@@ -71,6 +71,10 @@
 // Forward declarations
 //
 void print_with_timestamp(const char* format, ...);
+void llm_thread_func(struct omni_context * ctx_omni, common_params * params);
+void tts_thread_func(struct omni_context * ctx_omni, common_params * params);
+void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params * params);
+void t2w_thread_func(struct omni_context * ctx_omni, common_params * params);
 
 //
 // omni structure
@@ -4062,6 +4066,319 @@ void eval_prefix_with_hidden(struct omni_context* ctx_omni, common_params* param
     eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->n_past, false, hidden_states);
 }
 
+struct OmniBootstrapPrompts {
+    std::string voice_clone_prompt;
+    std::string assistant_prompt;
+};
+
+struct PrefillContextDecision {
+    bool need_bootstrap = false;
+    bool should_start_workers = false;
+};
+
+static std::string omni_normalize_prefill_prompt(const std::string & prompt) {
+    if (prompt.rfind("<|", 0) == 0) {
+        return prompt;
+    }
+    return "<|im_start|>user\n" + prompt;
+}
+
+static OmniBootstrapPrompts omni_select_bootstrap_prompts(const struct omni_context * ctx_omni) {
+    const bool use_omni_prompt = ctx_omni->media_type == 2;
+    const std::string & raw_voice_clone_prompt = use_omni_prompt
+        ? ctx_omni->omni_voice_clone_prompt
+        : ctx_omni->audio_voice_clone_prompt;
+    const std::string & raw_assistant_prompt = use_omni_prompt
+        ? ctx_omni->omni_assistant_prompt
+        : ctx_omni->audio_assistant_prompt;
+
+    return {
+        omni_normalize_prefill_prompt(raw_voice_clone_prompt),
+        omni_normalize_prefill_prompt(raw_assistant_prompt),
+    };
+}
+
+// Step A: prepare one prefill round without touching encoding or LLM prefill protocol.
+static PrefillContextDecision omni_prepare_prefill_context(struct omni_context * ctx_omni, int index) {
+    if (ctx_omni->duplex_mode) {
+        duplex_timing_set_active_chunk(ctx_omni, index);
+    }
+
+    // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成。
+    if (ctx_omni->use_tts && index == 0 && ctx_omni->warmup_done.load() && !ctx_omni->duplex_mode) {
+        if (ctx_omni->break_event.load()) {
+            print_with_timestamp("TTS: break_event active, skipping wait for previous round\n");
+            ctx_omni->speek_done = true;
+            ctx_omni->break_event.store(false);
+            ctx_omni->workers.speek_cv.notify_all();
+        }
+        print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
+        std::unique_lock<std::mutex> lock(ctx_omni->workers.speek_mtx);
+        const bool wait_ok = ctx_omni->workers.speek_cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return ctx_omni->speek_done || ctx_omni->break_event.load();
+        });
+        if (!wait_ok) {
+            ctx_omni->speek_done = true;
+        }
+        ctx_omni->speek_done = false;
+
+        if (ctx_omni->tts_thread_info != nullptr) {
+            omni_clear_tts_queue(ctx_omni, "stream_prefill: cleared TTS queue for new turn");
+        }
+    } else if (ctx_omni->use_tts && index == 0 && !ctx_omni->duplex_mode) {
+        ctx_omni->speek_done = false;
+        if (ctx_omni->tts_thread_info != nullptr) {
+            omni_clear_tts_queue(ctx_omni);
+        }
+    }
+
+    PrefillContextDecision decision;
+    decision.need_bootstrap = index == 0 && !ctx_omni->system_prompt_initialized;
+    decision.should_start_workers = decision.need_bootstrap && ctx_omni->async;
+    return decision;
+}
+
+static std::string omni_get_bootstrap_ref_audio_path(const struct omni_context * ctx_omni, const std::string & aud_fname) {
+    if (ctx_omni->duplex_mode && !aud_fname.empty()) {
+        return aud_fname;
+    }
+    return ctx_omni->ref_audio_path.empty()
+        ? "tools/omni/assets/default_ref_audio/default_ref_audio.wav"
+        : ctx_omni->ref_audio_path;
+}
+
+// Step B: bootstrap the session once, including system prompt and ref-audio prefill.
+static bool omni_run_session_bootstrap_if_needed(
+        struct omni_context * ctx_omni,
+        const PrefillContextDecision & decision,
+        const OmniBootstrapPrompts & prompts,
+        const std::string & aud_fname,
+        int index) {
+    if (!decision.need_bootstrap) {
+        return true;
+    }
+
+    print_with_timestamp(
+        "stream_prefill: n_past = %d\n voice_clone_prompt = %s\n assistant_prompt = %s\n",
+        ctx_omni->n_past,
+        prompts.voice_clone_prompt.c_str(),
+        prompts.assistant_prompt.c_str());
+
+    const std::string bootstrap_ref_audio = omni_get_bootstrap_ref_audio_path(ctx_omni, aud_fname);
+    if (!ctx_omni->duplex_mode || bootstrap_ref_audio != aud_fname) {
+        print_with_timestamp("system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
+    }
+
+    eval_string(ctx_omni, ctx_omni->params, prompts.voice_clone_prompt.c_str(),
+                ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+
+    auto ref_audio_embed_start = std::chrono::high_resolution_clock::now();
+    auto * ref_audio_embeds = omni_audio_embed_make_with_filename(
+        ctx_omni->ctx_audio,
+        ctx_omni->params->cpuparams.n_threads,
+        bootstrap_ref_audio);
+    duplex_timing_note_audio(
+        ctx_omni,
+        index,
+        timing_elapsed_ms(ref_audio_embed_start, std::chrono::high_resolution_clock::now()));
+    if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
+        print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
+        prefill_with_emb(
+            ctx_omni,
+            ctx_omni->params,
+            ref_audio_embeds->embed,
+            ref_audio_embeds->n_pos,
+            ctx_omni->params->n_batch,
+            &ctx_omni->n_past);
+        omni_embed_free(ref_audio_embeds);
+    } else {
+        print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
+    }
+
+    eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(),
+                ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+
+    ctx_omni->system_prompt_initialized = true;
+    ctx_omni->n_keep = ctx_omni->n_past;
+    print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
+    eval_prefix(ctx_omni, ctx_omni->params);
+
+    print_with_timestamp("stream_prefill(index=0): system prompt 初始化完成，ref_audio 已在其中 prefill\n");
+    sliding_window_register_system_prompt(ctx_omni);
+    print_with_timestamp("n_past = %d\n", ctx_omni->n_past);
+
+    if (decision.should_start_workers) {
+        const OmniWorkerThreadFns worker_fns = {
+            llm_thread_func,
+            tts_thread_func,
+            tts_thread_func_duplex,
+            t2w_thread_func,
+        };
+        omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
+    }
+
+    return true;
+}
+
+// Step C: encode image/audio input into a single prefill payload.
+static bool omni_encode_prefill_input(
+        struct omni_context * ctx_omni,
+        const std::string & aud_fname,
+        const std::string & img_fname,
+        int index,
+        int max_slice_nums,
+        struct omni_embeds & encoded) {
+    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    encoded.index = index;
+
+    if (!img_fname.empty()) {
+        if (max_slice_nums >= 1 && ctx_omni->ctx_vision != nullptr) {
+            vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
+            LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
+        }
+
+        auto vit_embed_start = std::chrono::high_resolution_clock::now();
+        const bool image_embed_ok = omni_image_embed_make_chunks_with_filename(
+            ctx_omni->ctx_vision,
+            ctx_omni->params->cpuparams.n_threads,
+            img_fname,
+            encoded.vision_embed);
+        duplex_timing_note_vit(
+            ctx_omni,
+            index,
+            timing_elapsed_ms(vit_embed_start, std::chrono::high_resolution_clock::now()));
+        if (!image_embed_ok) {
+            LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
+            return false;
+        }
+        LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int) encoded.vision_embed.size());
+    }
+
+    if (!aud_fname.empty()) {
+        print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
+        auto audio_embed_start = std::chrono::high_resolution_clock::now();
+        auto * audio_embeds = omni_audio_embed_make_with_filename(
+            ctx_omni->ctx_audio,
+            ctx_omni->params->cpuparams.n_threads,
+            aud_fname);
+        duplex_timing_note_audio(
+            ctx_omni,
+            index,
+            timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now()));
+        if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
+            print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index, audio_embeds->n_pos);
+            encoded.audio_embed.resize(audio_embeds->n_pos * hidden_size);
+            std::memcpy(encoded.audio_embed.data(), audio_embeds->embed, encoded.audio_embed.size() * sizeof(float));
+            omni_embed_free(audio_embeds);
+        } else {
+            LOG_WRN("%s: audio encoding failed, skipping audio for this frame: %s\n", __func__, aud_fname.c_str());
+        }
+    }
+
+    return true;
+}
+
+// Shared LLM stage apply path used by both sync stream_prefill and llm_thread_func.
+static void omni_llm_stage_prefill_apply(
+        struct omni_context * ctx_omni,
+        struct common_params * params,
+        const struct omni_embeds & embeds) {
+    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        sliding_window_register_unit_start(ctx_omni);
+    }
+
+    if (!embeds.vision_embed.empty()) {
+        const int n_chunks = (int) embeds.vision_embed.size();
+        const int tokens_per_chunk = (int) embeds.vision_embed[0].size() / hidden_size;
+        const int n_audio_tokens = embeds.audio_embed.size() / hidden_size;
+        const bool has_audio = n_audio_tokens > 0;
+        const bool has_slices = n_chunks > 1;
+
+        if (ctx_omni->duplex_mode) {
+            eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->n_past, false);
+        } else {
+            eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->n_past, false);
+        }
+
+        prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[0].data()), tokens_per_chunk,
+                        params->n_batch, &ctx_omni->n_past);
+        eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->n_past, false);
+
+        if (has_slices) {
+            for (int i = 1; i < n_chunks; ++i) {
+                eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->n_past, false);
+                prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[i].data()), tokens_per_chunk,
+                                params->n_batch, &ctx_omni->n_past);
+                eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->n_past, false);
+            }
+            eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->n_past, false);
+        }
+
+        print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n",
+                            n_chunks, tokens_per_chunk, n_audio_tokens, has_slices);
+
+        if (has_audio) {
+            if (!ctx_omni->duplex_mode) {
+                eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
+            }
+            prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
+                            params->n_batch, &ctx_omni->n_past);
+            if (!ctx_omni->duplex_mode) {
+                eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
+            }
+        }
+    } else {
+        const int n_audio_tokens = embeds.audio_embed.size() / hidden_size;
+        print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
+
+        if (ctx_omni->duplex_mode) {
+            eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
+        } else {
+            eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
+        }
+
+        if (n_audio_tokens > 0) {
+            prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
+                            params->n_batch, &ctx_omni->n_past);
+        }
+
+        if (!ctx_omni->duplex_mode) {
+            eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
+        }
+    }
+
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        const std::string input_type = embeds.vision_embed.empty() ? "audio" : "omni";
+        sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
+    }
+}
+
+static void omni_finalize_llm_prefill(struct omni_context * ctx_omni) {
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        sliding_window_enforce(ctx_omni);
+    }
+}
+
+// Step D: submit the encoded payload to the shared LLM stage.
+static bool omni_submit_llm_prefill(struct omni_context * ctx_omni, std::unique_ptr<struct omni_embeds> encoded) {
+    if (!ctx_omni->async) {
+        omni_llm_stage_prefill_apply(ctx_omni, ctx_omni->params, *encoded);
+        omni_finalize_llm_prefill(ctx_omni);
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+    ctx_omni->llm_thread_info->cv.wait(lock, [&] {
+        return ctx_omni->llm_thread_info->queue.size() < static_cast<size_t>(ctx_omni->llm_thread_info->MAX_QUEUE_SIZE);
+    });
+    ctx_omni->llm_thread_info->queue.push(encoded.release());
+    lock.unlock();
+    ctx_omni->llm_thread_info->cv.notify_all();
+    return true;
+}
+
 /**
  * LLM线程函数：负责处理多模态（视觉+音频）嵌入的前缀填充（prefill）
  * 
@@ -4080,9 +4397,7 @@ void eval_prefix_with_hidden(struct omni_context* ctx_omni, common_params* param
  */
 void llm_thread_func(omni_context* ctx_omni, common_params* params){
     print_with_timestamp("LLM thread started\n");
-    // 获取模型的隐藏层维度，用于计算token数量
-    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-    
+
     // ========== 主循环：持续处理嵌入数据 ==========
     while(ctx_omni->workers.llm_thread_running){
         // 获取队列的互斥锁，保护共享资源
@@ -4135,8 +4450,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             
             // 如果批量处理多个嵌入，打印日志
             print_with_timestamp("Batch processing %zu llm prefill\n", llm_embeds.size());
-            if (llm_embeds.size() > 1)
-            
+
             // 通知等待的生产者线程，队列有空间了
             ctx_omni->llm_thread_info->cv.notify_all();
 
@@ -4151,92 +4465,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             // 遍历所有嵌入数据
             for (int il = 0; il < (int)llm_embeds.size(); ++il) {
                 auto embeds = llm_embeds[il];
-                
-                // 🔧 [#39 滑动窗口] 注册 unit 开始
-                if (ctx_omni->sliding_window_config.mode != "off") {
-                    sliding_window_register_unit_start(ctx_omni);
-                }
-                
-                // ========== 子分支1：处理包含视觉嵌入的数据 ==========
-                // 🔧 [高清模式] vision_embed 现在是二维 vector: [0]=overview, [1..n]=slices
-                if (embeds->vision_embed.size() > 0){
-                    int n_chunks = (int)embeds->vision_embed.size();
-                    int tokens_per_chunk = (int)embeds->vision_embed[0].size() / hidden_size;
-                    int n_audio_tokens = embeds->audio_embed.size() / hidden_size;
-                    bool has_audio = (n_audio_tokens > 0);
-                    bool has_slices = (n_chunks > 1);
-                    
-                    // 🔧 [与 Python 对齐] 根据模式决定是否添加 <unit>
-                    if (ctx_omni->duplex_mode) {
-                        eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->n_past, false);
-                    } else {
-                        eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->n_past, false);
-                    }
-                    
-                    // Prefill overview embedding (第一个 chunk)
-                    prefill_with_emb(ctx_omni, params, embeds->vision_embed[0].data(), tokens_per_chunk, 
-                                    params->n_batch, &ctx_omni->n_past);
-                    eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->n_past, false);
-                    
-                    // 🔧 [高清模式 V2.6 schema] 如果有 slices，添加 <slice> 标记
-                    // 格式: <image>(overview)</image><slice>(slice1)</slice><slice>(slice2)</slice>\n
-                    if (has_slices) {
-                        for (int i = 1; i < n_chunks; i++) {
-                            eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->n_past, false);
-                            prefill_with_emb(ctx_omni, params, embeds->vision_embed[i].data(), tokens_per_chunk,
-                                            params->n_batch, &ctx_omni->n_past);
-                            eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->n_past, false);
-                        }
-                        // V2.6 格式在 slices 后添加换行
-                        eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->n_past, false);
-                    }
-                    
-                    print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", 
-                                        n_chunks, tokens_per_chunk, n_audio_tokens, has_slices);
-                    
-                    // 音频部分
-                    if (has_audio) {
-                        if (!ctx_omni->duplex_mode) {
-                            // 单工格式：<|audio_start|> + audio + <|audio_end|>
-                            eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
-                        }
-                        prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
-                                        params->n_batch, &ctx_omni->n_past);
-                        if (!ctx_omni->duplex_mode) {
-                            eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
-                        }
-                    }
-                }
-                // ========== 子分支2：处理只有音频嵌入的数据（纯音频模式） ==========
-                else {
-                    int n_audio_tokens = embeds->audio_embed.size() / hidden_size;
-                    print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
-                    
-                    // 🔧 [根据模式选择格式]
-                    if (ctx_omni->duplex_mode) {
-                        // 双工格式：<unit> + audio_embedding（无 audio_start/end）
-                        eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
-                    } else {
-                        // 单工格式：<|audio_start|> + audio + <|audio_end|>
-                        eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
-                    }
-                    
-                    // Prefill 音频 embedding
-                    prefill_with_emb(ctx_omni, params, embeds->audio_embed.data(), n_audio_tokens,
-                                    params->n_batch, &ctx_omni->n_past);
-                    
-                    // 单工格式需要 <|audio_end|>
-                    if (!ctx_omni->duplex_mode) {
-                        eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
-                    }
-                }
-                
-                // 🔧 [#39 滑动窗口] 注册 unit 结束
-                if (ctx_omni->sliding_window_config.mode != "off") {
-                    std::string input_type = embeds->vision_embed.size() > 0 ? "omni" : "audio";
-                    sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
-                }
-                
+                omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
                 // 释放嵌入数据的内存（由生产者线程分配）
                 delete embeds;
             }
@@ -4247,10 +4476,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                                  ctx_omni->n_past - ctx_omni->n_keep,
                                  ctx_omni->duplex_mode);
             
-            // 🔧 [#39 滑动窗口] prefill 完成后检查是否需要滑窗
-            if (ctx_omni->sliding_window_config.mode != "off") {
-                sliding_window_enforce(ctx_omni);
-            }
+            omni_finalize_llm_prefill(ctx_omni);
         }
         
         // ========== 分支2：队列为空且需要开始生成文本 ==========
@@ -8105,298 +8331,23 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
 }
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {
-    if (ctx_omni->duplex_mode) {
-        duplex_timing_set_active_chunk(ctx_omni, index);
-    }
-    
-    // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
-    // 同一轮内的后续 prefill (index >= 1) 不需要等待
-    if (ctx_omni->use_tts && index == 0 && ctx_omni->warmup_done.load() && !ctx_omni->duplex_mode) {
-        // 🔧 如果 break_event 已触发，跳过等待（上一轮已被打断）
-        if (ctx_omni->break_event.load()) {
-            print_with_timestamp("TTS: break_event active, skipping wait for previous round\n");
-            ctx_omni->speek_done = true;
-            ctx_omni->break_event.store(false);
-            ctx_omni->workers.speek_cv.notify_all();
-        }
-        print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
-        std::unique_lock<std::mutex> lock(ctx_omni->workers.speek_mtx);
-        // 添加超时等待，避免永久卡住
-        auto wait_result = ctx_omni->workers.speek_cv.wait_for(lock, std::chrono::seconds(5), [&]{return ctx_omni->speek_done || ctx_omni->break_event.load(); });
-        if (!wait_result) {
-            // 强制设置为 true 以继续
-            ctx_omni->speek_done = true;
-        }
-        // 等待完成后重置 speek_done，为下一轮做准备
-        ctx_omni->speek_done = false;
-        
-        // 🔧 [多轮对话修复] 清理 TTS 队列中的残留数据，避免混淆
-        if (ctx_omni->tts_thread_info && !ctx_omni->duplex_mode) {
-            omni_clear_tts_queue(ctx_omni, "stream_prefill: cleared TTS queue for new turn");
-        }
-    } else if (ctx_omni->use_tts && index == 0 && !ctx_omni->duplex_mode) {
-        // 否则 LLM 输出会被丢弃（因为 speek_done 初始值为 true）
-        ctx_omni->speek_done = false;
-        
-        // 🔧 [多轮对话修复] 首次初始化时也要清理队列
-        if (ctx_omni->tts_thread_info) {
-            omni_clear_tts_queue(ctx_omni);
-        }
-    } else if (ctx_omni->use_tts) {
-    }
-    
-    // ctx_omni->need_speek = false;
-    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-    
-    std::string voice_clone_prompt = "";
-    std::string assistant_prompt = "";
-    
-    if (ctx_omni->media_type == 1){ // audio
-        // 如果 audio_voice_clone_prompt 以 "<|" 开头（特殊 token），不添加前缀
-        // 这允许完全控制 prompt 格式（例如使用 system 而不是 user）
-        if (ctx_omni->audio_voice_clone_prompt.substr(0, 2) == "<|") {
-            voice_clone_prompt = ctx_omni->audio_voice_clone_prompt;
-        } else {
-            voice_clone_prompt = "<|im_start|>user\n" + ctx_omni->audio_voice_clone_prompt;
-        }
-        // 如果 audio_assistant_prompt 以 "<|" 开头（特殊 token），不添加前缀
-        if (ctx_omni->audio_assistant_prompt.substr(0, 2) == "<|") {
-            assistant_prompt = ctx_omni->audio_assistant_prompt;
-        } else {
-            assistant_prompt = "<|im_start|>user\n" + ctx_omni->audio_assistant_prompt;
-        }
-    }
-    else if (ctx_omni->media_type == 2){ // omni
-        if (ctx_omni->omni_voice_clone_prompt.substr(0, 2) == "<|") {
-            voice_clone_prompt = ctx_omni->omni_voice_clone_prompt;
-        } else {
-            voice_clone_prompt = "<|im_start|>user\n" + ctx_omni->omni_voice_clone_prompt;
-        }
-        if (ctx_omni->omni_assistant_prompt.substr(0, 2) == "<|") {
-            assistant_prompt = ctx_omni->omni_assistant_prompt;
-        } else {
-            assistant_prompt = "<|im_start|>user\n" + ctx_omni->omni_assistant_prompt;
-        }
-    }
-    // 这是因为 omni_init 中可能会调用 stream_prefill(voice_audio, "", 0)，
-    // 然后测试脚本又会调用 stream_prefill(audio_0, "", 0)
-    // 如果不检查这个标志，系统 prompt 会被评估两次，导致格式混乱
-    if (index == 0 && !ctx_omni->system_prompt_initialized) {
-        print_with_timestamp("stream_prefill: n_past = %d\n voice_clone_prompt = %s\n assistant_prompt = %s\n", ctx_omni->n_past, voice_clone_prompt.c_str(), assistant_prompt.c_str());
-        // tc-todo
-        // llama_kv_cache_clear(ctx_omni->ctx_llama);
-        
-        // 🔧 [对齐 Python 双工模型] 初始化格式
-        // Python 双工模型的 _init_duplex_session：
-        //   1. feed prefix_system_prompt（包含 <|audio_start|>）
-        //   2. feed ref_audio 的 APM embedding
-        //   3. feed suffix_system_prompt（包含 <|audio_end|><|im_end|>）
-        // 
-        // 完整格式：
-        //   <|im_start|>system\nStreaming Duplex Conversation! You are a helpful assistant.\n<|audio_start|>
-        //   [ref_audio APM embedding]
-        //   <|audio_end|><|im_end|>
-        
-        if (ctx_omni->duplex_mode && aud_fname.length() > 0) {
-            // 双工模式：参考音频需要送入 LLM
-            
-            // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-            
-            // Step 2: 获取并 prefill 参考音频的 APM embedding
-            auto audio_embed_start = std::chrono::high_resolution_clock::now();
-            auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
-            duplex_timing_note_audio(ctx_omni, index, timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now()));
-            if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
-                prefill_with_emb(ctx_omni, ctx_omni->params, audio_embeds->embed, audio_embeds->n_pos, 
-                                ctx_omni->params->n_batch, &ctx_omni->n_past);
-                omni_embed_free(audio_embeds);
-            } else {
-            }
-            
-            // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-        } else {
-            // 🔧 [与 Python 对齐] 非双工模式也需要在 system prompt 中插入 ref_audio embedding
-            // Python: sys_msgs = {"role": "system", "content": [vc_prompt_prefix, ref_audio, vc_prompt_suffix]}
-            // 格式: <|im_start|>system\n{vc_prompt_prefix}\n<|audio_start|>[ref_audio_embed]<|audio_end|>{vc_prompt_suffix}<|im_end|>\n
-            
-            // 确定 ref_audio 路径：优先使用配置的路径，否则使用默认路径
-            std::string system_ref_audio = ctx_omni->ref_audio_path.empty() 
-                ? "tools/omni/assets/default_ref_audio/default_ref_audio.wav" 
-                : ctx_omni->ref_audio_path;
-            print_with_timestamp("system prompt ref_audio: %s\n", system_ref_audio.c_str());
-            
-            // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
-            eval_string(ctx_omni, ctx_omni->params, voice_clone_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-            
-            // Step 2: 获取并 prefill 参考音频的 APM embedding
-            auto ref_audio_embed_start = std::chrono::high_resolution_clock::now();
-            auto * ref_audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, system_ref_audio);
-            duplex_timing_note_audio(ctx_omni, index, timing_elapsed_ms(ref_audio_embed_start, std::chrono::high_resolution_clock::now()));
-            if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
-                print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
-                prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos, 
-                                ctx_omni->params->n_batch, &ctx_omni->n_past);
-                omni_embed_free(ref_audio_embeds);
-            } else {
-                print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", system_ref_audio.c_str());
-            }
-            
-            // Step 3: 评估 suffix (assistant_prompt，包含 <|audio_end|><|im_end|>)
-            eval_string(ctx_omni, ctx_omni->params, assistant_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-        }
-        
-        // 标记系统 prompt 已初始化
-        ctx_omni->system_prompt_initialized = true;
+    const PrefillContextDecision decision = omni_prepare_prefill_context(ctx_omni, index);
+    const OmniBootstrapPrompts prompts = omni_select_bootstrap_prompts(ctx_omni);
 
-        //把这步完成再开llm线程以防冲突
-        ctx_omni->n_keep = ctx_omni->n_past;
-        print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
-        eval_prefix(ctx_omni, ctx_omni->params);
-        
-        // 🔧 [说明] index=0 时，aud_fname 通常是 ref_audio（用于 voice cloning）
-        // ref_audio 已经在上面的 system prompt 初始化中被正确 prefill 了
-        // 这里不需要再处理 aud_fname，因为：
-        // 1. 如果 aud_fname 是 ref_audio，它已经作为 system prompt 的一部分被处理了
-        // 2. 如果 aud_fname 是用户音频，用户音频应该从 index >= 1 开始传入
-        // 所以 index=0 阶段只负责 system prompt 初始化，不处理额外的音频输入
-        print_with_timestamp("stream_prefill(index=0): system prompt 初始化完成，ref_audio 已在其中 prefill\n");
-        
-        // 🔧 [#39 滑动窗口] 注册 system prompt 保护长度
-        sliding_window_register_system_prompt(ctx_omni);
-
-        print_with_timestamp("n_past = %d\n", ctx_omni->n_past);
-        
-        if (ctx_omni->async){
-            const OmniWorkerThreadFns worker_fns = {
-                llm_thread_func,
-                tts_thread_func,
-                tts_thread_func_duplex,
-                t2w_thread_func,
-            };
-            omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
-        }
-
+    if (!omni_run_session_bootstrap_if_needed(ctx_omni, decision, prompts, aud_fname, index)) {
+        return false;
     }
-    else {
-        if (!ctx_omni->async) {
-            if (img_fname.length() > 0) {
-                // 🔧 [高清模式] 使用 V2.6 slice schema
-                // 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
-                if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
-                    vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
-                    LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
-                }
-                std::vector<std::vector<float>> vision_chunks;
-                auto vit_embed_start = std::chrono::high_resolution_clock::now();
-                bool image_embed_ok = omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision,
-                        ctx_omni->params->cpuparams.n_threads, img_fname, vision_chunks);
-                duplex_timing_note_vit(ctx_omni, index, timing_elapsed_ms(vit_embed_start, std::chrono::high_resolution_clock::now()));
-                if (!image_embed_ok) {
-                    LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
-                    return false;
-                }
-                
-                int n_chunks = (int)vision_chunks.size();
-                int tokens_per_chunk = (int)vision_chunks[0].size() / hidden_size;
-                bool has_slices = (n_chunks > 1);
-                
-                std::string prefix = "<unit>";
-                eval_string(ctx_omni, ctx_omni->params, prefix.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                
-                // Overview
-                eval_string(ctx_omni, ctx_omni->params, "<image>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                prefill_with_emb(ctx_omni, ctx_omni->params, vision_chunks[0].data(), tokens_per_chunk, ctx_omni->params->n_batch, &ctx_omni->n_past);
-                eval_string(ctx_omni, ctx_omni->params, "</image>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                
-                // Slices (V2.6 schema)
-                if (has_slices) {
-                    for (int i = 1; i < n_chunks; i++) {
-                        eval_string(ctx_omni, ctx_omni->params, "<slice>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                        prefill_with_emb(ctx_omni, ctx_omni->params, vision_chunks[i].data(), tokens_per_chunk, ctx_omni->params->n_batch, &ctx_omni->n_past);
-                        eval_string(ctx_omni, ctx_omni->params, "</slice>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                    }
-                    eval_string(ctx_omni, ctx_omni->params, "\n", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                }
-                LOG_INF("%s: prefilled %d vision chunks (%d tokens each)\n", __func__, n_chunks, tokens_per_chunk);
-            }
-            if (aud_fname.length() > 0) {
-                print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
-                auto audio_embed_start = std::chrono::high_resolution_clock::now();
-                auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
-                duplex_timing_note_audio(ctx_omni, index, timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now()));
-                // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
-                // 这里做安全检查，如果仍然失败则跳过该帧音频
-                if (embeds != nullptr && embeds->n_pos > 0) {
-                    print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index, embeds->n_pos);
-                    // 🔧 添加音频标记，与 index=0 保持一致
-                    eval_string(ctx_omni, ctx_omni->params, "<|audio_start|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                    prefill_with_emb(ctx_omni, ctx_omni->params, embeds->embed, embeds->n_pos, ctx_omni->params->n_batch, &ctx_omni->n_past);
-                    eval_string(ctx_omni, ctx_omni->params, "<|audio_end|>", ctx_omni->params->n_batch, &ctx_omni->n_past, false);
-                    omni_embed_free(embeds);
-                } else {
-                    LOG_WRN("%s: audio encoding failed, skipping audio for this frame\n", __func__);
-                }
-            }
-        }
-        else {
-            // async 模式：将 embeds 加入队列，由 LLM 线程处理
-            
-            const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-            omni_embeds * omni_embeds = new struct omni_embeds();
-            //video
-            if (img_fname.length() > 0) {
-                LOG_INF("%s: img_fname:%s\n", __func__, img_fname.c_str());
-                // 🔧 [高清模式] 如果指定了 max_slice_nums，临时设置（用于高清+高刷组合模式）
-                if (max_slice_nums >= 1 && ctx_omni->ctx_vision) {
-                    vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
-                    LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
-                }
-                // 🔧 [高清模式] 使用新的 chunks 接口，支持 V2.6 slice schema
-                auto vit_embed_start = std::chrono::high_resolution_clock::now();
-                bool image_embed_ok = omni_image_embed_make_chunks_with_filename(ctx_omni->ctx_vision,
-                        ctx_omni->params->cpuparams.n_threads, img_fname, omni_embeds->vision_embed);
-                duplex_timing_note_vit(ctx_omni, index, timing_elapsed_ms(vit_embed_start, std::chrono::high_resolution_clock::now()));
-                if (!image_embed_ok) {
-                    LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
-                    delete omni_embeds;
-                    return false;
-                }
-                LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int)omni_embeds->vision_embed.size());
-            }
-            //audio
-            // 只有在音频路径非空时才处理音频
-            if (aud_fname.length() > 0) {
-                LOG_INF("%s: aud_fname:%s\n", __func__, aud_fname.c_str());
-                auto audio_embed_start = std::chrono::high_resolution_clock::now();
-                auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
-                duplex_timing_note_audio(ctx_omni, index, timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now()));
-                // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
-                // 这里做安全检查，如果仍然失败则跳过该帧音频（保持 audio_embed 为空）
-                if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
-                    //save to buffer
-                    LOG_INF("%s: audio_embeds->n_pos: %d ,hidden_size: %d\n", __func__, audio_embeds->n_pos, hidden_size);
-                    omni_embeds->audio_embed.resize(audio_embeds->n_pos * hidden_size);
-                    std::memcpy(omni_embeds->audio_embed.data(), audio_embeds->embed, omni_embeds->audio_embed.size() * sizeof(float));
-                    omni_embed_free(audio_embeds);
-                } else {
-                    LOG_WRN("%s: audio encoding failed, skipping audio for this frame: %s\n", __func__, aud_fname.c_str());
-                }
-            }
-            omni_embeds->index = index;
-            // 🔧 [整合] <|im_start|>user\n 已在 sys prompt 末尾添加，后续轮次在 stream_decode 结束时添加
-            // 不再需要在这里设置 is_round_start 标记
-            
-            std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-            ctx_omni->llm_thread_info->cv.wait(lock, [&] { return ctx_omni->llm_thread_info->queue.size() < ctx_omni->llm_thread_info->MAX_QUEUE_SIZE; });
-            ctx_omni->llm_thread_info->queue.push(omni_embeds);
 
-            //notify the llm
-            lock.unlock();
-            ctx_omni->llm_thread_info->cv.notify_all();
+    if (!decision.need_bootstrap) {
+        auto encoded = std::make_unique<struct omni_embeds>();
+        if (!omni_encode_prefill_input(ctx_omni, aud_fname, img_fname, index, max_slice_nums, *encoded)) {
+            return false;
+        }
+        if (!omni_submit_llm_prefill(ctx_omni, std::move(encoded))) {
+            return false;
         }
     }
+
     // 🔧 [诊断] 打印 stream_prefill 结束时的状态
     print_with_timestamp("\n\nc++ finish stream_prefill(index=%d). n_past=%d, n_keep=%d, n_ctx=%d\n\n",
                          index, ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx);

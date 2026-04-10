@@ -2,9 +2,11 @@
 
 #include "omni-impl.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -25,6 +27,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+
+namespace fs = std::filesystem;
 
 bool cross_platform_mkdir_p(const std::string & path) {
     if (path.empty()) {
@@ -233,26 +237,73 @@ void omni_archive_output_dir(const std::string & base_output_dir, const std::str
 }
 
 void omni_merge_wav_files(const std::string & output_dir, int num_chunks) {
-    if (num_chunks == 0) {
-        LOG_WRN("TTS: no chunks to merge\n");
-        return;
+    const std::string merged_file = output_dir + "/tts_output_merged.wav";
+    std::vector<std::pair<int, std::string>> indexed_chunk_files;
+
+    // 当前运行链路实际由 T2W 生成 wav_*.wav，这里按数字后缀排序收集。
+    try {
+        if (fs::exists(output_dir) && fs::is_directory(output_dir)) {
+            for (const auto & entry : fs::directory_iterator(output_dir)) {
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+
+                const std::string filename = entry.path().filename().string();
+                if (filename.rfind("wav_", 0) != 0 || entry.path().extension() != ".wav") {
+                    continue;
+                }
+
+                const std::string stem = entry.path().stem().string();
+                const std::string index_str = stem.substr(4);
+                if (index_str.empty()) {
+                    continue;
+                }
+
+                const bool is_numeric = std::all_of(index_str.begin(), index_str.end(), [](unsigned char ch) {
+                    return std::isdigit(ch) != 0;
+                });
+                if (!is_numeric) {
+                    continue;
+                }
+
+                std::error_code ec;
+                const auto file_size = fs::file_size(entry.path(), ec);
+                if (ec || file_size == 0) {
+                    continue;
+                }
+
+                indexed_chunk_files.emplace_back(std::stoi(index_str), entry.path().string());
+            }
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("TTS: failed to scan wav files in %s: %s\n", output_dir.c_str(), e.what());
     }
 
-    const std::string merged_file = output_dir + "/tts_output_merged.wav";
-    std::vector<std::string> chunk_files;
-    for (int i = 0; i < num_chunks; ++i) {
-        const std::string chunk_file = output_dir + "/tts_output_chunk_" + std::to_string(i) + ".wav";
-        struct stat st;
-        if (stat(chunk_file.c_str(), &st) == 0 && st.st_size > 0) {
-            chunk_files.push_back(chunk_file);
-        } else {
-            LOG_WRN("TTS: chunk file %s does not exist or is empty\n", chunk_file.c_str());
+    // 兼容旧目录格式：如果没有 wav_*.wav，再回退到 tts_output_chunk_*.wav。
+    if (indexed_chunk_files.empty() && num_chunks > 0) {
+        for (int i = 0; i < num_chunks; ++i) {
+            const std::string chunk_file = output_dir + "/tts_output_chunk_" + std::to_string(i) + ".wav";
+            struct stat st;
+            if (stat(chunk_file.c_str(), &st) == 0 && st.st_size > 0) {
+                indexed_chunk_files.emplace_back(i, chunk_file);
+            }
         }
     }
 
-    if (chunk_files.empty()) {
+    if (indexed_chunk_files.empty()) {
         LOG_WRN("TTS: no valid WAV files to merge\n");
         return;
+    }
+
+    std::sort(indexed_chunk_files.begin(), indexed_chunk_files.end(),
+              [](const auto & lhs, const auto & rhs) {
+                  return lhs.first < rhs.first;
+              });
+
+    std::vector<std::string> chunk_files;
+    chunk_files.reserve(indexed_chunk_files.size());
+    for (const auto & indexed_file : indexed_chunk_files) {
+        chunk_files.push_back(indexed_file.second);
     }
 
     const std::string concat_list_file = output_dir + "/concat_list.txt";
