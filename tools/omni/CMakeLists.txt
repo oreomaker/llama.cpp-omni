@@ -8,6 +8,10 @@ option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
 add_library(omni
             omni.cpp
             omni.h
+            omni-session-state.cpp
+            omni-session-state.h
+            omni-turn-coordinator.cpp
+            omni-turn-coordinator.h
             omni-runtime-messages.h
             omni-worker-state.h
             omni-token-protocol.cpp

@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "omni-session-state.h"
 #include "omni-runtime-messages.h"
 #include "omni-worker-state.h"
 
@@ -78,34 +79,6 @@ struct T2WThreadInfo {
     T2WThreadInfo(int maxQueueSize) : MAX_QUEUE_SIZE(maxQueueSize) {}
 };
 
-// Projector Semantic: 2-layer MLP (LLM hidden states -> TTS embedding)
-// forward(x): relu(linear1(x)) -> linear2
-// ==================== 滑动窗口配置 ====================
-// 🔧 [#39] 基于 Python stream_decoder.py 的 DuplexWindowConfig
-struct SlidingWindowConfig {
-    // 滑窗模式: "off" / "basic" / "context"
-    // - "off": 禁用滑窗
-    // - "basic": 基础滑窗（按 cache 长度触发）
-    // - "context": 带 context 的滑窗（保留生成文本到 previous）
-    std::string mode = "off";
-    
-    // 基础滑窗参数
-    int high_water_tokens = 4000;  // 高水位线：超过此值触发滑窗
-    int low_water_tokens = 3500;   // 低水位线：滑窗后保留到此值
-    
-    // RoPE 参数
-    float rope_theta = 10000.0f;   // RoPE base frequency
-};
-
-// Unit 历史记录条目
-struct UnitEntry {
-    int unit_id = -1;              // Unit ID
-    int length = 0;                // 该 unit 在 cache 中的长度（tokens 数）
-    std::string type;              // 类型: "audio" / "video" / "omni" / "system"
-    std::vector<llama_token> generated_tokens;  // 生成的 tokens
-    bool is_listen = false;        // 是否是 listen 状态
-};
-
 struct projector_hparams {
     int32_t in_dim  = 4096;  // 输入维度 (LLM hidden size)
     int32_t out_dim = 768;   // 输出维度 (TTS embedding size)
@@ -171,39 +144,25 @@ struct omni_context {
     int output_audio_chunk_size[5] = {5, 10, 20, 40, 40};
     
     struct omni_output *omni_output = NULL;
-    int n_past = 0;
-    int n_keep = 0;
-    
-    // ==================== 轮次边界管理（用于智能滑动窗口） ====================
-    // 每轮对话开始时的 n_past 位置
-    // round_start_positions[i] 表示第 i 轮开始的 n_past 位置
-    // 第 i 轮的范围是 [round_start_positions[i], round_start_positions[i+1])
-    // 最后一轮的结束位置是当前 n_past
-    std::vector<int> round_start_positions;
-    
-    // 滑动窗口保留的最大上下文长度（不包括 n_keep）
-    // 设置为 0 表示使用旧的按比例删除策略
-    int max_preserved_context = 2048;
-    
-    // ==================== 滑动窗口状态 (#39) ====================
-    SlidingWindowConfig sliding_window_config;
-    
-    // Unit 历史管理（用于按 unit 粒度删除）
-    std::vector<UnitEntry> unit_history;
-    int next_unit_id = 0;
-    int pending_unit_id = -1;           // 当前正在处理的 unit ID
-    int pending_unit_start_cache_len = 0;  // pending unit 开始时的 cache 长度
-    
-    // System prompt 保护长度（这部分永远不会被滑窗删除）
-    int system_preserve_length = 0;
-    
-    // RoPE 位置偏移（用于 RoPE 位置重对齐后的 position_ids 计算）
-    int position_offset = 0;
-    
-    // 滑窗统计
-    int sliding_event_count = 0;    // 滑窗触发次数
-    int total_dropped_tokens = 0;   // 总共丢弃的 token 数
-    int total_dropped_units = 0;    // 总共丢弃的 unit 数
+    OmniSessionState session;
+    OmniTurnState turn;
+    OmniSessionGate gate;
+
+    // 兼容层：旧字段名继续保留，但实际所有权收敛到 session / turn / gate 子对象。
+    int & n_past;
+    int & n_keep;
+    std::vector<int> & round_start_positions;
+    int & max_preserved_context;
+    SlidingWindowConfig & sliding_window_config;
+    std::vector<UnitEntry> & unit_history;
+    int & next_unit_id;
+    int & pending_unit_id;
+    int & pending_unit_start_cache_len;
+    int & system_preserve_length;
+    int & position_offset;
+    int & sliding_event_count;
+    int & total_dropped_tokens;
+    int & total_dropped_units;
     
     bool async = false;
     std::thread llm_thread;
@@ -214,8 +173,8 @@ struct omni_context {
     struct T2WThreadInfo *t2w_thread_info = NULL;
     OmniWorkerState workers;
     
-    volatile bool need_speek = false;
-    volatile bool speek_done = true;
+    volatile bool & need_speek;
+    volatile bool & speek_done;
     
     // 预热标志：第一轮对话视为预热（例如音色克隆参考音频），完成后设为 true
     std::atomic<bool> warmup_done{false};
@@ -223,25 +182,25 @@ struct omni_context {
     // ==================== 双工模式状态 ====================
     // 当前轮次是否已结束（用于决策是否允许切换到 listen 状态）
     // Python: self.current_turn_ended
-    bool current_turn_ended = true;
+    bool & current_turn_ended;
     
     // 打断事件标志
     // break_event: 打断当前生成，但保持会话活跃（用于双工模式的用户打断）
     //              打断后可继续调用 prefill/decode
-    std::atomic<bool> break_event{false};
+    std::atomic<bool> & break_event;
     
     // session_stop_event: 终止整个会话（预留，目前未使用）
     //                     用于彻底关闭当前会话，需要重新 omni_init
-    std::atomic<bool> session_stop_event{false};
+    std::atomic<bool> & session_stop_event;
     
     // 🔧 [双工模式] 记录当前 decode 是否以 <|listen|> 结束
     // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
-    std::atomic<bool> ended_with_listen{false};
+    std::atomic<bool> & ended_with_listen;
     
     // 🔧 [与 Python 对齐] LLM 生成结束标志
     // 当 LLM 检测到 end token 时设置为 true
     // TTS 线程检查此标志来决定是否添加 text_eos_embed
-    std::atomic<bool> llm_generation_done{false};
+    std::atomic<bool> & llm_generation_done;
     
     // ==================== 双工模式参数 ====================
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
@@ -258,7 +217,7 @@ struct omni_context {
     bool duplex_mode = false;
     
     // 系统 prompt 是否已初始化（防止 stream_prefill index=0 被重复调用导致 prompt 重复）
-    bool system_prompt_initialized = false;
+    bool & system_prompt_initialized;
     
     class AudioInputManager * audio_input_manager = NULL;
     
@@ -296,8 +255,8 @@ struct omni_context {
     std::mutex text_mtx;
     std::condition_variable text_cv;
     std::deque<std::string> text_queue;
-    bool text_streaming = false;
-    bool text_done_flag = false;
+    bool & text_streaming;
+    bool & text_done_flag;
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;
@@ -392,10 +351,10 @@ struct omni_context {
     // 每次取 28 个 tokens (25 main + 3 lookahead)，处理后移动 25 个，保留 3 个重叠
     std::vector<int32_t> token2wav_buffer;
     int token2wav_wav_idx = 0;  // 输出 WAV 文件计数器
-    int wav_turn_base = 0;      // 每轮对话结束时 +1000，用于区分不同轮次的 WAV 文件
+    int & wav_turn_base;        // 每轮对话结束时 +1000，用于区分不同轮次的 WAV 文件
     
     // 🔧 [单工模式] 当前轮次索引（用于创建 round_000、round_001 等子目录）
-    int simplex_round_idx = 0;
+    int & simplex_round_idx;
     
     // ==================== 特殊 Token ID ====================
     // 在 omni_init 时从词表查找并缓存
@@ -409,6 +368,12 @@ struct omni_context {
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
     llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
+
+    omni_context();
+    ~omni_context();
+
+    omni_context(const omni_context &) = delete;
+    omni_context & operator=(const omni_context &) = delete;
 };
 
 //

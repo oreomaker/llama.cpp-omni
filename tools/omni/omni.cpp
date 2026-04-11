@@ -1,6 +1,7 @@
 #include "omni-impl.h"
 #include "omni-output.h"
 #include "omni-python-t2w.h"
+#include "omni-turn-coordinator.h"
 #include "omni-token-protocol.h"
 #include "omni-worker-coordinator.h"
 #include "vision.h"
@@ -91,6 +92,38 @@ struct omni_output {
     std::vector<unit_buffer *> output;
     int idx;
 };
+
+omni_context::omni_context()
+    : n_past(session.n_past)
+    , n_keep(session.prompt.n_keep)
+    , round_start_positions(session.round_start_positions)
+    , max_preserved_context(session.max_preserved_context)
+    , sliding_window_config(session.sliding_window_config)
+    , unit_history(session.unit_history)
+    , next_unit_id(session.next_unit_id)
+    , pending_unit_id(session.pending_unit_id)
+    , pending_unit_start_cache_len(session.pending_unit_start_cache_len)
+    , system_preserve_length(session.prompt.system_preserve_length)
+    , position_offset(session.position_offset)
+    , sliding_event_count(session.sliding_event_count)
+    , total_dropped_tokens(session.total_dropped_tokens)
+    , total_dropped_units(session.total_dropped_units)
+    , need_speek(gate.prefill_requested)
+    , speek_done(gate.speech_ready)
+    , current_turn_ended(turn.current_turn_ended)
+    , break_event(gate.break_event)
+    , session_stop_event(gate.session_stop_event)
+    , ended_with_listen(turn.ended_with_listen)
+    , llm_generation_done(gate.llm_generation_done)
+    , system_prompt_initialized(session.prompt.system_prompt_initialized)
+    , text_streaming(gate.text_streaming)
+    , text_done_flag(gate.text_done)
+    , wav_turn_base(session.current_round.wav_turn_base)
+    , simplex_round_idx(session.current_round.round_idx) {
+    session.current_round.duplex_mode = false;
+}
+
+omni_context::~omni_context() = default;
 
 // 前向声明
 static void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size);
@@ -3360,6 +3393,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->media_type = media_type;
     ctx_omni->use_tts = use_tts;
     ctx_omni->duplex_mode = duplex_mode;
+    omni_session_sync_round_meta(ctx_omni);
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式
@@ -4071,11 +4105,6 @@ struct OmniBootstrapPrompts {
     std::string assistant_prompt;
 };
 
-struct PrefillContextDecision {
-    bool need_bootstrap = false;
-    bool should_start_workers = false;
-};
-
 static std::string omni_normalize_prefill_prompt(const std::string & prompt) {
     if (prompt.rfind("<|", 0) == 0) {
         return prompt;
@@ -4098,46 +4127,6 @@ static OmniBootstrapPrompts omni_select_bootstrap_prompts(const struct omni_cont
     };
 }
 
-// Step A: prepare one prefill round without touching encoding or LLM prefill protocol.
-static PrefillContextDecision omni_prepare_prefill_context(struct omni_context * ctx_omni, int index) {
-    if (ctx_omni->duplex_mode) {
-        duplex_timing_set_active_chunk(ctx_omni, index);
-    }
-
-    // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成。
-    if (ctx_omni->use_tts && index == 0 && ctx_omni->warmup_done.load() && !ctx_omni->duplex_mode) {
-        if (ctx_omni->break_event.load()) {
-            print_with_timestamp("TTS: break_event active, skipping wait for previous round\n");
-            ctx_omni->speek_done = true;
-            ctx_omni->break_event.store(false);
-            ctx_omni->workers.speek_cv.notify_all();
-        }
-        print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
-        std::unique_lock<std::mutex> lock(ctx_omni->workers.speek_mtx);
-        const bool wait_ok = ctx_omni->workers.speek_cv.wait_for(lock, std::chrono::seconds(5), [&] {
-            return ctx_omni->speek_done || ctx_omni->break_event.load();
-        });
-        if (!wait_ok) {
-            ctx_omni->speek_done = true;
-        }
-        ctx_omni->speek_done = false;
-
-        if (ctx_omni->tts_thread_info != nullptr) {
-            omni_clear_tts_queue(ctx_omni, "stream_prefill: cleared TTS queue for new turn");
-        }
-    } else if (ctx_omni->use_tts && index == 0 && !ctx_omni->duplex_mode) {
-        ctx_omni->speek_done = false;
-        if (ctx_omni->tts_thread_info != nullptr) {
-            omni_clear_tts_queue(ctx_omni);
-        }
-    }
-
-    PrefillContextDecision decision;
-    decision.need_bootstrap = index == 0 && !ctx_omni->system_prompt_initialized;
-    decision.should_start_workers = decision.need_bootstrap && ctx_omni->async;
-    return decision;
-}
-
 static std::string omni_get_bootstrap_ref_audio_path(const struct omni_context * ctx_omni, const std::string & aud_fname) {
     if (ctx_omni->duplex_mode && !aud_fname.empty()) {
         return aud_fname;
@@ -4150,7 +4139,7 @@ static std::string omni_get_bootstrap_ref_audio_path(const struct omni_context *
 // Step B: bootstrap the session once, including system prompt and ref-audio prefill.
 static bool omni_run_session_bootstrap_if_needed(
         struct omni_context * ctx_omni,
-        const PrefillContextDecision & decision,
+        const OmniPrefillTurnDecision & decision,
         const OmniBootstrapPrompts & prompts,
         const std::string & aud_fname,
         int index) {
@@ -8331,7 +8320,11 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
 }
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {
-    const PrefillContextDecision decision = omni_prepare_prefill_context(ctx_omni, index);
+    if (ctx_omni->duplex_mode) {
+        duplex_timing_set_active_chunk(ctx_omni, index);
+    }
+
+    const OmniPrefillTurnDecision decision = omni_turn_coordinator_begin_prefill(ctx_omni, index);
     const OmniBootstrapPrompts prompts = omni_select_bootstrap_prompts(ctx_omni);
 
     if (!omni_run_session_bootstrap_if_needed(ctx_omni, decision, prompts, aud_fname, index)) {
@@ -8383,63 +8376,6 @@ static bool omni_can_decode(struct omni_context * ctx_omni) {
         return false;
     }
     return true;
-}
-
-// Step E: prepare one decode round and sync async prefill state.
-static void omni_prepare_decode_context(
-        struct omni_context * ctx_omni,
-        const LlmDecodeRequest & request) {
-    // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
-    // 如果需要归档，可以在新 session 开始时（omni_init）手动调用
-    // move_old_output_to_archive();
-
-    if (request.round_idx >= 0 && !ctx_omni->duplex_mode) {
-        if (ctx_omni->simplex_round_idx != request.round_idx) {
-            print_with_timestamp("📍 [轮次同步] 调用方指定 round_idx=%d，当前 simplex_round_idx=%d，强制同步\n",
-                                request.round_idx, ctx_omni->simplex_round_idx);
-            ctx_omni->simplex_round_idx = request.round_idx;
-            ctx_omni->wav_turn_base = request.round_idx * 1000;
-        }
-    }
-
-    ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
-    print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n",
-                         ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx, ctx_omni->duplex_mode);
-
-    if (!ctx_omni->duplex_mode) {
-        ctx_omni->llm_generation_done.store(false);
-    }
-    ctx_omni->ended_with_listen = false;
-
-    if (ctx_omni->duplex_mode && ctx_omni->break_event.load()) {
-        ctx_omni->break_event.store(false);
-        print_with_timestamp("📍 stream_decode: reset break_event from true to false\n");
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
-        ctx_omni->text_queue.clear();
-        ctx_omni->text_done_flag = false;
-        ctx_omni->text_streaming = true;
-    }
-
-    if (ctx_omni->async) {
-        const OmniWorkerThreadFns worker_fns = {
-            llm_thread_func,
-            tts_thread_func,
-            tts_thread_func_duplex,
-            t2w_thread_func,
-        };
-        omni_ensure_decode_workers_started(ctx_omni, worker_fns);
-        omni_request_prefill(ctx_omni);
-        print_with_timestamp("wait prefill done\n");
-        omni_wait_for_prefill_completion(ctx_omni);
-        omni_reset_prefill_completion(ctx_omni);
-    }
-
-    if (ctx_omni->use_tts) {
-        ctx_omni->speek_done = false;
-    }
 }
 
 // Step F: build the decode prefix inside the LLM stage protocol builder.
@@ -8665,7 +8601,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
 
     const LlmDecodeRequest request = { std::move(debug_dir), round_idx };
-    omni_prepare_decode_context(ctx_omni, request);
+    const OmniWorkerThreadFns worker_fns = {
+        llm_thread_func,
+        tts_thread_func,
+        tts_thread_func_duplex,
+        t2w_thread_func,
+    };
+    omni_turn_coordinator_prepare_decode(ctx_omni, request.round_idx, worker_fns);
     omni_apply_decode_prefix(ctx_omni, omni_build_decode_prefix(ctx_omni));
 
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
