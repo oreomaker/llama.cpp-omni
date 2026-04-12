@@ -10,6 +10,8 @@ add_library(omni
             omni.h
             omni-session-state.cpp
             omni-session-state.h
+            omni-sliding-window.cpp
+            omni-sliding-window.h
             omni-turn-coordinator.cpp
             omni-turn-coordinator.h
             omni-runtime-messages.h

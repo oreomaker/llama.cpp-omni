@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "omni-session-state.h"
 #include "omni-runtime-messages.h"
+#include "omni-sliding-window.h"
 #include "omni-worker-state.h"
 
 #include <thread>
@@ -58,14 +59,6 @@ struct LLMThreadInfo {
     std::chrono::steady_clock::time_point end;
 
     LLMThreadInfo(int maxQueueSize) : MAX_QUEUE_SIZE(maxQueueSize) {}
-};
-
-struct T2WOut {
-    std::vector<llama_token> audio_tokens;  // Audio token IDs (25 tokens per chunk)
-    bool is_final = false;  // Whether this is the final chunk (turn end)
-    bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
-    OmniRoundMeta round_meta;  // 当前消息所属轮次，由上游线程显式传递
-    int duplex_chunk_idx = -1;  // Duplex test chunk index for timing aggregation
 };
 
 struct T2WThreadInfo {
@@ -437,18 +430,6 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
 void projector_free(projector_model & model);
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
-
-// ==================== 滑动窗口函数声明 (#39) ====================
-// Unit 管理
-int sliding_window_register_unit_start(struct omni_context * ctx_omni);
-void sliding_window_register_unit_end(struct omni_context * ctx_omni, const std::string & input_type, 
-                                      const std::vector<llama_token> & generated_tokens = {}, bool is_listen = false);
-void sliding_window_register_system_prompt(struct omni_context * ctx_omni);
-
-// 滑窗执行
-bool sliding_window_enforce(struct omni_context * ctx_omni);
-bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int length);
-void sliding_window_reset(struct omni_context * ctx_omni);
 
 // ==================== 高清模式函数声明 ====================
 // 设置 vision max_slice_nums 覆盖值，用于高清模式

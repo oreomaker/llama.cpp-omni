@@ -1,6 +1,7 @@
 #include "omni-output.h"
 
 #include "omni-impl.h"
+#include "omni-session-state.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -129,6 +130,20 @@ bool omni_ensure_directory(const std::string & dir_path) {
     }
 
     return true;
+}
+
+std::string omni_round_output_dir(const std::string & base_output_dir, const OmniRoundMeta & round_meta) {
+    if (round_meta.duplex_mode) {
+        return base_output_dir;
+    }
+
+    char round_dir[512];
+    snprintf(round_dir, sizeof(round_dir), "%s/round_%03d", base_output_dir.c_str(), round_meta.round_idx);
+    return std::string(round_dir);
+}
+
+std::string omni_round_tts_wav_output_dir(const std::string & base_output_dir, const OmniRoundMeta & round_meta) {
+    return omni_round_output_dir(base_output_dir, round_meta) + "/tts_wav";
 }
 
 static bool omni_dir_has_content(const std::string & dir_path) {

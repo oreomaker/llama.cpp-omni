@@ -23,6 +23,14 @@ struct LLMOut {
     int duplex_chunk_idx = -1;
 };
 
+struct T2WOut {
+    std::vector<llama_token> audio_tokens;
+    bool is_final = false;
+    bool is_chunk_end = false;
+    OmniRoundMeta round_meta;
+    int duplex_chunk_idx = -1;
+};
+
 struct TTSThreadInfo {
     const int MAX_QUEUE_SIZE;
     std::queue<LLMOut *> queue;
