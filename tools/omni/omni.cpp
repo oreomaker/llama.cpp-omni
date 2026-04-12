@@ -76,6 +76,7 @@ void llm_thread_func(struct omni_context * ctx_omni, common_params * params);
 void tts_thread_func(struct omni_context * ctx_omni, common_params * params);
 void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params * params);
 void t2w_thread_func(struct omni_context * ctx_omni, common_params * params);
+void omni_finalize_decode_round(struct omni_context * ctx_omni);
 
 //
 // omni structure
@@ -217,19 +218,6 @@ static std::string omni_round_output_dir(const std::string & base_output_dir, co
 
 static std::string omni_round_tts_wav_output_dir(const std::string & base_output_dir, const OmniRoundMeta & round_meta) {
     return omni_round_output_dir(base_output_dir, round_meta) + "/tts_wav";
-}
-
-static OmniRoundMeta omni_advance_simplex_round_meta(
-        struct omni_context * ctx_omni,
-        const OmniRoundMeta & current_round_meta) {
-    if (ctx_omni == nullptr || current_round_meta.duplex_mode) {
-        return current_round_meta;
-    }
-
-    const OmniRoundMeta next_round_meta =
-        omni_session_make_round_meta(ctx_omni, current_round_meta.round_idx + 1);
-    omni_session_set_round_meta(ctx_omni, next_round_meta);
-    return next_round_meta;
 }
 
 //
@@ -4166,11 +4154,11 @@ static std::string omni_get_bootstrap_ref_audio_path(const struct omni_context *
 // Step B: bootstrap the session once, including system prompt and ref-audio prefill.
 static bool omni_run_session_bootstrap_if_needed(
         struct omni_context * ctx_omni,
-        const OmniPrefillTurnDecision & decision,
+        const OmniPrefillSetup & setup,
         const OmniBootstrapPrompts & prompts,
         const std::string & aud_fname,
         int index) {
-    if (!decision.need_bootstrap) {
+    if (!setup.need_bootstrap) {
         return true;
     }
 
@@ -4223,7 +4211,7 @@ static bool omni_run_session_bootstrap_if_needed(
     sliding_window_register_system_prompt(ctx_omni);
     print_with_timestamp("n_past = %d\n", ctx_omni->n_past);
 
-    if (decision.should_start_workers) {
+    if (setup.should_start_workers) {
         const OmniWorkerThreadFns worker_fns = {
             llm_thread_func,
             tts_thread_func,
@@ -6241,10 +6229,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
 
     print_with_timestamp("TTS thread started\n");
 
-    // 🔧 [单工模式] 标志位：当前 break_event 是否已经递增过 round_idx
-    // 防止在等待 T2W 线程清除 break_event 期间重复递增
-    bool break_round_incremented = false;
-
     // Multi Round Persistent Loop
     while(ctx_omni->workers.tts_thread_running) {
         
@@ -6256,14 +6240,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         if (ctx_omni->break_event.load()) {
             // 清空 TTS 队列（队列元素类型是 LLMOut*）
             omni_clear_tts_queue(ctx_omni);
-            
-            // 🔧 [单工模式] 打断时递增 round 索引（只递增一次！）
-            if (!ctx_omni->duplex_mode && !break_round_incremented) {
-                active_round_meta = omni_advance_simplex_round_meta(ctx_omni, active_round_meta);
-                break_round_incremented = true;  // 标记已递增，防止重复
-                print_with_timestamp("TTS: 打断触发，下一轮 round_idx=%d\n", active_round_meta.round_idx);
-                update_output_dirs();
-            }
             
             // 重置状态
             llm_finish = false;
@@ -6279,11 +6255,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             ctx_omni->tts_condition_saved = false;
             // 不清除 break_event，让 T2W 线程也能检测到
             continue;
-        }
-        
-        // 🔧 [单工模式] break_event 被 T2W 线程清除后，重置标志位
-        if (break_round_incremented && !ctx_omni->break_event.load()) {
-            break_round_incremented = false;
         }
 
         std::string llm_text = "";
@@ -6471,12 +6442,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 }
                 ctx_omni->t2w_thread_info->cv.notify_one();
                 print_with_timestamp("TTS: sent is_final=true to T2W (llm_finish with no data)\n");
-
-                if (!completed_round_meta.duplex_mode) {
-                    active_round_meta = omni_advance_simplex_round_meta(ctx_omni, completed_round_meta);
-                    print_with_timestamp("TTS: 单工模式轮次结束，下一轮 round_idx=%d\n", active_round_meta.round_idx);
-                    update_output_dirs();
-                }
             }
             
             ctx_omni->speek_done = true;
@@ -6998,11 +6963,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     }
                     ctx_omni->t2w_thread_info->cv.notify_one();
                     print_with_timestamp("TTS: sent is_final=true to T2W queue (turn end)\n");
-                }
-                if (!completed_round_meta.duplex_mode) {
-                    active_round_meta = omni_advance_simplex_round_meta(ctx_omni, completed_round_meta);
-                    print_with_timestamp("TTS: 单工模式轮次结束，下一轮 round_idx=%d\n", active_round_meta.round_idx);
-                    update_output_dirs();
                 }
                 ctx_omni->tts_n_past_accumulated = 0;
                 ctx_omni->tts_all_generated_tokens.clear();
@@ -8263,14 +8223,14 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         duplex_timing_set_active_chunk(ctx_omni, index);
     }
 
-    const OmniPrefillTurnDecision decision = omni_turn_coordinator_begin_prefill(ctx_omni, index);
+    const OmniPrefillSetup setup = omni_turn_coordinator_prepare_prefill(ctx_omni, index);
     const OmniBootstrapPrompts prompts = omni_select_bootstrap_prompts(ctx_omni);
 
-    if (!omni_run_session_bootstrap_if_needed(ctx_omni, decision, prompts, aud_fname, index)) {
+    if (!omni_run_session_bootstrap_if_needed(ctx_omni, setup, prompts, aud_fname, index)) {
         return false;
     }
 
-    if (!decision.need_bootstrap) {
+    if (!setup.need_bootstrap) {
         auto encoded = std::make_unique<struct omni_embeds>();
         if (!omni_encode_prefill_input(ctx_omni, aud_fname, img_fname, index, max_slice_nums, *encoded)) {
             return false;
@@ -8509,7 +8469,7 @@ static void omni_finish_decode_text_stream(struct omni_context * ctx_omni) {
 }
 
 // Step H: finalize the decode round and preserve simplex turn boundaries.
-static void omni_finalize_decode_round(struct omni_context * ctx_omni) {
+void omni_finalize_decode_round(struct omni_context * ctx_omni) {
     if (ctx_omni->duplex_mode) {
         return;
     }
@@ -8723,24 +8683,12 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
     fflush(stdout);
     omni_finish_decode_text_stream(ctx_omni);
-    omni_finalize_decode_round(ctx_omni);
+    omni_turn_coordinator_close(ctx_omni, OmniTurnCloseKind::finish);
     return true;
 }
 
 bool stop_speek(struct omni_context * ctx_omni){
-    ctx_omni->speek_done = true;
-    if (ctx_omni->use_tts && ctx_omni->tts_thread_info) {
-        std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
-        while(!ctx_omni->tts_thread_info->queue.empty()){
-            LLMOut *llm_out = ctx_omni->tts_thread_info->queue.front();
-            if (llm_out) {
-                delete llm_out;
-                llm_out = nullptr;
-            }
-            ctx_omni->tts_thread_info->queue.pop();
-        }
-        ctx_omni->tts_thread_info->cv.notify_all();
-    }
+    omni_turn_coordinator_close(ctx_omni, OmniTurnCloseKind::abort, "stop_speek");
     return true;
 }
 

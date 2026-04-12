@@ -7,22 +7,55 @@
 #include <chrono>
 
 void print_with_timestamp(const char * format, ...);
+void omni_finalize_decode_round(struct omni_context * ctx_omni);
 
-OmniPrefillTurnDecision omni_turn_coordinator_begin_prefill(struct omni_context * ctx_omni, int index) {
-    OmniPrefillTurnDecision decision;
+static const char * omni_turn_close_kind_name(OmniTurnCloseKind kind) {
+    return kind == OmniTurnCloseKind::abort ? "abort" : "finish";
+}
+
+static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(
+        struct omni_context * ctx_omni,
+        OmniTurnCloseKind kind) {
+    OmniTurnCloseResult result;
     if (ctx_omni == nullptr) {
-        return decision;
+        return result;
     }
 
-    decision.need_bootstrap = index == 0 && !ctx_omni->system_prompt_initialized;
-    decision.should_start_workers = decision.need_bootstrap && ctx_omni->async;
+    result.completed_round = omni_session_round_meta(ctx_omni);
+    result.active_round = result.completed_round;
+    result.interrupted = kind == OmniTurnCloseKind::abort;
+
+    if (ctx_omni->duplex_mode || ctx_omni->current_turn_ended) {
+        result.turn_closed = ctx_omni->current_turn_ended;
+        return result;
+    }
+
+    omni_finalize_decode_round(ctx_omni);
+    ctx_omni->current_turn_ended = true;
+
+    result.turn_closed = true;
+    result.active_round = omni_session_make_round_meta(ctx_omni, result.completed_round.round_idx + 1);
+    omni_session_set_round_meta(ctx_omni, result.active_round);
+
+    print_with_timestamp("TurnCoordinator: %s simplex turn round_idx=%d -> %d\n",
+                         omni_turn_close_kind_name(kind),
+                         result.completed_round.round_idx,
+                         result.active_round.round_idx);
+    return result;
+}
+
+OmniPrefillSetup omni_turn_coordinator_prepare_prefill(struct omni_context * ctx_omni, int index) {
+    OmniPrefillSetup setup;
+    if (ctx_omni == nullptr) {
+        return setup;
+    }
+
+    setup.need_bootstrap = index == 0 && !ctx_omni->system_prompt_initialized;
+    setup.should_start_workers = setup.need_bootstrap && ctx_omni->async;
 
     if (!(ctx_omni->use_tts && index == 0 && !ctx_omni->duplex_mode)) {
-        return decision;
+        return setup;
     }
-
-    decision.transition.should_wait_for_tts = true;
-    decision.transition.should_clear_tts_queue = true;
 
     if (ctx_omni->warmup_done.load()) {
         if (ctx_omni->break_event.load()) {
@@ -30,7 +63,6 @@ OmniPrefillTurnDecision omni_turn_coordinator_begin_prefill(struct omni_context 
             ctx_omni->speek_done = true;
             ctx_omni->break_event.store(false);
             ctx_omni->workers.speek_cv.notify_all();
-            decision.transition.interrupted = true;
         }
 
         print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
@@ -50,7 +82,7 @@ OmniPrefillTurnDecision omni_turn_coordinator_begin_prefill(struct omni_context 
             ctx_omni->warmup_done.load() ? "stream_prefill: cleared TTS queue for new turn" : nullptr);
     }
 
-    return decision;
+    return setup;
 }
 
 void omni_turn_coordinator_prepare_decode(
@@ -73,6 +105,7 @@ void omni_turn_coordinator_prepare_decode(
     print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n",
                          ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx, ctx_omni->duplex_mode);
 
+    ctx_omni->current_turn_ended = false;
     if (!ctx_omni->duplex_mode) {
         ctx_omni->llm_generation_done.store(false);
     }
@@ -101,4 +134,55 @@ void omni_turn_coordinator_prepare_decode(
     if (ctx_omni->use_tts) {
         ctx_omni->speek_done = false;
     }
+}
+
+OmniTurnCloseResult omni_turn_coordinator_close(
+        struct omni_context * ctx_omni,
+        OmniTurnCloseKind kind,
+        const char * reason) {
+    OmniTurnCloseResult result;
+    if (ctx_omni == nullptr) {
+        return result;
+    }
+
+    const bool turn_was_ended = ctx_omni->current_turn_ended;
+
+    if (kind == OmniTurnCloseKind::abort) {
+        ctx_omni->break_event.store(true);
+        ctx_omni->ended_with_listen.store(false);
+        ctx_omni->llm_generation_done.store(false);
+        ctx_omni->speek_done = true;
+        ctx_omni->workers.speek_cv.notify_all();
+
+        omni_clear_tts_queue(ctx_omni);
+        if (ctx_omni->tts_thread_info != nullptr) {
+            ctx_omni->tts_thread_info->cv.notify_all();
+        }
+        if (ctx_omni->t2w_thread_info != nullptr) {
+            ctx_omni->t2w_thread_info->cv.notify_all();
+        }
+    }
+
+    if (!ctx_omni->duplex_mode && !turn_was_ended) {
+        result = omni_turn_coordinator_close_simplex_turn(ctx_omni, kind);
+    } else {
+        result.completed_round = omni_session_round_meta(ctx_omni);
+        result.active_round = result.completed_round;
+        result.interrupted = kind == OmniTurnCloseKind::abort;
+        if (kind == OmniTurnCloseKind::abort) {
+            result.turn_closed = true;
+            ctx_omni->current_turn_ended = true;
+        } else {
+            result.turn_closed = ctx_omni->current_turn_ended;
+        }
+    }
+
+    print_with_timestamp("TurnCoordinator: close(kind=%s, reason=%s, duplex_mode=%d, turn_was_ended=%d, round_idx=%d, next_round_idx=%d)\n",
+                         omni_turn_close_kind_name(kind),
+                         reason != nullptr ? reason : "none",
+                         ctx_omni->duplex_mode ? 1 : 0,
+                         turn_was_ended ? 1 : 0,
+                         result.completed_round.round_idx,
+                         result.active_round.round_idx);
+    return result;
 }

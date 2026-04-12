@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "omni.h"
+#include "omni-turn-coordinator.h"
 
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
@@ -5854,10 +5855,9 @@ int main(int argc, char ** argv) {
         //   reason: string (optional) - 打断原因，用于日志
         // 
         // 打断机制：
-        //   1. 设置 break_event = true，通知 LLM/TTS 线程停止生成
+        //   1. 通过 turn coordinator 设置 break_event，并收口 turn abort 语义
         //   2. 清空 text_queue (文本流队列)
-        //   3. 设置 current_turn_ended = true，表示当前轮次结束
-        //   4. TTS/T2W 队列由各自线程检测 break_event 后自行清理
+        //   3. TTS/T2W 队列由各自线程检测 break_event 后自行清理
         //
         // 注意：打断后需要重新调用 prefill 来开始新的输入
         
@@ -5874,9 +5874,8 @@ int main(int argc, char ** argv) {
             
             SRV_INF("%s: break requested, reason=%s\n", __func__, reason.c_str());
             
-            // 1. 设置打断标志 - 原子操作，线程安全
-            ctx_server.octx->break_event = true;
-            ctx_server.octx->current_turn_ended = true;
+            // 1. 通过 turn coordinator 统一解释 break 语义
+            omni_turn_coordinator_close(ctx_server.octx, OmniTurnCloseKind::abort, reason.c_str());
             
             // 2. 清空 text_queue 并通知等待的消费者
             {
