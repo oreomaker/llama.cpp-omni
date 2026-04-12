@@ -64,7 +64,7 @@ struct T2WOut {
     std::vector<llama_token> audio_tokens;  // Audio token IDs (25 tokens per chunk)
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
-    int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    OmniRoundMeta round_meta;  // 当前消息所属轮次，由上游线程显式传递
     int duplex_chunk_idx = -1;  // Duplex test chunk index for timing aggregation
 };
 

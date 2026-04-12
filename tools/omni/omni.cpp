@@ -205,6 +205,33 @@ static void duplex_timing_note_t2w(struct omni_context * ctx_omni, int chunk_idx
     }
 }
 
+static std::string omni_round_output_dir(const std::string & base_output_dir, const OmniRoundMeta & round_meta) {
+    if (round_meta.duplex_mode) {
+        return base_output_dir;
+    }
+
+    char round_dir[512];
+    snprintf(round_dir, sizeof(round_dir), "%s/round_%03d", base_output_dir.c_str(), round_meta.round_idx);
+    return std::string(round_dir);
+}
+
+static std::string omni_round_tts_wav_output_dir(const std::string & base_output_dir, const OmniRoundMeta & round_meta) {
+    return omni_round_output_dir(base_output_dir, round_meta) + "/tts_wav";
+}
+
+static OmniRoundMeta omni_advance_simplex_round_meta(
+        struct omni_context * ctx_omni,
+        const OmniRoundMeta & current_round_meta) {
+    if (ctx_omni == nullptr || current_round_meta.duplex_mode) {
+        return current_round_meta;
+    }
+
+    const OmniRoundMeta next_round_meta =
+        omni_session_make_round_meta(ctx_omni, current_round_meta.round_idx + 1);
+    omni_session_set_round_meta(ctx_omni, next_round_meta);
+    return next_round_meta;
+}
+
 //
 // omni mtmd embed
 //
@@ -4615,6 +4642,7 @@ static bool generate_audio_tokens_local_simplex(
     int tts_n_embd,
     int chunk_idx,
     std::vector<int32_t>& output_audio_tokens,
+    const OmniRoundMeta & round_meta,
     const std::string& output_dir = "",
     bool is_final_text_chunk = false  // 🔧 [与 Python 对齐] 是否是最后一个 text chunk
 ) {
@@ -4793,7 +4821,7 @@ static bool generate_audio_tokens_local_simplex(
             t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                          ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
             t2w_out->is_final = false;
-            t2w_out->round_idx = ctx_omni->simplex_round_idx;
+            t2w_out->round_meta = round_meta;
             
             {
                 std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -4889,7 +4917,7 @@ static bool generate_audio_tokens_local_simplex(
                     t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                                  ctx_omni->tts_token_buffer.begin() + CHUNK_SIZE);
                     t2w_out->is_final = false;
-                    t2w_out->round_idx = ctx_omni->simplex_round_idx;
+                    t2w_out->round_meta = round_meta;
                     {
                         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                         ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -4922,7 +4950,7 @@ static bool generate_audio_tokens_local_simplex(
         t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                      ctx_omni->tts_token_buffer.end());
         t2w_out->is_final = false;  // 注意：这里不设 is_final=true，is_final 由 tts_thread_func 在 llm_finish 时发送
-        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+        t2w_out->round_meta = round_meta;
         
         {
             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -4942,7 +4970,7 @@ static bool generate_audio_tokens_local_simplex(
         t2w_out->audio_tokens.clear();  // 空的 token 列表
         t2w_out->is_final = false;  // Not final (turn not ended)
         t2w_out->is_chunk_end = true;  // 🔧 标记 chunk 结束，T2W 需要 flush buffer
-        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+        t2w_out->round_meta = round_meta;
         
         {
             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -5003,6 +5031,7 @@ static bool generate_audio_tokens_local(
     int duplex_chunk_idx,
     std::vector<int32_t>& output_audio_tokens,
     bool is_end_of_turn = false,  // 🔧 [与 Python 对齐] 是否是轮次结束
+    const OmniRoundMeta & round_meta = {},
     const std::string& output_dir = ""
 ) {
     print_with_timestamp("TTS Local: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d, emb_size=%zu)\n", 
@@ -5263,7 +5292,7 @@ static bool generate_audio_tokens_local(
             t2w_out->audio_tokens.assign(stream_buffer.begin(), stream_buffer.end());
             t2w_out->is_final = false;
             t2w_out->is_chunk_end = false;  // 🔧 中间推送，不是 chunk 结束
-            t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+            t2w_out->round_meta = round_meta;
             t2w_out->duplex_chunk_idx = duplex_chunk_idx;
             
             {
@@ -5293,7 +5322,7 @@ static bool generate_audio_tokens_local(
         // Python: token2wav.stream(..., last_chunk=is_last_chunk) 其中 is_last_chunk = end_of_turn
         t2w_out->is_final = is_end_of_turn;
         t2w_out->is_chunk_end = !is_end_of_turn;  // 非 turn 结束时才用 is_chunk_end
-        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+        t2w_out->round_meta = round_meta;
         t2w_out->duplex_chunk_idx = duplex_chunk_idx;
         
         {
@@ -5520,6 +5549,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     const std::string tts_output_dir = base_output_dir + "/tts_txt";
     const std::string llm_debug_output_dir = base_output_dir + "/llm_debug";
     const std::string tts_wav_output_dir = base_output_dir + "/tts_wav";
+    OmniRoundMeta active_round_meta = omni_session_round_meta(ctx_omni);
     
     // Helper function to create directory
     auto create_dir = [](const std::string& dir_path) {
@@ -5627,6 +5657,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 queue.pop();
                 llm_finish |= llm_out->llm_finish;
                 accumulated_is_end_of_turn |= llm_out->is_end_of_turn;
+                active_round_meta = llm_out->round_meta;
                 
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
                     llm_text += llm_out->text;
@@ -5675,7 +5706,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->audio_tokens.clear();
                         t2w_out->is_final = false;
                         t2w_out->is_chunk_end = true;
-                        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->round_meta = active_round_meta;
                         t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -5744,7 +5775,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     t2w_out->audio_tokens.clear();
                     t2w_out->is_final = false;
                     t2w_out->is_chunk_end = true;
-                    t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                    t2w_out->round_meta = active_round_meta;
                     t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
                     {
                         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -5766,7 +5797,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     t2w_out->audio_tokens.clear();
                     t2w_out->is_final = true;
                     t2w_out->is_chunk_end = false;
-                    t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                    t2w_out->round_meta = active_round_meta;
                     {
                         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                         ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -5973,7 +6004,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 
                 bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, merged_embeddings,
                                                 n_tokens_filtered, tts_n_embd, current_chunk_idx, current_chunk_perf_idx,
-                                                audio_tokens_out, is_end_of_turn, tts_wav_output_dir);
+                                                audio_tokens_out, is_end_of_turn, active_round_meta, tts_wav_output_dir);
                 
                 if (tts_gen_success) {
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
@@ -6006,7 +6037,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->audio_tokens.clear();
                         t2w_out->is_final = false;
                         t2w_out->is_chunk_end = true;
-                        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->round_meta = active_round_meta;
                         t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -6022,7 +6053,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         T2WOut *t2w_out = new T2WOut();
                         t2w_out->audio_tokens.clear();
                         t2w_out->is_final = true;
-                        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->round_meta = active_round_meta;
                         t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -6061,7 +6092,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 
                 bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, empty_embeddings,
                                                 n_tokens_for_tts, tts_n_embd, current_chunk_idx, current_chunk_perf_idx,
-                                                audio_tokens_out, true, tts_wav_output_dir);
+                                                audio_tokens_out, true, active_round_meta, tts_wav_output_dir);
                 
                 if (tts_gen_success) {
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
@@ -6071,7 +6102,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                         t2w_out->audio_tokens.clear();
                         t2w_out->is_final = true;
                         t2w_out->is_chunk_end = false;
-                        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->round_meta = active_round_meta;
                         t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -6128,6 +6159,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     
     // 🔧 [多实例支持] 使用可配置的 base_output_dir
     const std::string& base_output_dir = ctx_omni->base_output_dir;
+    OmniRoundMeta active_round_meta = omni_session_round_meta(ctx_omni);
     
     // Helper function to create directory
     struct stat info;
@@ -6149,20 +6181,12 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     
     // 🔧 [单工模式] Helper function to get round-specific output directory
     // 单工模式下返回 output/round_XXX，双工模式下返回 output
-    auto get_round_output_dir = [&]() -> std::string {
-        if (!ctx_omni->duplex_mode) {
-            // 单工模式：使用 round_XXX 子目录
-            char round_dir[512];
-            snprintf(round_dir, sizeof(round_dir), "%s/round_%03d", base_output_dir.c_str(), ctx_omni->simplex_round_idx);
-            return std::string(round_dir);
-        } else {
-            // 双工模式：直接使用 base_output_dir
-            return base_output_dir;
-        }
+    auto get_round_output_dir = [&](const OmniRoundMeta & round_meta) -> std::string {
+        return omni_round_output_dir(base_output_dir, round_meta);
     };
     
     // 🔧 [单工模式] 动态目录路径（每轮开始时更新）
-    std::string current_round_dir = get_round_output_dir();
+    std::string current_round_dir = get_round_output_dir(active_round_meta);
     std::string tts_output_dir = current_round_dir + "/tts_txt";
     std::string llm_debug_output_dir = current_round_dir + "/llm_debug";
     std::string tts_wav_output_dir = current_round_dir + "/tts_wav";
@@ -6172,19 +6196,19 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     
     // 🔧 [单工模式] Helper function to update output directories for current round
     auto update_output_dirs = [&]() {
-        current_round_dir = get_round_output_dir();
+        current_round_dir = get_round_output_dir(active_round_meta);
         tts_output_dir = current_round_dir + "/tts_txt";
         llm_debug_output_dir = current_round_dir + "/llm_debug";
         tts_wav_output_dir = current_round_dir + "/tts_wav";
         
         // 只在新的 round 时创建目录
-        if (ctx_omni->simplex_round_idx != last_created_round_idx || ctx_omni->duplex_mode) {
+        if (active_round_meta.round_idx != last_created_round_idx || active_round_meta.duplex_mode) {
             create_dir(tts_output_dir);
             create_dir(llm_debug_output_dir);
             create_dir(tts_wav_output_dir);
-            last_created_round_idx = ctx_omni->simplex_round_idx;
+            last_created_round_idx = active_round_meta.round_idx;
             
-            if (!ctx_omni->duplex_mode) {
+            if (!active_round_meta.duplex_mode) {
                 print_with_timestamp("TTS: 创建单工模式输出目录: %s\n", current_round_dir.c_str());
             }
         }
@@ -6235,12 +6259,10 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             // 🔧 [单工模式] 打断时递增 round 索引（只递增一次！）
             if (!ctx_omni->duplex_mode && !break_round_incremented) {
-                ctx_omni->simplex_round_idx++;
-                // 🔧 [移除] wav_turn_base 的递增移到 T2W 线程的打断处理中
-                // 原因：避免竞态条件，确保 T2W 先处理完当前轮次的所有数据再递增
-                // ctx_omni->wav_turn_base += 1000;  // 已移到 T2W 线程
+                active_round_meta = omni_advance_simplex_round_meta(ctx_omni, active_round_meta);
                 break_round_incremented = true;  // 标记已递增，防止重复
-                print_with_timestamp("TTS: 打断触发，下一轮 round_idx=%d\n", ctx_omni->simplex_round_idx);
+                print_with_timestamp("TTS: 打断触发，下一轮 round_idx=%d\n", active_round_meta.round_idx);
+                update_output_dirs();
             }
             
             // 重置状态
@@ -6299,6 +6321,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             if (!queue.empty()) {
                 LLMOut *llm_out = queue.front();
                 llm_finish |= llm_out->llm_finish;
+                active_round_meta = llm_out->round_meta;
                 // 只取一个 chunk 的数据
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
                     llm_text = llm_out->text;  // 注意：= 而不是 +=
@@ -6330,6 +6353,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
+            update_output_dirs();
             
             // 🔧 [诊断] 打印取出数据后的关键状态
             print_with_timestamp("TTS: after queue pop - speek_done=%d, llm_finish=%d, llm_text.empty=%d, token_ids.size=%zu\n",
@@ -6422,7 +6446,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), 
                                              ctx_omni->tts_token_buffer.end());
                 t2w_out->is_final = false;  // 先发送剩余 tokens
-                t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                t2w_out->round_meta = active_round_meta;
                 {
                     std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                     ctx_omni->t2w_thread_info->queue.push(t2w_out);
@@ -6435,25 +6459,24 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             
             // 🔧 [修复] 发送 is_final=true 到 T2W，让 T2W 写入 generation_done.flag
             if (ctx_omni->t2w_thread_info) {
-                // 🔧 保存当前 round_idx 用于 T2W（递增前的值）
-                int current_round_idx = ctx_omni->simplex_round_idx;
-                
-                // 单工模式：递增 round_idx
-                if (!ctx_omni->duplex_mode) {
-                    ctx_omni->simplex_round_idx++;
-                    print_with_timestamp("TTS: 单工模式轮次结束，下一轮 round_idx=%d\n", ctx_omni->simplex_round_idx);
-                }
+                const OmniRoundMeta completed_round_meta = active_round_meta;
                 
                 T2WOut *t2w_final = new T2WOut();
                 t2w_final->audio_tokens.clear();
                 t2w_final->is_final = true;
-                t2w_final->round_idx = current_round_idx;  // 🔧 使用递增前的值
+                t2w_final->round_meta = completed_round_meta;
                 {
                     std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                     ctx_omni->t2w_thread_info->queue.push(t2w_final);
                 }
                 ctx_omni->t2w_thread_info->cv.notify_one();
                 print_with_timestamp("TTS: sent is_final=true to T2W (llm_finish with no data)\n");
+
+                if (!completed_round_meta.duplex_mode) {
+                    active_round_meta = omni_advance_simplex_round_meta(ctx_omni, completed_round_meta);
+                    print_with_timestamp("TTS: 单工模式轮次结束，下一轮 round_idx=%d\n", active_round_meta.round_idx);
+                    update_output_dirs();
+                }
             }
             
             ctx_omni->speek_done = true;
@@ -6881,7 +6904,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 // 🔧 [与 Python 对齐] 传递 is_final_text_chunk，用于 flush buffer
                 tts_gen_success = generate_audio_tokens_local_simplex(ctx_omni, params, merged_embeddings,
                                                 n_tokens_filtered, tts_n_embd, current_chunk_idx,
-                                                audio_tokens, tts_wav_output_dir, is_final_text_chunk);
+                                                audio_tokens, active_round_meta, tts_wav_output_dir, is_final_text_chunk);
                 if (tts_gen_success) {
                     tts_success = true;
                     
@@ -6937,7 +6960,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                             ctx_omni->tts_token_buffer.end()
                         );
                         t2w_out->is_final = false;  // 还不是最后一个，后面还有 turn_end 的 is_final
-                        t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                        t2w_out->round_meta = active_round_meta;
                         
                         {
                             std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -6957,17 +6980,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 // Merge all WAV files into a single file
                 omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
                 // Python: end_of_turn = last_id in turn_terminator_token_ids
-                
-                // 🔧 保存当前 round_idx 用于 T2W（递增前的值）
-                int current_round_idx = ctx_omni->simplex_round_idx;
-                
-                // 🔧 [单工模式] 先递增 round 索引，再发送 is_final
-                // 这样 T2W 线程在处理完 is_final 后能立即检测到新的 round_idx
-                // 避免竞态条件导致下一轮数据写入旧目录
-                if (!ctx_omni->duplex_mode) {
-                    ctx_omni->simplex_round_idx++;
-                    print_with_timestamp("TTS: 单工模式轮次结束，下一轮 round_idx=%d\n", ctx_omni->simplex_round_idx);
-                }
+                const OmniRoundMeta completed_round_meta = active_round_meta;
                 
                 // 🔧 发送 is_final=true 到 T2W 队列，通知 T2W 重置 buffer
                 // 注意：T2W 端只在双工模式下调用 Token2WavSession::reset()
@@ -6978,13 +6991,18 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     T2WOut *t2w_out = new T2WOut();
                     t2w_out->audio_tokens.clear();  // 空tokens，只是通知final
                     t2w_out->is_final = true;
-                    t2w_out->round_idx = current_round_idx;  // 🔧 使用递增前的值
+                    t2w_out->round_meta = completed_round_meta;
                     {
                         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
                         ctx_omni->t2w_thread_info->queue.push(t2w_out);
                     }
                     ctx_omni->t2w_thread_info->cv.notify_one();
                     print_with_timestamp("TTS: sent is_final=true to T2W queue (turn end)\n");
+                }
+                if (!completed_round_meta.duplex_mode) {
+                    active_round_meta = omni_advance_simplex_round_meta(ctx_omni, completed_round_meta);
+                    print_with_timestamp("TTS: 单工模式轮次结束，下一轮 round_idx=%d\n", active_round_meta.round_idx);
+                    update_output_dirs();
                 }
                 ctx_omni->tts_n_past_accumulated = 0;
                 ctx_omni->tts_all_generated_tokens.clear();
@@ -7002,9 +7020,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 all_audio_tokens.clear();
                 llm_finish = false;
                 tts_finish = false;
-                // 🔧 [移除] wav_turn_base 的递增移到 T2W 线程的 is_final 处理中
-                // 原因：避免竞态条件，确保 T2W 先处理完当前轮次的所有数据再递增
-                // ctx_omni->wav_turn_base += 1000;  // 已移到 T2W 线程
+                // WAV 编号基数已改为从 round metadata 派生，这里不再做线程内补偿。
             }
             
             continue;  // Skip the rest of the TTS processing
@@ -7380,7 +7396,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     T2WOut *t2w_out = new T2WOut();
                     t2w_out->audio_tokens = audio_token_buffer;  // Copy the 25 tokens
                     t2w_out->is_final = false;  // Not final, more chunks may come
-                    t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                    t2w_out->round_meta = omni_session_round_meta(ctx_omni);
                     
                     {
                         std::unique_lock<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -7468,7 +7484,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 T2WOut *t2w_out = new T2WOut();
                 t2w_out->audio_tokens = audio_token_buffer;  // Copy remaining tokens
                 t2w_out->is_final = (audio_gen_finish || llm_finish);  // Mark as final if generation finished
-                t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                t2w_out->round_meta = omni_session_round_meta(ctx_omni);
                 
                 {
                     std::unique_lock<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -7575,7 +7591,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 T2WOut *t2w_out = new T2WOut();
                 t2w_out->audio_tokens.clear();  // 空tokens，只是通知final
                 t2w_out->is_final = true;
-                t2w_out->round_idx = ctx_omni->simplex_round_idx;  // 🔧 传递轮次索引
+                t2w_out->round_meta = omni_session_round_meta(ctx_omni);
                 
                 {
                     std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
@@ -7697,21 +7713,15 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
     
     // 使用可配置的 base_output_dir
     const std::string& base_output_dir = ctx_omni->base_output_dir;
+    OmniRoundMeta active_round_meta = omni_session_round_meta(ctx_omni);
     
     // Helper function to get round-specific output directory
-    auto get_wav_output_dir = [&]() -> std::string {
-        if (!ctx_omni->duplex_mode) {
-            char round_dir[512];
-            snprintf(round_dir, sizeof(round_dir), "%s/round_%03d/tts_wav", 
-                     base_output_dir.c_str(), ctx_omni->simplex_round_idx);
-            return std::string(round_dir);
-        } else {
-            return base_output_dir + "/tts_wav";
-        }
+    auto get_wav_output_dir = [&](const OmniRoundMeta & round_meta) -> std::string {
+        return omni_round_tts_wav_output_dir(base_output_dir, round_meta);
     };
     
-    int last_round_idx = ctx_omni->simplex_round_idx;
-    std::string tts_wav_output_dir = get_wav_output_dir();
+    int last_round_idx = active_round_meta.round_idx;
+    std::string tts_wav_output_dir = get_wav_output_dir(active_round_meta);
     int wav_idx = 0;
     const int sample_rate = 24000;  // Python Token2Wav 输出采样率
     
@@ -7732,16 +7742,6 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             ctx_omni->break_event = false;
             token_buffer = {4218, 4218, 4218};
             wav_idx = 0;
-            
-            if (!ctx_omni->duplex_mode) {
-                ctx_omni->wav_turn_base += 1000;
-            }
-            
-            if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
-                last_round_idx = ctx_omni->simplex_round_idx;
-                tts_wav_output_dir = get_wav_output_dir();
-                cross_platform_mkdir_p(tts_wav_output_dir);
-            }
             
             // 重置 Python 缓存
             omni_reset_python_t2w_cache(ctx_omni);
@@ -7764,7 +7764,8 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
         std::vector<llama_token> new_tokens;
         bool is_final = false;
         bool is_chunk_end = false;
-        int received_round_idx = -1;  // 🔧 从队列中获取的 round_idx
+        OmniRoundMeta received_round_meta = active_round_meta;
+        bool received_round_meta_valid = false;
         
         while (!queue.empty()) {
             T2WOut *t2w_out = queue.front();
@@ -7772,10 +7773,8 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             new_tokens.insert(new_tokens.end(), t2w_out->audio_tokens.begin(), t2w_out->audio_tokens.end());
             is_final = is_final || t2w_out->is_final;
             is_chunk_end = is_chunk_end || t2w_out->is_chunk_end;
-            // 🔧 使用最新的 round_idx（最后一个有效的值）
-            if (t2w_out->round_idx >= 0) {
-                received_round_idx = t2w_out->round_idx;
-            }
+            received_round_meta = t2w_out->round_meta;
+            received_round_meta_valid = true;
             delete t2w_out;
         }
         
@@ -7785,13 +7784,18 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             continue;
         }
         
-        // 🔧 [通过 T2WOut 传递 round_idx] 使用传入的 round_idx 确定输出目录
-        // 这比从 ctx_omni->simplex_round_idx 读取更可靠，避免竞态条件
-        if (!ctx_omni->duplex_mode && received_round_idx >= 0 && received_round_idx != last_round_idx) {
+        if (received_round_meta_valid &&
+            (received_round_meta.round_idx != active_round_meta.round_idx ||
+             received_round_meta.wav_turn_base != active_round_meta.wav_turn_base ||
+             received_round_meta.duplex_mode != active_round_meta.duplex_mode)) {
+            active_round_meta = received_round_meta;
+        }
+
+        if (!active_round_meta.duplex_mode && active_round_meta.round_idx != last_round_idx) {
             print_with_timestamp("T2W(Python): round_idx 变化 %d -> %d（来自T2WOut），更新输出目录\n",
-                                last_round_idx, received_round_idx);
-            last_round_idx = received_round_idx;
-            tts_wav_output_dir = get_wav_output_dir();
+                                last_round_idx, active_round_meta.round_idx);
+            last_round_idx = active_round_meta.round_idx;
+            tts_wav_output_dir = get_wav_output_dir(active_round_meta);
             cross_platform_mkdir_p(tts_wav_output_dir);
             // 重置 wav 索引，因为是新的轮次
             wav_idx = 0;
@@ -7832,7 +7836,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             std::vector<int32_t> window(token_buffer.begin(), token_buffer.begin() + process_size);
             
             // 生成 WAV 输出路径
-            std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
+            std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(active_round_meta.wav_turn_base + wav_idx) + ".wav";
             
             double inference_time_ms = 0;
             double audio_duration = 0;
@@ -7849,7 +7853,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                     
                     float rtf = (float)(inference_time_ms / 1000.0) / audio_duration;
                     print_with_timestamp("T2W(Python): wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
-                                        ctx_omni->wav_turn_base + wav_idx, audio_duration, inference_time_ms, rtf, (long long)elapsed_ms);
+                                        active_round_meta.wav_turn_base + wav_idx, audio_duration, inference_time_ms, rtf, (long long)elapsed_ms);
                     wav_idx++;
                     
                     // 注意：不要在中途重置缓存！Python 原版在整个对话中保持缓存连续
@@ -7892,7 +7896,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                     std::string done_flag_path = tts_wav_output_dir + "/generation_done.flag";
                     FILE* flag_file = fopen(done_flag_path.c_str(), "w");
                     if (flag_file) {
-                        int last_wav_idx = (wav_idx > 0) ? (ctx_omni->wav_turn_base + wav_idx - 1) : 0;
+                        int last_wav_idx = (wav_idx > 0) ? (active_round_meta.wav_turn_base + wav_idx - 1) : 0;
                         fprintf(flag_file, "%d\n", last_wav_idx);
                         fclose(flag_file);
                     }
@@ -7902,16 +7906,7 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                     // 重置 Python 缓存
                     omni_reset_python_t2w_cache(ctx_omni);
                     
-                    if (!ctx_omni->duplex_mode) {
-                        wav_idx = 0;
-                        ctx_omni->wav_turn_base += 1000;
-                    }
-                    
-                    if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
-                        last_round_idx = ctx_omni->simplex_round_idx;
-                        tts_wav_output_dir = get_wav_output_dir();
-                        cross_platform_mkdir_p(tts_wav_output_dir);
-                    }
+                    wav_idx = 0;
                 }
                 break;
             }
@@ -7927,28 +7922,12 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
 // T2W Thread Function (C++ Token2Wav)
 // ==============================================================================
 // 
-// 📌 关于轮次管理的说明（单工模式专用）：
-// 
-// 单工模式下，每轮对话的 WAV 输出保存在不同的 round_XXX 目录中。
-// 统一使用 ctx_omni->simplex_round_idx 作为轮次索引的唯一来源。
-// 
-// 变量说明：
-// 1. ctx_omni->simplex_round_idx（全局变量，唯一来源）
-//    - 存储在 omni_context 结构体中的「当前轮次索引」
-//    - 更新时机：
-//      a) stream_decode 开始时，通过传入的 round_idx 参数同步
-//      b) TTS 线程在每轮结束时递增（在发送 is_final=true 之前）
-//    - 初始值为 0，每轮对话结束后 +1
-// 
-// 2. last_round_idx（T2W 线程本地变量）
-//    - T2W 线程内部记录的「上一次使用的轮次索引」
-//    - 用于检测 simplex_round_idx 是否发生变化
-//    - 当 simplex_round_idx != last_round_idx 时，说明进入了新轮次，需要更新输出目录
-// 
-// 轮次同步流程：
-//   Python调用 stream_decode(round_idx) -> 同步 simplex_round_idx
-//                                              ↓
-//   T2W线程检测到 simplex_round_idx != last_round_idx -> 更新 tts_wav_output_dir
+// 📌 关于轮次管理的说明：
+//
+// 这一层现在只消费消息里携带的 OmniRoundMeta。
+// - TTS 在发送 T2WOut 时显式附带 round metadata
+// - T2W 只根据消息里的 round_idx / wav_turn_base 切目录和编号
+// - worker 不再通过读取 ctx_omni->simplex_round_idx / wav_turn_base 的瞬时值推断当前轮次
 // ==============================================================================
 void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) {
     print_with_timestamp("T2W thread (C++) started\n");
@@ -7969,19 +7948,11 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     
     // 🔧 [多实例支持] 使用可配置的 base_output_dir
     const std::string& base_output_dir = ctx_omni->base_output_dir;
+    OmniRoundMeta active_round_meta = omni_session_round_meta(ctx_omni);
     
     // 🔧 [单工模式] Helper function to get round-specific output directory
-    auto get_wav_output_dir = [&]() -> std::string {
-        if (!ctx_omni->duplex_mode) {
-            // 单工模式：使用 round_XXX 子目录
-            char round_dir[512];
-            snprintf(round_dir, sizeof(round_dir), "%s/round_%03d/tts_wav", 
-                     base_output_dir.c_str(), ctx_omni->simplex_round_idx);
-            return std::string(round_dir);
-        } else {
-            // 双工模式：直接使用 base_output_dir
-            return base_output_dir + "/tts_wav";
-        }
+    auto get_wav_output_dir = [&](const OmniRoundMeta & round_meta) -> std::string {
+        return omni_round_tts_wav_output_dir(base_output_dir, round_meta);
     };
     
     // 📌 last_round_idx：T2W 线程本地记录的「上一次使用的轮次」
@@ -7990,7 +7961,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
     int last_round_idx = -1;
     
     // WAV output settings (与 tts_thread_func 保持一致)
-    std::string tts_wav_output_dir = get_wav_output_dir();
+    std::string tts_wav_output_dir = get_wav_output_dir(active_round_meta);
     int wav_idx = 0;
     const int sample_rate = omni::flow::Token2Wav::kSampleRate;
     
@@ -8007,19 +7978,6 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             ctx_omni->break_event = false;
             token_buffer = {4218, 4218, 4218};  // 重置 buffer
             wav_idx = 0;  // 重置 wav index
-            
-            // 🔧 [修复竞态条件] 在 T2W 线程处理完打断后递增 wav_turn_base
-            // 原因：确保当前轮次的所有 wav 文件使用旧的编号，然后再切换到新编号
-            if (!ctx_omni->duplex_mode) {
-                ctx_omni->wav_turn_base += 1000;
-            }
-            
-            // 🔧 [单工模式] 打断后更新输出目录（TTS 线程已经递增了 simplex_round_idx）
-            if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
-                last_round_idx = ctx_omni->simplex_round_idx;
-                tts_wav_output_dir = get_wav_output_dir();
-                print_with_timestamp("T2W线程: 打断后更新输出目录为 %s\n", tts_wav_output_dir.c_str());
-            }
             continue;
         }
         
@@ -8042,7 +8000,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         std::vector<llama_token> new_tokens;
         bool is_final = false;
         bool is_chunk_end = false;  // 标记 TTS chunk 结束
-        int received_round_idx = -1;  // 🔧 保存传入的 round_idx
+        OmniRoundMeta received_round_meta = active_round_meta;
+        bool received_round_meta_valid = false;
         int received_chunk_idx = -1;  // Duplex test chunk index
         
         while (!queue.empty()) {
@@ -8061,10 +8020,8 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             new_tokens.insert(new_tokens.end(), t2w_out->audio_tokens.begin(), t2w_out->audio_tokens.end());
             is_final = is_final || t2w_out->is_final;  // 任何一个是 final 就是 final
             is_chunk_end = is_chunk_end || t2w_out->is_chunk_end;  // 任何一个是 chunk_end 就是 chunk_end
-            // 🔧 保存最后一个有效的 round_idx（优先使用非负值）
-            if (t2w_out->round_idx >= 0) {
-                received_round_idx = t2w_out->round_idx;
-            }
+            received_round_meta = t2w_out->round_meta;
+            received_round_meta_valid = true;
             delete t2w_out;
         }
         
@@ -8074,26 +8031,25 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
             continue;
         }
         
-        // 📌 [轮次切换检测] 使用 T2WOut 传入的 round_idx 判断，而不是直接读取 ctx_omni->simplex_round_idx
-        // 原因：TTS 线程在发送 is_final 之前会递增 simplex_round_idx，导致竞态条件
-        // 现在 T2WOut.round_idx 保存的是递增前的值，确保 WAV 写入正确的目录
-        int effective_round_idx = (received_round_idx >= 0) ? received_round_idx : ctx_omni->simplex_round_idx;
-        
-        if (!ctx_omni->duplex_mode && effective_round_idx != last_round_idx) {
+        if (received_round_meta_valid &&
+            (received_round_meta.round_idx != active_round_meta.round_idx ||
+             received_round_meta.wav_turn_base != active_round_meta.wav_turn_base ||
+             received_round_meta.duplex_mode != active_round_meta.duplex_mode)) {
+            active_round_meta = received_round_meta;
+        }
+
+        if (!active_round_meta.duplex_mode && active_round_meta.round_idx != last_round_idx) {
             print_with_timestamp("T2W线程(C++): 轮次切换 (%d -> %d)，更新输出目录\n",
-                                last_round_idx, effective_round_idx);
+                                last_round_idx, active_round_meta.round_idx);
             
             // 更新本地记录的轮次
-            last_round_idx = effective_round_idx;
+            last_round_idx = active_round_meta.round_idx;
             
-            // 更新输出目录（基于 effective_round_idx）
-            tts_wav_output_dir = base_output_dir + "/round_" + 
-                                 (effective_round_idx < 100 ? (effective_round_idx < 10 ? "00" : "0") : "") + 
-                                 std::to_string(effective_round_idx) + "/tts_wav";
+            // 更新输出目录（基于消息携带的 round meta）
+            tts_wav_output_dir = get_wav_output_dir(active_round_meta);
             
             // 重置轮次相关状态
             wav_idx = 0;                                                    // WAV 文件编号从 0 开始
-            ctx_omni->wav_turn_base = effective_round_idx * 1000;           // 更新全局 WAV 编号基数
             token_buffer = {4218, 4218, 4218};                              // 重置 token buffer（3个静音前缀）
             
             print_with_timestamp("T2W线程(C++): 新输出目录 %s\n", tts_wav_output_dir.c_str());
@@ -8162,7 +8118,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 
                 if (!chunk_wav.empty()) {
                     // Write WAV file
-                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(ctx_omni->wav_turn_base + wav_idx) + ".wav";
+                    std::string wav_path = tts_wav_output_dir + "/wav_" + std::to_string(active_round_meta.wav_turn_base + wav_idx) + ".wav";
                     
                     const int16_t num_channels = 1;
                     const int16_t bits_per_sample = 16;
@@ -8211,7 +8167,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                             print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long)elapsed_ms);
                         }
                         print_with_timestamp("T2W线程: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n",
-                                            ctx_omni->wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
+                                            active_round_meta.wav_turn_base + wav_idx, audio_duration, t2w_ms, rtf, (long long)elapsed_ms);
                         wav_idx++;
                     }
                 }
@@ -8267,7 +8223,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                         FILE* flag_file = fopen(done_flag_path.c_str(), "w");
                         if (flag_file) {
                             // 写入最后一个 wav 的编号（wav_idx - 1，因为 wav_idx 已经指向下一个）
-                            int last_wav_idx = (wav_idx > 0) ? (ctx_omni->wav_turn_base + wav_idx - 1) : 0;
+                            int last_wav_idx = (wav_idx > 0) ? (active_round_meta.wav_turn_base + wav_idx - 1) : 0;
                             fprintf(flag_file, "%d\n", last_wav_idx);
                             fclose(flag_file);
                             print_with_timestamp("T2W线程: 写入结束标记 %s (last_wav=%d)\n", done_flag_path.c_str(), last_wav_idx);
@@ -8279,24 +8235,7 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                     // 单工和双工模式都只重置 token_buffer，保持 Token2Wav 的 stream 状态
                     // 重新初始化buffer（3个静音token作为前缀）
                     token_buffer = {4218, 4218, 4218};
-                    
-                    // 🔧 [修复竞态条件] 在 T2W 线程处理完 is_final 后递增 wav_turn_base
-                    // 原因：确保当前轮次的所有 wav 文件使用旧的编号，然后再切换到新编号
-                    // 这样避免了 TTS 线程提前递增导致最后几个 wav 文件编号跳跃的问题
-                    if (!ctx_omni->duplex_mode) {
-                        wav_idx = 0;  // 🔧 [单工模式] 重置 wav_idx 用于下一轮
-                        ctx_omni->wav_turn_base += 1000;
-                    }
-                    
-                    // 🔧 [单工模式] 在 is_final 后检查是否需要更新目录
-                    // simplex_round_idx 已经在 TTS 线程中递增
-                    if (!ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != last_round_idx) {
-                        last_round_idx = ctx_omni->simplex_round_idx;
-                        tts_wav_output_dir = get_wav_output_dir();
-                        print_with_timestamp("T2W线程: 轮次结束后更新输出目录为 %s\n", tts_wav_output_dir.c_str());
-                        // 确保目录存在
-                        cross_platform_mkdir_p(tts_wav_output_dir);
-                    }
+                    wav_idx = 0;
                 }
                 // 注意：is_chunk_end 时不重置 buffer，剩余 tokens 保留给下一个 chunk
                 break;
@@ -8517,6 +8456,7 @@ static void omni_dispatch_decode_chunk_to_tts(
     llm_out->n_past = ctx_omni->n_past;
     llm_out->llm_finish = llm_finish;
     llm_out->debug_dir = request.debug_dir;
+    llm_out->round_meta = omni_session_round_meta(ctx_omni);
     llm_out->token_ids = chunk_token_ids;
     llm_out->hidden_states = chunk_hidden_states;
     llm_out->n_embd = llm_n_embd;

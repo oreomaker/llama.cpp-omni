@@ -1,5 +1,6 @@
 #pragma once
 
+#include "omni-session-state.h"
 #include "llama.h"
 
 #include <chrono>
@@ -14,6 +15,7 @@ struct LLMOut {
     int n_past = 0;
     bool llm_finish = false;
     std::string debug_dir;
+    OmniRoundMeta round_meta;
     std::vector<llama_token> token_ids;
     std::vector<float> hidden_states;
     int n_embd = 0;

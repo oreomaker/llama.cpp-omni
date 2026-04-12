@@ -76,6 +76,8 @@ struct OmniSessionGate {
     std::atomic<bool> llm_generation_done{false};
 };
 
+OmniRoundMeta omni_session_make_round_meta(const struct omni_context * ctx_omni, int round_idx);
 void omni_session_sync_round_meta(struct omni_context * ctx_omni);
+void omni_session_set_round_meta(struct omni_context * ctx_omni, const OmniRoundMeta & round_meta);
 void omni_session_set_round_index(struct omni_context * ctx_omni, int round_idx);
 OmniRoundMeta omni_session_round_meta(const struct omni_context * ctx_omni);
