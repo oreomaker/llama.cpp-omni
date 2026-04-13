@@ -16,6 +16,10 @@ add_library(omni
             omni-turn-coordinator.h
             omni-runtime-messages.h
             omni-worker-state.h
+            omni-t2w-stage.cpp
+            omni-t2w-stage.h
+            omni-tts-stage.cpp
+            omni-tts-stage.h
             omni-token-protocol.cpp
             omni-token-protocol.h
             omni-output.cpp

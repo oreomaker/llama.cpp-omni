@@ -185,6 +185,15 @@ void sliding_window_reset(struct omni_context * ctx_omni) {
     }
 }
 
+void sliding_window_reset_after_kvcache_clean(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    sliding_window_reset(ctx_omni);
+    ctx_omni->system_preserve_length = ctx_omni->n_keep;
+}
+
 int sliding_window_register_unit_start(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr) {
         return -1;

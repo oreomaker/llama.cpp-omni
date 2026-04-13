@@ -4,6 +4,8 @@
 #include "omni-session-state.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -144,6 +146,84 @@ std::string omni_round_output_dir(const std::string & base_output_dir, const Omn
 
 std::string omni_round_tts_wav_output_dir(const std::string & base_output_dir, const OmniRoundMeta & round_meta) {
     return omni_round_output_dir(base_output_dir, round_meta) + "/tts_wav";
+}
+
+bool omni_ensure_round_tts_wav_output_dir(
+        const std::string & base_output_dir,
+        const OmniRoundMeta & round_meta,
+        std::string * out_dir) {
+    const std::string dir = omni_round_tts_wav_output_dir(base_output_dir, round_meta);
+    if (out_dir != nullptr) {
+        *out_dir = dir;
+    }
+    return omni_ensure_directory(dir);
+}
+
+bool omni_write_generation_done_flag(const std::string & output_dir, int last_wav_idx) {
+    const std::string done_flag_path = output_dir + "/generation_done.flag";
+    FILE * flag_file = fopen(done_flag_path.c_str(), "w");
+    if (flag_file == nullptr) {
+        LOG_ERR("Failed to write generation_done.flag: %s\n", done_flag_path.c_str());
+        return false;
+    }
+
+    fprintf(flag_file, "%d\n", last_wav_idx);
+    fclose(flag_file);
+    return true;
+}
+
+bool omni_write_wav_file_f32_mono_s16(const std::string & wav_path, const std::vector<float> & samples, int sample_rate) {
+    if (sample_rate <= 0) {
+        LOG_ERR("Invalid WAV sample rate: %d\n", sample_rate);
+        return false;
+    }
+
+    const int16_t num_channels = 1;
+    const int16_t bits_per_sample = 16;
+    const int16_t block_align = num_channels * (bits_per_sample / 8);
+    const int32_t byte_rate = sample_rate * block_align;
+
+    std::vector<int16_t> pcm(samples.size());
+    for (size_t i = 0; i < samples.size(); ++i) {
+        float x = samples[i];
+        if (!std::isfinite(x)) {
+            x = 0.0f;
+        }
+        x = std::max(-1.0f, std::min(1.0f, x));
+        pcm[i] = (int16_t) (x * 32767.0f);
+    }
+
+    const uint32_t data_bytes = (uint32_t) (pcm.size() * sizeof(int16_t));
+    const uint32_t riff_size = 36u + data_bytes;
+
+    FILE * f_wav = fopen(wav_path.c_str(), "wb");
+    if (f_wav == nullptr) {
+        LOG_ERR("Failed to open WAV output: %s\n", wav_path.c_str());
+        return false;
+    }
+
+    fwrite("RIFF", 1, 4, f_wav);
+    fwrite(&riff_size, 4, 1, f_wav);
+    fwrite("WAVE", 1, 4, f_wav);
+    fwrite("fmt ", 1, 4, f_wav);
+
+    const uint32_t fmt_size = 16;
+    const uint16_t audio_format = 1;
+    fwrite(&fmt_size, 4, 1, f_wav);
+    fwrite(&audio_format, 2, 1, f_wav);
+    fwrite(&num_channels, 2, 1, f_wav);
+    fwrite(&sample_rate, 4, 1, f_wav);
+    fwrite(&byte_rate, 4, 1, f_wav);
+    fwrite(&block_align, 2, 1, f_wav);
+    fwrite(&bits_per_sample, 2, 1, f_wav);
+    fwrite("data", 1, 4, f_wav);
+    fwrite(&data_bytes, 4, 1, f_wav);
+    if (!pcm.empty()) {
+        fwrite(pcm.data(), 1, data_bytes, f_wav);
+    }
+
+    fclose(f_wav);
+    return true;
 }
 
 static bool omni_dir_has_content(const std::string & dir_path) {

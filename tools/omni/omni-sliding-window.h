@@ -21,5 +21,6 @@ void sliding_window_register_system_prompt(struct omni_context * ctx_omni);
 bool sliding_window_enforce(struct omni_context * ctx_omni);
 bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int length);
 void sliding_window_reset(struct omni_context * ctx_omni);
+void sliding_window_reset_after_kvcache_clean(struct omni_context * ctx_omni);
 
 void omni_finalize_decode_round(struct omni_context * ctx_omni);

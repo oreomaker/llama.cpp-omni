@@ -2,7 +2,6 @@
 #include "llama.h"
 #include "omni-session-state.h"
 #include "omni-runtime-messages.h"
-#include "omni-sliding-window.h"
 #include "omni-worker-state.h"
 
 #include <thread>
@@ -419,12 +418,6 @@ bool clean_kvcache(struct omni_context * ctx_omni);
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);
 bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, float* embed, int n_pos, int n_batch, int* n_past_tts);
-// sample_tts_token 参数说明：
-// - all_generated_tokens: 跨 chunk 累积的所有 tokens（用于判断是否是整个过程的第一个 token，即 re-forward condition）
-// - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
-// - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
-// - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
-llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
 
 // Projector 函数声明（精度验证版本）
 bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
