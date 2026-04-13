@@ -12,6 +12,8 @@ add_library(omni
             omni-log.h
             omni-runtime-init.cpp
             omni-runtime-init.h
+            omni-llm-stage.cpp
+            omni-llm-stage.h
             omni-session-state.cpp
             omni-session-state.h
             omni-sliding-window.cpp

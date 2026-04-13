@@ -8,6 +8,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "omni-impl.h"
+#include "omni-llm-stage.h"
 #include "omni-log.h"
 #include "omni-output.h"
 #include "omni-python-t2w.h"
@@ -579,282 +580,6 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
     audition_audio_u8_free(audio);
     // printf("omni_audio_embed_make_with_filename 3 :%s\n", audio_path.c_str());
     return embed;
-}
-
-static bool eval_tokens(struct omni_context *    ctx_omni,
-                        common_params *          params,
-                        std::vector<llama_token> tokens,
-                        int                      n_batch,
-                        int *                    n_past,
-                        bool                     get_emb = false) {
-    int N = (int) tokens.size();
-    kv_cache_slide_window(ctx_omni, params, N);
-
-    for (int i = 0; i < N; i += n_batch) {
-        int n_eval = std::min((int) tokens.size() - i, n_batch);
-        if (n_eval == 0) {
-            break;
-        }
-        if (get_emb) {
-            llama_set_embeddings(ctx_omni->ctx_llama, true);
-        }
-        // llama_batch_get_one 返回的 batch.pos 可能是 nullptr，需要手动设置
-        llama_batch            batch = llama_batch_get_one(&tokens[i], n_eval);
-        std::vector<llama_pos> pos_vec;
-        if (batch.pos == nullptr) {
-            pos_vec.resize(n_eval);
-            batch.pos = pos_vec.data();
-        }
-        for (int j = 0; j < n_eval; j++) {
-            batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
-        }
-
-        if (llama_decode(ctx_omni->ctx_llama, batch)) {
-            LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
-            return false;
-        }
-        if (get_emb) {
-            llama_set_embeddings(ctx_omni->ctx_llama, false);
-        }
-        *n_past += n_eval;
-    }
-    return true;
-}
-
-// 与 eval_tokens 类似，但会将每次 decode 的 hidden_state 保存并拼接到 hidden_states 中
-// hidden_states 由函数内部分配空间，大小为 N * n_embd * sizeof(float)，调用者负责释放
-static bool eval_tokens_with_hidden(struct omni_context *    ctx_omni,
-                                    common_params *          params,
-                                    std::vector<llama_token> tokens,
-                                    int                      n_batch,
-                                    int *                    n_past,
-                                    float *&                 hidden_states) {
-    int N = (int) tokens.size();
-    if (N == 0) {
-        hidden_states = nullptr;
-        return true;
-    }
-
-    kv_cache_slide_window(ctx_omni, params, N);
-
-    const int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-
-    // 在函数内部分配空间
-    hidden_states = (float *) malloc(N * n_embd * sizeof(float));
-    if (hidden_states == nullptr) {
-        LOG_ERR("%s : failed to allocate memory for hidden_states\n", __func__);
-        return false;
-    }
-
-    int tokens_processed = 0;
-
-    for (int i = 0; i < N; i += n_batch) {
-        int n_eval = std::min((int) tokens.size() - i, n_batch);
-        if (n_eval == 0) {
-            break;
-        }
-
-        // 启用 embeddings 输出
-        llama_set_embeddings(ctx_omni->ctx_llama, true);
-        // llama_batch_get_one 返回的 batch.pos 可能是 nullptr，需要手动设置
-        llama_batch            batch = llama_batch_get_one(&tokens[i], n_eval);
-        std::vector<llama_pos> pos_vec;
-        if (batch.pos == nullptr) {
-            pos_vec.resize(n_eval);
-            batch.pos = pos_vec.data();
-        }
-        for (int j = 0; j < n_eval; j++) {
-            batch.pos[j] = *n_past + j;  // 从当前 n_past 位置开始
-        }
-
-        if (llama_decode(ctx_omni->ctx_llama, batch)) {
-            LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, N, n_batch, *n_past);
-            llama_set_embeddings(ctx_omni->ctx_llama, false);
-            free(hidden_states);
-            hidden_states = nullptr;
-            return false;
-        }
-
-        // 获取当前 batch 的 embeddings 并复制到 hidden_states
-        float * emb = llama_get_embeddings(ctx_omni->ctx_llama);
-        if (emb != nullptr) {
-            // 将当前 batch 的 embeddings 复制到 hidden_states 的对应位置
-            memcpy(hidden_states + tokens_processed * n_embd, emb, n_eval * n_embd * sizeof(float));
-        }
-
-        llama_set_embeddings(ctx_omni->ctx_llama, false);
-
-        *n_past += n_eval;
-        tokens_processed += n_eval;
-    }
-    return true;
-}
-
-static bool eval_id(struct omni_context * ctx_omni, common_params * params, int id, int * n_past) {
-    std::vector<llama_token> tokens;
-    tokens.push_back(id);
-    return eval_tokens(ctx_omni, params, tokens, 1, n_past);
-}
-
-static bool eval_id_with_hidden(struct omni_context * ctx_omni,
-                                common_params *       params,
-                                int                   id,
-                                int *                 n_past,
-                                float *&              hidden_states) {
-    std::vector<llama_token> tokens;
-    tokens.push_back(id);
-    return eval_tokens_with_hidden(ctx_omni, params, tokens, 1, n_past, hidden_states);
-}
-
-static bool eval_string(struct omni_context * ctx_omni,
-                        common_params *       params,
-                        const char *          str,
-                        int                   n_batch,
-                        int *                 n_past,
-                        bool                  add_bos,
-                        bool                  get_emb = false) {
-    std::string              str2     = str;
-    std::vector<llama_token> embd_inp = common_tokenize(ctx_omni->ctx_llama, str2, add_bos, true);
-    return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb);
-}
-
-static bool eval_string_with_hidden(struct omni_context * ctx_omni,
-                                    common_params *       params,
-                                    const char *          str,
-                                    int                   n_batch,
-                                    int *                 n_past,
-                                    bool                  add_bos,
-                                    float *&              hidden_states) {
-    std::string              str2     = str;
-    std::vector<llama_token> embd_inp = common_tokenize(ctx_omni->ctx_llama, str2, add_bos, true);
-    return eval_tokens_with_hidden(ctx_omni, params, embd_inp, n_batch, n_past, hidden_states);
-}
-
-static const char * sample(struct common_sampler * smpl,
-                           struct omni_context *   ctx_omni,
-                           common_params *         params,
-                           int *                   n_past) {
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
-    common_sampler_accept(smpl, id, true);
-    static std::string ret;
-    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
-        ret = "</s>";
-    } else {
-        ret = common_token_to_piece(ctx_omni->ctx_llama, id);
-    }
-    eval_id(ctx_omni, params, id, n_past);
-    return ret.c_str();
-}
-
-static const char * sample_with_hidden(struct common_sampler * smpl,
-                                       struct omni_context *   ctx_omni,
-                                       common_params *         params,
-                                       int *                   n_past,
-                                       float *&                hidden_states) {
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
-    common_sampler_accept(smpl, id, true);
-    static std::string ret;
-    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
-        ret = "</s>";
-    } else {
-        ret = common_token_to_piece(ctx_omni->ctx_llama, id);
-    }
-    eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
-    return ret.c_str();
-}
-
-static const char * llama_loop(struct omni_context *   ctx_omni,
-                               common_params *         params,
-                               struct common_sampler * smpl,
-                               int &                   n_past) {
-    const char * tmp = sample(smpl, ctx_omni, params, &n_past);
-    return tmp;
-}
-
-// 修改sample_with_hidden来返回token ID（通过引用参数）
-// 🔧 [双工模式] 支持 listen_prob_scale 参数，增加 <|listen|> 的采样概率
-// 🔧 [双工模式] 支持 forbidden_token_ids，禁止采样 <|tts_pad|> 等 token
-static const char * sample_with_hidden_and_token(struct common_sampler * smpl,
-                                                 struct omni_context *   ctx_omni,
-                                                 common_params *         params,
-                                                 int *                   n_past,
-                                                 float *&                hidden_states,
-                                                 llama_token &           token_id) {
-    float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
-
-    // 🔧 [双工模式] 在采样前调整 logits
-    if (ctx_omni->duplex_mode) {
-        if (logits != nullptr) {
-            // 1. 调整 <|listen|> 的 logit（listen_prob_scale）
-            // listen_prob_scale > 1.0 会增加 <|listen|> 的概率，让模型更倾向于先听
-            if (ctx_omni->special_token_listen >= 0) {
-                // 使用 listen_prob_scale 调整 <|listen|> 的 logit
-                // 默认值 1.0 不改变，> 1.0 增加 listen 概率
-                // 这里我们使用加法而不是乘法，因为 logit 可能是负数
-                // 添加一个偏置值来增加 listen 的概率
-                // listen_prob_bias = log(listen_prob_scale) ≈ (listen_prob_scale - 1.0) for small values
-                float listen_bias = (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;  // 放大效果
-                logits[ctx_omni->special_token_listen] += listen_bias;
-            }
-
-            // 2. 🔧 [与 Python 对齐] 禁止采样 <|tts_pad|> token
-            // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
-            //         logits[:, self.forbidden_token_ids] = float("-inf")
-            // <|tts_pad|> 是填充 token，模型不应该主动生成它
-            // 如果不禁止，模型可能生成 <|speak|> → <|tts_pad|> → <|chunk_eos|>，导致无有效输出
-            if (ctx_omni->special_token_tts_pad >= 0) {
-                logits[ctx_omni->special_token_tts_pad] = -INFINITY;
-            }
-        }
-    }
-
-    // 🔧 [Length Penalty] 调整 EOS token 的 logit 值（单工模式）
-    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
-    if (!ctx_omni->duplex_mode && ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
-        if (logits != nullptr) {
-            float eos_logit = logits[ctx_omni->special_token_tts_eos];
-            if (eos_logit > 0) {
-                // logit > 0 时，除以 length_penalty 来降低概率
-                logits[ctx_omni->special_token_tts_eos] = eos_logit / ctx_omni->length_penalty;
-            } else {
-                // logit <= 0 时，乘以 length_penalty 来降低概率
-                logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->length_penalty;
-            }
-        }
-    }
-
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
-    token_id             = id;  // 保存token ID
-    common_sampler_accept(smpl, id, true);
-    static std::string ret;
-    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
-        ret = "</s>";
-    } else {
-        ret = common_token_to_piece(ctx_omni->ctx_llama, id);
-    }
-    eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
-    return ret.c_str();
-}
-
-static const char * llama_loop_with_hidden(struct omni_context *   ctx_omni,
-                                           common_params *         params,
-                                           struct common_sampler * smpl,
-                                           int &                   n_past,
-                                           float *&                hidden_states) {
-    llama_token  dummy_token;
-    const char * tmp = sample_with_hidden_and_token(smpl, ctx_omni, params, &n_past, hidden_states, dummy_token);
-    return tmp;
-}
-
-// 新增：返回token ID的版本
-static const char * llama_loop_with_hidden_and_token(struct omni_context *   ctx_omni,
-                                                     common_params *         params,
-                                                     struct common_sampler * smpl,
-                                                     int &                   n_past,
-                                                     float *&                hidden_states,
-                                                     llama_token &           token_id) {
-    const char * tmp = sample_with_hidden_and_token(smpl, ctx_omni, params, &n_past, hidden_states, token_id);
-    return tmp;
 }
 
 //
@@ -2042,13 +1767,14 @@ static void process_audio(struct omni_context * ctx_omni,
 static void eval_prefix(struct omni_context * ctx_omni, common_params * params) {
     std::string prefix = "<|im_start|>user\n";
     std::cout << "prefix : " << prefix << '\n';
-    eval_string(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->session.n_past, false);
+    omni_llm_stage_eval_string(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->session.n_past, false);
 }
 
 static void eval_prefix_with_hidden(struct omni_context * ctx_omni, common_params * params, float *& hidden_states) {
     std::string prefix = "<|im_start|>user\n";
     std::cout << "prefix : " << prefix << '\n';
-    eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->session.n_past, false, hidden_states);
+    omni_llm_stage_eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch,
+                                           &ctx_omni->session.n_past, false, hidden_states);
 }
 
 namespace {
@@ -2105,8 +1831,8 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
         print_with_timestamp("system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
     }
 
-    eval_string(ctx_omni, ctx_omni->params, prompts.voice_clone_prompt.c_str(), ctx_omni->params->n_batch,
-                &ctx_omni->session.n_past, false);
+    omni_llm_stage_eval_string(ctx_omni, ctx_omni->params, prompts.voice_clone_prompt.c_str(),
+                               ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
 
     auto   ref_audio_embed_start = std::chrono::high_resolution_clock::now();
     auto * ref_audio_embeds      = omni_audio_embed_make_with_filename(
@@ -2122,8 +1848,8 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
         print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
     }
 
-    eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(), ctx_omni->params->n_batch,
-                &ctx_omni->session.n_past, false);
+    omni_llm_stage_eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(),
+                               ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
 
     ctx_omni->session.prompt.system_prompt_initialized = true;
     ctx_omni->session.prompt.n_keep                    = ctx_omni->session.n_past;
@@ -2215,23 +1941,27 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         const bool has_slices       = n_chunks > 1;
 
         if (ctx_omni->duplex_mode) {
-            eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->session.n_past, false);
+            omni_llm_stage_eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->session.n_past,
+                                       false);
         } else {
-            eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->session.n_past, false);
+            omni_llm_stage_eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->session.n_past,
+                                       false);
         }
 
         prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[0].data()), tokens_per_chunk,
                          params->n_batch, &ctx_omni->session.n_past);
-        eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->session.n_past, false);
+        omni_llm_stage_eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->session.n_past, false);
 
         if (has_slices) {
             for (int i = 1; i < n_chunks; ++i) {
-                eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->session.n_past, false);
+                omni_llm_stage_eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->session.n_past,
+                                           false);
                 prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[i].data()), tokens_per_chunk,
                                  params->n_batch, &ctx_omni->session.n_past);
-                eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->session.n_past, false);
+                omni_llm_stage_eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->session.n_past,
+                                           false);
             }
-            eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->session.n_past, false);
+            omni_llm_stage_eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->session.n_past, false);
         }
 
         print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
@@ -2239,12 +1969,14 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
 
         if (has_audio) {
             if (!ctx_omni->duplex_mode) {
-                eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->session.n_past, false);
+                omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
+                                           &ctx_omni->session.n_past, false);
             }
             prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
                              params->n_batch, &ctx_omni->session.n_past);
             if (!ctx_omni->duplex_mode) {
-                eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->session.n_past, false);
+                omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch,
+                                           &ctx_omni->session.n_past, false);
             }
         }
     } else {
@@ -2252,9 +1984,10 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
 
         if (ctx_omni->duplex_mode) {
-            eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->session.n_past, false);
+            omni_llm_stage_eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->session.n_past, false);
         } else {
-            eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->session.n_past, false);
+            omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
+                                       &ctx_omni->session.n_past, false);
         }
 
         if (n_audio_tokens > 0) {
@@ -2263,7 +1996,8 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         }
 
         if (!ctx_omni->duplex_mode) {
-            eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->session.n_past, false);
+            omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch,
+                                       &ctx_omni->session.n_past, false);
         }
     }
 
@@ -2641,23 +2375,6 @@ bool stream_prefill(struct omni_context * ctx_omni,
     return true;
 }
 
-namespace {
-struct LlmDecodeRequest {
-    std::string debug_dir;
-    int         round_idx = -1;
-};
-
-struct LlmDecodeRuntime {
-    int  max_tgt_len             = 0;
-    int  step_size               = 10;
-    int  llm_n_embd              = 0;
-    int  generated_decode_tokens = 0;
-    int  current_chunk_tokens    = 0;
-    bool llm_finish              = false;
-    bool llm_first_token_logged  = false;
-};
-}  // namespace
-
 static bool omni_can_decode(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr) {
         LOG_ERR("stream_decode: ctx_omni is nullptr!");
@@ -2674,360 +2391,28 @@ static bool omni_can_decode(struct omni_context * ctx_omni) {
     return true;
 }
 
-// Step F: build the decode prefix inside the LLM stage protocol builder.
-static std::string omni_build_decode_prefix(const struct omni_context * ctx_omni) {
-    if (ctx_omni->duplex_mode) {
-        return "";
-    }
-    if (ctx_omni->use_tts) {
-        return "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>";
-    }
-    return "<|im_end|>\n<|im_start|>assistant\n";
-}
-
-static void omni_apply_decode_prefix(struct omni_context * ctx_omni, const std::string & prompt) {
-    if (prompt.empty()) {
-        print_with_timestamp("stream_decode: 双工模式，跳过 assistant prompt\n");
-        return;
-    }
-
-    if (ctx_omni->use_tts) {
-        print_with_timestamp("📍 [单工TTS] 添加 assistant prompt: \"%s\", n_past=%d\n", prompt.c_str(),
-                             ctx_omni->session.n_past);
-    }
-
-    eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
-
-    if (ctx_omni->use_tts) {
-        print_with_timestamp("📍 [单工TTS] assistant prompt 完成, n_past=%d\n", ctx_omni->session.n_past);
-    }
-}
-
-static LlmDecodeRuntime omni_init_decode_runtime(struct omni_context * ctx_omni) {
-    LlmDecodeRuntime runtime;
-    runtime.max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
-    runtime.llm_n_embd  = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d\n", runtime.max_tgt_len,
-                         ctx_omni->params->n_predict, ctx_omni->params->n_ctx);
-    return runtime;
-}
-
-static void omni_mark_decode_turn_end(struct omni_context * ctx_omni, OmniTokenType token_type, bool & is_end_of_turn) {
-    if (!ctx_omni->duplex_mode) {
-        return;
-    }
-
-    if (token_type == OmniTokenType::TURN_EOS || token_type == OmniTokenType::TTS_EOS ||
-        token_type == OmniTokenType::EOS) {
-        is_end_of_turn               = true;
-        ctx_omni->turn.current_turn_ended = true;
-        print_with_timestamp(
-            "LLM Duplex: turn_eos detected (type=%d), "
-            "set is_end_of_turn=true (not breaking, wait for chunk_eos)\n",
-            (int) token_type);
-    }
-}
-
-static void omni_handle_decode_end_token(struct omni_context * ctx_omni, OmniTokenType token_type) {
-    if (!ctx_omni->duplex_mode) {
-        ctx_omni->gate.llm_generation_done.store(true);
-        print_with_timestamp("LLM: detected end token, set llm_generation_done=true\n");
-    }
-
-    if (token_type == OmniTokenType::TURN_EOS || token_type == OmniTokenType::TTS_EOS ||
-        token_type == OmniTokenType::EOS) {
-        ctx_omni->turn.current_turn_ended = true;
-    }
-
-    if (token_type == OmniTokenType::LISTEN && ctx_omni->duplex_mode) {
-        ctx_omni->turn.ended_with_listen = true;
-
-        if (ctx_omni->async) {
-            std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-            ctx_omni->text_queue.push_back("__IS_LISTEN__");
-            ctx_omni->text_cv.notify_all();
-        }
-    }
-}
-
-static void omni_strip_decode_special_tokens(std::string & response) {
-    static const std::vector<std::string> end_token_strings = {
-        "<|tts_eos|>", "</s>", "<|listen|>", "<|turn_eos|>", "<|chunk_eos|>", "<|chunk_tts_eos|>",
-    };
-
-    for (const auto & delimiter : end_token_strings) {
-        const size_t end = response.find(delimiter);
-        if (end != std::string::npos) {
-            response = response.substr(0, end);
-        }
-    }
-
-    size_t speak_pos = response.find("<|speak|>");
-    while (speak_pos != std::string::npos) {
-        response.erase(speak_pos, std::string("<|speak|>").length());
-        speak_pos = response.find("<|speak|>");
-    }
-}
-
-static void omni_publish_decode_response(struct omni_context * ctx_omni, const std::string & response) {
-    if (response.empty()) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-    ctx_omni->text_queue.push_back(response);
-    ctx_omni->text_cv.notify_all();
-}
-
-static void omni_dispatch_decode_chunk_to_tts(struct omni_context *            ctx_omni,
-                                              const LlmDecodeRequest &         request,
-                                              const std::string &              response,
-                                              const std::vector<llama_token> & chunk_token_ids,
-                                              const std::vector<float> &       chunk_hidden_states,
-                                              bool                             llm_finish,
-                                              bool                             is_end_of_turn,
-                                              int                              llm_n_embd) {
-    if (!ctx_omni->async || !ctx_omni->use_tts || ctx_omni->tts_thread_info == nullptr ||
-        (response.empty() && !llm_finish)) {
-        return;
-    }
-
-    LLMOut * llm_out          = new LLMOut();
-    llm_out->text             = response;
-    llm_out->n_past           = ctx_omni->session.n_past;
-    llm_out->llm_finish       = llm_finish;
-    llm_out->debug_dir        = request.debug_dir;
-    llm_out->round_meta       = omni_session_round_meta(ctx_omni);
-    llm_out->token_ids        = chunk_token_ids;
-    llm_out->hidden_states    = chunk_hidden_states;
-    llm_out->n_embd           = llm_n_embd;
-    llm_out->is_end_of_turn   = is_end_of_turn;
-    llm_out->duplex_chunk_idx = duplex_timing_get_active_chunk(ctx_omni);
-
-    {
-        std::string token_ids_str;
-        for (size_t i = 0; i < chunk_token_ids.size() && i < 20; ++i) {
-            token_ids_str += std::to_string(chunk_token_ids[i]);
-            if (i + 1 < chunk_token_ids.size() && i < 19) {
-                token_ids_str += " ";
-            }
-        }
-        if (chunk_token_ids.size() > 20) {
-            token_ids_str += "...";
-        }
-
-        print_with_timestamp("LLM->TTS: text='%s', n_tokens=%zu, hidden_size=%zu, n_embd=%d, token_ids=[%s]\n",
-                             response.c_str(), chunk_token_ids.size(), chunk_hidden_states.size(), llm_n_embd,
-                             token_ids_str.c_str());
-    }
-
-    std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
-    ctx_omni->tts_thread_info->cv.wait(lock, [&] {
-        return ctx_omni->tts_thread_info->queue.size() < static_cast<size_t>(ctx_omni->tts_thread_info->MAX_QUEUE_SIZE);
-    });
-
-    if (!ctx_omni->gate.speech_ready || ctx_omni->duplex_mode) {
-        ctx_omni->tts_thread_info->queue.push(llm_out);
-        ctx_omni->tts_thread_info->cv.notify_all();
-    } else {
-        delete llm_out;
-    }
-}
-
-static void omni_finish_decode_text_stream(struct omni_context * ctx_omni) {
-    std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-    if (!ctx_omni->duplex_mode || !ctx_omni->turn.ended_with_listen) {
-        ctx_omni->text_queue.push_back("__END_OF_TURN__");
-    }
-
-    ctx_omni->gate.text_done = true;
-    ctx_omni->text_cv.notify_all();
-    ctx_omni->gate.text_streaming = false;
-}
-
 bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
     if (!omni_can_decode(ctx_omni)) {
         return false;
     }
 
-    const LlmDecodeRequest    request    = { std::move(debug_dir), round_idx };
-    const OmniWorkerThreadFns worker_fns = {
+    const OmniLlmStageDecodeRequest request = { std::move(debug_dir), round_idx };
+    const OmniWorkerThreadFns       worker_fns = {
         llm_thread_func,
         tts_thread_func,
         tts_thread_func_duplex,
         t2w_thread_func,
     };
+
     omni_turn_coordinator_prepare_decode(ctx_omni, request.round_idx, worker_fns);
-    omni_apply_decode_prefix(ctx_omni, omni_build_decode_prefix(ctx_omni));
 
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");
-    LlmDecodeRuntime runtime = omni_init_decode_runtime(ctx_omni);
-    std::string      response;
 
-    for (; runtime.generated_decode_tokens < runtime.max_tgt_len;) {
-        if (ctx_omni->gate.break_event.load()) {
-            runtime.llm_finish = true;
-            break;
-        }
-        fflush(stdout);
-        response = "";
-        fflush(stdout);
-
-        // 注意: speek_done=true 现在只表示"TTS 完成，可接受新 prefill"
-        // 不再用于控制 LLM 退出。LLM 应该正常完成直到 EOS 或达到最大长度。
-        // 打断逻辑通过 need_speek 或其他机制处理。
-        fflush(stdout);
-
-        int                      jl                     = 0;  // 计数有效的 TTS token 数量
-        int                      total_tokens_generated = 0;  // 计数总共生成的 token 数量（包括被过滤的）
-        // 收集当前chunk的token IDs和hidden states用于TTS条件生成
-        // 🔧 [优化] 只收集有效的 TTS token，确保每次给 TTS 的都是 step_size 个有效 token
-        std::vector<llama_token> chunk_token_ids;
-        std::vector<float>       chunk_hidden_states;
-        const int                llm_n_embd           = runtime.llm_n_embd;
-        bool                     local_is_end_of_turn = false;
-
-        // 🔧 [单双工适配] chunk 限制只在双工模式下生效
-        // - 双工模式: 每个 chunk 最多 max_new_speak_tokens_per_chunk 个 tokens，便于及时响应打断
-        // - 单工模式: 无限制，LLM 生成直到 EOS
-        int  max_chunk_tokens    = ctx_omni->duplex_mode ? ctx_omni->max_new_speak_tokens_per_chunk : 0;
-        bool chunk_limit_reached = (max_chunk_tokens > 0 && runtime.current_chunk_tokens >= max_chunk_tokens);
-        {
-            fflush(stdout);
-            // 🔧 [重要] 循环直到收集到 step_size 个有效 token，而不是生成 step_size 个 token
-            // 🔧 [P0-打断检测] 检测 break_event，支持双工模式下的打断
-            // 🔧 [P2-chunk限制] 检测 max_new_speak_tokens_per_chunk，便于及时响应打断
-            while (jl < runtime.step_size && !runtime.llm_finish && !ctx_omni->gate.break_event.load() &&
-                   !chunk_limit_reached) {
-                // streaming llm
-                const char * tmp           = nullptr;
-                float *      hidden_states = nullptr;
-
-                llama_token sampled_token = 0;
-                {
-                    std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-                    // 使用新函数获取token文本、hidden state和token ID
-                    tmp = llama_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler,
-                                                           ctx_omni->session.n_past, hidden_states, sampled_token);
-                }
-
-                total_tokens_generated++;
-
-                // 🔧 [过滤逻辑] 只收集有效的 TTS token
-                // 特殊 token（如 <think>, </think>, 换行等）不计入 step_size
-                if (tmp != nullptr && hidden_states != nullptr) {
-                    if (omni_tts_is_valid_token(sampled_token)) {
-                        // 有效 token：收集并计入计数
-                        chunk_token_ids.push_back(sampled_token);
-                        chunk_hidden_states.insert(chunk_hidden_states.end(), hidden_states,
-                                                   hidden_states + llm_n_embd);
-                        jl++;  // 只有有效 token 才增加计数
-
-                        // 🔧 [调试] 打印收集的 token 和 hidden states 摘要
-
-                        // 🔧 [P2-chunk限制] 更新当前 chunk 的 token 计数
-                        runtime.current_chunk_tokens++;
-
-                        // 检查是否达到 chunk 限制
-                        if (max_chunk_tokens > 0 && runtime.current_chunk_tokens >= max_chunk_tokens) {
-                            chunk_limit_reached = true;
-                        }
-                    } else {
-                        // 🔧 [调试] 打印被过滤的 token
-                    }
-                }
-
-                // if (hidden_states != nullptr) {
-                //     int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-                //     // 打印第一个 embedding 的前5个数字
-                //     printf("First embedding (first 5): ");
-                //     for (int i = 0; i < 5 && i < n_embd; i++) {
-                //         printf("%.6f ", hidden_states[i]);
-                //     }
-                //     printf("\n");
-                //     // 打印最后一个 embedding 的后5个数字 (这里只有1个token，所以第一个和最后一个是同一个)
-                //     printf("Last embedding (last 5): ");
-                //     for (int i = n_embd - 5; i < n_embd; i++) {
-                //         if (i >= 0) {
-                //             printf("%.6f ", hidden_states[i]);
-                //         }
-                //     }
-                //     printf("\n");
-                //     free(hidden_states);
-                // }
-                if (!runtime.llm_first_token_logged) {
-                    runtime.llm_first_token_logged = true;
-                }
-                if (tmp == nullptr) {
-                    LOG_ERR("llama_loop returned nullptr!");
-                    break;
-                }
-
-                // 🔧 [调试日志] 记录每个生成的 token 到文件
-
-                // 🔧 [使用 token ID 检测] 使用缓存的 token ID 进行检测，比字符串比较更高效
-                OmniTokenType token_type = omni_get_token_type(ctx_omni, sampled_token);
-                if (token_type != OmniTokenType::NORMAL) {
-                }
-
-                omni_mark_decode_turn_end(ctx_omni, token_type, local_is_end_of_turn);
-
-                if (omni_is_end_token(ctx_omni, sampled_token)) {
-                    runtime.llm_finish = true;
-                    omni_handle_decode_end_token(ctx_omni, token_type);
-                    // Don't add end tokens to response
-                    break;
-                }
-
-                // Copy tmp to a local string immediately to avoid issues with static string
-                std::string tmp_str(tmp);
-                response += tmp_str;
-                fflush(stdout);
-            }
-            fflush(stdout);
-            fflush(stdout);
-        }
-        fflush(stdout);
-
-        // 🔧 [P2-chunk限制] 如果达到 chunk 限制，结束当前 decode
-        // 这与 Python 双工 server 行为一致：每次 generate 只返回一个 chunk
-        // 客户端需要再次调用 stream_decode 获取下一个 chunk
-        if (chunk_limit_reached) {
-            // 🔧 [P0-修复] 与 Python 对齐：达到 chunk 限制时，强制添加 <|chunk_eos|> token
-            // Python: self.decoder.feed(self.decoder.embed_token(self.chunk_eos_token_id))
-            if (ctx_omni->special_token_chunk_eos >= 0) {
-                std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-                // Feed chunk_eos token to model (update KV cache)
-                std::vector<llama_token>    chunk_eos_tokens = { ctx_omni->special_token_chunk_eos };
-                eval_tokens(ctx_omni, ctx_omni->params, chunk_eos_tokens, ctx_omni->params->n_batch, &ctx_omni->session.n_past);
-            }
-            // 这样 SSE 流会结束，客户端可以再次调用 decode
-            runtime.llm_finish           = true;
-            // 注意：不重置 current_chunk_tokens，下次 decode 会从 0 开始
-            runtime.current_chunk_tokens = 0;
-        }
-
-        // add </unit> token after each chunk
-        if (ctx_omni->duplex_mode && ctx_omni->special_token_unit_end >= 0) {
-            std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-            // Feed </unit> token to model (update KV cache)
-            std::vector<llama_token>    unit_end_tokens = { ctx_omni->special_token_unit_end };
-            eval_tokens(ctx_omni, ctx_omni->params, unit_end_tokens, ctx_omni->params->n_batch, &ctx_omni->session.n_past);
-        }
-        fflush(stdout);
-        runtime.generated_decode_tokens += total_tokens_generated;
-        omni_strip_decode_special_tokens(response);
-        omni_publish_decode_response(ctx_omni, response);
-        omni_dispatch_decode_chunk_to_tts(ctx_omni, request, response, chunk_token_ids, chunk_hidden_states,
-                                          runtime.llm_finish, local_is_end_of_turn, llm_n_embd);
-        fflush(stdout);
-        if (runtime.llm_finish) {
-            break;
-        }
+    if (!omni_llm_stage_decode_run(ctx_omni, request)) {
+        return false;
     }
-    fflush(stdout);
-    omni_finish_decode_text_stream(ctx_omni);
+
     omni_turn_coordinator_close(ctx_omni, OmniTurnCloseKind::finish);
     return true;
 }

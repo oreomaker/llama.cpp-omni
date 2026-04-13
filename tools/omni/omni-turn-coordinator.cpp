@@ -1,9 +1,9 @@
 #include "omni-turn-coordinator.h"
 
 #include "common/common.h"
+#include "omni-llm-stage.h"
 #include "omni-log.h"
 #include "omni-session-state.h"
-#include "omni-sliding-window.h"
 #include "omni.h"
 
 #include <chrono>
@@ -28,7 +28,7 @@ static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(struct omni_
         return result;
     }
 
-    omni_finalize_decode_round(ctx_omni);
+    omni_llm_stage_finalize_decode_round(ctx_omni);
     ctx_omni->turn.current_turn_ended = true;
 
     result.turn_closed  = true;

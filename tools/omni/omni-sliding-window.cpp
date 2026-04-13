@@ -409,34 +409,3 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
 
     return dropped_count > 0;
 }
-
-void omni_finalize_decode_round(struct omni_context * ctx_omni) {
-    if (ctx_omni->duplex_mode) {
-        return;
-    }
-
-    const int reserved_space = 1024;
-    const int n_ctx          = ctx_omni->params->n_ctx;
-
-    if (ctx_omni->session.n_past > n_ctx - reserved_space) {
-        print_with_timestamp("⚠️ Decode 结束滑窗检查: n_past=%d > n_ctx-reserved=%d，需要滑窗\n", ctx_omni->session.n_past,
-                             n_ctx - reserved_space);
-        kv_cache_slide_window(ctx_omni, ctx_omni->params, reserved_space);
-    } else {
-        print_with_timestamp("📍 Decode 结束: n_past=%d, 剩余空间=%d, 无需滑窗\n", ctx_omni->session.n_past,
-                             n_ctx - ctx_omni->session.n_past);
-    }
-
-    ctx_omni->session.round_start_positions.push_back(ctx_omni->session.n_past);
-    print_with_timestamp("📍 轮次 %zu 结束，记录边界于 n_past=%d\n", ctx_omni->session.round_start_positions.size(),
-                         ctx_omni->session.n_past);
-
-    const bool prefix_ok = omni_sliding_eval_string(ctx_omni, ctx_omni->params, "<|im_end|>\n<|im_start|>user\n",
-                                                    ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
-    if (!prefix_ok) {
-        print_with_timestamp("⚠️ 为下一轮准备 user 前缀失败，n_past=%d\n", ctx_omni->session.n_past);
-        return;
-    }
-
-    print_with_timestamp("📍 为下一轮准备: eval <|im_end|>\\n<|im_start|>user\\n, n_past=%d\n", ctx_omni->session.n_past);
-}
