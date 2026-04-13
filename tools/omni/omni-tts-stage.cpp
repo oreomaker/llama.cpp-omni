@@ -4,6 +4,7 @@
 #include "common/sampling.h"
 #include "omni-impl.h"
 #include "omni-output.h"
+#include "omni-worker-coordinator.h"
 #include "omni.h"
 
 #include <algorithm>
@@ -13,14 +14,95 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <set>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#    include <sys/stat.h>
+#    include <sys/types.h>
+#    ifndef S_IFDIR
+#        define S_IFDIR _S_IFDIR
+#    endif
+#    ifndef stat
+#        define stat _stat
+#    endif
+#else
+#    include <sys/stat.h>
+#    include <sys/types.h>
+#endif
+
 void print_with_timestamp(const char * format, ...);
 
 namespace {
+
+static void duplex_timing_mark_tts_done(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    if (timing.tts_audio_token_ms < 0.0) {
+        timing.tts_audio_token_ms = 0.0;
+    }
+    timing.tts_done = true;
+}
+
+static size_t findIncompleteUtf8(const std::string & str) {
+    if (str.empty()) {
+        return 0;
+    }
+
+    size_t len = str.length();
+
+    // Check from the end backwards to find incomplete UTF-8 sequences
+    size_t pos                         = len;
+    int    expected_continuation_bytes = 0;
+
+    while (pos > 0) {
+        unsigned char c = (unsigned char) str[pos - 1];
+
+        if ((c & 0x80) == 0) {
+            // ASCII character (0xxxxxxx), complete sequence
+            break;
+        } else if ((c & 0xC0) == 0x80) {
+            // Continuation byte (10xxxxxx), part of a multi-byte sequence
+            expected_continuation_bytes++;
+            pos--;
+        } else if ((c & 0xE0) == 0xC0) {
+            // 2-byte sequence start (110xxxxx)
+            if (expected_continuation_bytes == 1) {
+                break;
+            } else {
+                return len - pos + 1;
+            }
+        } else if ((c & 0xF0) == 0xE0) {
+            // 3-byte sequence start (1110xxxx)
+            if (expected_continuation_bytes == 2) {
+                break;
+            } else {
+                return len - pos + (3 - expected_continuation_bytes);
+            }
+        } else if ((c & 0xF8) == 0xF0) {
+            // 4-byte sequence start (11110xxx)
+            if (expected_continuation_bytes == 3) {
+                break;
+            } else {
+                return len - pos + (4 - expected_continuation_bytes);
+            }
+        } else {
+            break;
+        }
+    }
+
+    if (pos == 0 && expected_continuation_bytes > 0) {
+        return len;
+    }
+
+    return 0;
+}
 
 constexpr int OMNI_TTS_AUDIO_BOS_TOKEN_ID      = 151687;
 constexpr int OMNI_TTS_TEXT_EOS_TOKEN_ID       = 151692;
@@ -1816,4 +1898,845 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
     }
 
     return finish_tts_stage(!output_audio_tokens.empty());
+}
+
+// ==============================================================================
+// TTS Worker Main Loops
+// ==============================================================================
+
+void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_params * params) {
+    // TTS model state
+    int                      tts_n_past = 0;
+    std::vector<llama_token> audio_tokens;
+    std::vector<llama_token> all_audio_tokens;
+    std::string              debug_dir  = "";
+    bool                     tts_finish = false;
+    bool                     llm_finish = false;
+    int                      chunk_idx  = 0;
+    std::string              incomplete_bytes;
+
+    // 双工模式：固定输出目录（不使用 round_XXX 子目录）
+    const std::string & base_output_dir      = ctx_omni->base_output_dir;
+    const std::string   tts_output_dir       = base_output_dir + "/tts_txt";
+    const std::string   llm_debug_output_dir = base_output_dir + "/llm_debug";
+    const std::string   tts_wav_output_dir   = base_output_dir + "/tts_wav";
+    OmniRoundMeta       active_round_meta    = omni_session_round_meta(ctx_omni);
+
+    auto create_dir = [](const std::string & dir_path) {
+        if (!cross_platform_mkdir_p(dir_path)) {
+            LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
+            return false;
+        }
+        return true;
+    };
+
+    create_dir(tts_output_dir);
+    create_dir(llm_debug_output_dir);
+    create_dir(tts_wav_output_dir);
+
+    // 标志位：当前 turn 是否已经执行过 turn_eos flush
+    bool turn_eos_flushed = false;
+
+    print_with_timestamp("TTS thread (duplex mode) started\n");
+
+    // Multi Round Persistent Loop
+    while (ctx_omni->workers.tts_thread_running) {
+        if (!ctx_omni->workers.tts_thread_running) {
+            break;
+        }
+
+        // 双工模式打断检测
+        if (ctx_omni->break_event.load()) {
+            omni_clear_tts_queue(ctx_omni);
+            llm_finish = false;
+            tts_finish = false;
+            chunk_idx  = 0;
+            tts_n_past = 0;
+            audio_tokens.clear();
+            all_audio_tokens.clear();
+            incomplete_bytes.clear();
+            llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+            if (mem) {
+                llama_memory_seq_rm(mem, 0, 0, -1);
+                print_with_timestamp("TTS Duplex: break_event - cleared TTS KV cache\n");
+            }
+            ctx_omni->tts_n_past_accumulated = 0;
+            ctx_omni->tts_all_generated_tokens.clear();
+            ctx_omni->tts_condition_saved = false;
+            continue;
+        }
+
+        std::string              llm_text = "";
+        std::vector<llama_token> current_chunk_token_ids;
+        std::vector<float>       current_chunk_hidden_states;
+        int                      current_chunk_n_embd   = 0;
+        int                      current_chunk_perf_idx = -1;
+
+        bool accumulated_is_end_of_turn = false;
+
+        // Wait for queue
+        if (!llm_finish || (llm_finish && llm_text.empty())) {
+            std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+            auto &                       queue = ctx_omni->tts_thread_info->queue;
+            ctx_omni->tts_thread_info->cv.wait(lock, [&] {
+                return !queue.empty() || !ctx_omni->workers.tts_thread_running || ctx_omni->break_event.load();
+            });
+
+            if (ctx_omni->break_event.load()) {
+                lock.unlock();
+                continue;
+            }
+
+            if (!ctx_omni->workers.tts_thread_running) {
+                break;
+            }
+
+            // 清空 current_chunk 数据
+            current_chunk_token_ids.clear();
+            current_chunk_hidden_states.clear();
+            current_chunk_n_embd       = 0;
+            accumulated_is_end_of_turn = false;
+            current_chunk_perf_idx     = -1;
+
+            // 累积所有队列中的数据
+            while (!queue.empty()) {
+                LLMOut * llm_out = queue.front();
+                if (ctx_omni->duplex_mode && current_chunk_perf_idx >= 0 && llm_out->duplex_chunk_idx >= 0 &&
+                    llm_out->duplex_chunk_idx != current_chunk_perf_idx) {
+                    break;
+                }
+                if (current_chunk_perf_idx < 0 && llm_out->duplex_chunk_idx >= 0) {
+                    current_chunk_perf_idx = llm_out->duplex_chunk_idx;
+                }
+                queue.pop();
+                llm_finish |= llm_out->llm_finish;
+                accumulated_is_end_of_turn |= llm_out->is_end_of_turn;
+                active_round_meta = llm_out->round_meta;
+
+                if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
+                    llm_text += llm_out->text;
+                    debug_dir = llm_out->debug_dir;
+                }
+
+                if (!llm_out->token_ids.empty() && !llm_out->hidden_states.empty()) {
+                    current_chunk_token_ids.insert(current_chunk_token_ids.end(), llm_out->token_ids.begin(),
+                                                   llm_out->token_ids.end());
+                    current_chunk_hidden_states.insert(current_chunk_hidden_states.end(),
+                                                       llm_out->hidden_states.begin(), llm_out->hidden_states.end());
+                    current_chunk_n_embd = llm_out->n_embd;
+                }
+                delete llm_out;
+            }
+            lock.unlock();
+            ctx_omni->tts_thread_info->cv.notify_all();
+
+            print_with_timestamp(
+                "TTS Duplex: after queue - speek_done=%d, llm_finish=%d, token_ids.size=%zu, is_end_of_turn=%d, "
+                "llm_text.len=%zu\n",
+                ctx_omni->speek_done ? 1 : 0, llm_finish ? 1 : 0, current_chunk_token_ids.size(),
+                accumulated_is_end_of_turn ? 1 : 0, llm_text.size());
+
+            if (ctx_omni->speek_done && llm_finish) {
+                if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
+                    ctx_omni->speek_done = false;
+                } else if (ctx_omni->duplex_mode && accumulated_is_end_of_turn) {
+                    ctx_omni->speek_done = false;
+                    print_with_timestamp("TTS Duplex: is_end_of_turn=true, will call TTS to flush buffer\n");
+                } else {
+                    // LISTEN/CHUNK_EOS 且没有实际文本
+                    llm_finish = false;
+                    llm_text.clear();
+
+                    if (ctx_omni->t2w_thread_info) {
+                        T2WOut * t2w_out = new T2WOut();
+                        t2w_out->audio_tokens.clear();
+                        t2w_out->is_final         = false;
+                        t2w_out->is_chunk_end     = true;
+                        t2w_out->round_meta       = active_round_meta;
+                        t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
+                        {
+                            std::lock_guard<std::mutex> lock2(ctx_omni->t2w_thread_info->mtx);
+                            ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                        }
+                        ctx_omni->t2w_thread_info->cv.notify_one();
+                    }
+                    duplex_timing_mark_tts_done(ctx_omni, current_chunk_perf_idx);
+                    continue;
+                }
+            }
+        }
+
+        std::string & response = llm_text;
+        // 处理不完整的 UTF-8 字节
+        if (!incomplete_bytes.empty()) {
+            response = incomplete_bytes + response;
+            incomplete_bytes.clear();
+        }
+        size_t incomplete_len = findIncompleteUtf8(response);
+        if (incomplete_len > 0) {
+            incomplete_bytes = response.substr(response.size() - incomplete_len, incomplete_len);
+            response         = response.substr(0, response.size() - incomplete_len);
+        }
+
+        // Skip empty responses
+        if (response.empty() && !llm_finish) {
+            if (ctx_omni->speek_done) {
+                llm_finish = false;
+                if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
+                    // 保持状态
+                } else {
+                    chunk_idx  = 0;
+                    tts_n_past = 0;
+                    audio_tokens.clear();
+                    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                    if (mem) {
+                        llama_memory_seq_rm(mem, 0, 0, -1);
+                    }
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                }
+            }
+            continue;
+        }
+
+        // Tokenize text input
+        std::vector<llama_token> text_tokens = common_tokenize(ctx_omni->ctx_tts_llama, response, false, true);
+
+        if (text_tokens.empty() && !llm_finish) {
+            continue;
+        }
+
+        // Handle empty final chunk
+        if (text_tokens.empty() && response.empty() && llm_finish) {
+            ctx_omni->speek_done  = true;
+            ctx_omni->warmup_done = true;
+            ctx_omni->workers.speek_cv.notify_all();
+
+            if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
+                // LISTEN/CHUNK_EOS
+                if (ctx_omni->t2w_thread_info) {
+                    T2WOut * t2w_out = new T2WOut();
+                    t2w_out->audio_tokens.clear();
+                    t2w_out->is_final         = false;
+                    t2w_out->is_chunk_end     = true;
+                    t2w_out->round_meta       = active_round_meta;
+                    t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
+                    {
+                        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                        ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                    }
+                    ctx_omni->t2w_thread_info->cv.notify_one();
+                }
+                duplex_timing_mark_tts_done(ctx_omni, current_chunk_perf_idx);
+                tts_finish = false;
+                llm_finish = false;
+                continue;
+            }
+
+            if (ctx_omni->duplex_mode && accumulated_is_end_of_turn) {
+                print_with_timestamp(
+                    "TTS Duplex: empty final chunk but is_end_of_turn=true, will call TTS to flush buffer\n");
+            } else {
+                // 非双工模式
+                if (ctx_omni->t2w_thread_info) {
+                    T2WOut * t2w_out = new T2WOut();
+                    t2w_out->audio_tokens.clear();
+                    t2w_out->is_final     = true;
+                    t2w_out->is_chunk_end = false;
+                    t2w_out->round_meta   = active_round_meta;
+                    {
+                        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                        ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                    }
+                    ctx_omni->t2w_thread_info->cv.notify_one();
+                }
+                tts_finish = false;
+                llm_finish = false;
+                chunk_idx  = 0;
+                tts_n_past = 0;
+                audio_tokens.clear();
+                llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                if (mem && !ctx_omni->duplex_mode) {
+                    llama_memory_seq_rm(mem, 0, 0, -1);
+                }
+                ctx_omni->tts_n_past_accumulated = 0;
+                ctx_omni->tts_all_generated_tokens.clear();
+                ctx_omni->tts_condition_saved = false;
+                continue;
+            }
+        }
+
+        // Check for LLM data
+        bool has_llm_data =
+            (!current_chunk_token_ids.empty() && !current_chunk_hidden_states.empty() && current_chunk_n_embd > 0);
+
+        if (has_llm_data) {
+            int current_chunk_idx = chunk_idx;
+
+            if (turn_eos_flushed) {
+                turn_eos_flushed = false;
+            }
+
+            print_with_timestamp("TTS Duplex: processing chunk_idx=%d, n_tokens=%zu, is_end_of_turn=%d\n", chunk_idx,
+                                 current_chunk_token_ids.size(), accumulated_is_end_of_turn ? 1 : 0);
+
+            OmniTtsPreparedChunk prepared_chunk;
+            if (!omni_tts_prepare_duplex_chunk(ctx_omni, llm_debug_output_dir, current_chunk_idx, llm_text,
+                                               current_chunk_token_ids, current_chunk_hidden_states,
+                                               current_chunk_n_embd, prepared_chunk)) {
+                duplex_timing_mark_tts_done(ctx_omni, current_chunk_perf_idx);
+                continue;
+            }
+
+            int                  n_tokens_filtered = prepared_chunk.n_tokens_filtered;
+            const int            tts_n_embd        = prepared_chunk.tts_n_embd;
+            std::vector<float> & merged_embeddings = prepared_chunk.merged_embeddings;
+            const bool           merged_success    = prepared_chunk.merged_success;
+
+            bool should_call_tts =
+                (merged_success && !merged_embeddings.empty()) || (accumulated_is_end_of_turn && ctx_omni->duplex_mode);
+
+            if (should_call_tts) {
+                std::vector<int32_t> audio_tokens_out;
+                bool                 is_end_of_turn = accumulated_is_end_of_turn;
+
+                if (merged_embeddings.empty() && is_end_of_turn) {
+                    print_with_timestamp(
+                        "TTS Duplex: is_end_of_turn=true with empty embeddings, calling TTS to flush\n");
+                    n_tokens_filtered = 0;
+                }
+
+                bool tts_gen_success = omni_tts_generate_audio_tokens_local(
+                    ctx_omni, params, merged_embeddings, n_tokens_filtered, tts_n_embd, current_chunk_idx,
+                    current_chunk_perf_idx, audio_tokens_out, is_end_of_turn, active_round_meta, tts_wav_output_dir);
+
+                if (tts_gen_success) {
+                    all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
+                    if (is_end_of_turn && ctx_omni->duplex_mode) {
+                        turn_eos_flushed = true;
+                    }
+                }
+            } else {
+                duplex_timing_mark_tts_done(ctx_omni, current_chunk_perf_idx);
+            }
+
+            ++chunk_idx;
+            llm_text.clear();
+            response.clear();
+
+            // Handle final chunk
+            if (llm_finish) {
+                tts_finish            = true;
+                ctx_omni->speek_done  = true;
+                ctx_omni->warmup_done = true;
+                ctx_omni->workers.speek_cv.notify_all();
+
+                omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+
+                if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
+                    // LISTEN/CHUNK_EOS: 保持 TTS 状态
+                    if (ctx_omni->t2w_thread_info) {
+                        T2WOut * t2w_out = new T2WOut();
+                        t2w_out->audio_tokens.clear();
+                        t2w_out->is_final         = false;
+                        t2w_out->is_chunk_end     = true;
+                        t2w_out->round_meta       = active_round_meta;
+                        t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
+                        {
+                            std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                            ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                        }
+                        ctx_omni->t2w_thread_info->cv.notify_one();
+                    }
+                    llm_finish = false;
+                    tts_finish = false;
+                } else {
+                    // 真正的轮次结束
+                    if (ctx_omni->t2w_thread_info && !turn_eos_flushed) {
+                        T2WOut * t2w_out = new T2WOut();
+                        t2w_out->audio_tokens.clear();
+                        t2w_out->is_final         = true;
+                        t2w_out->round_meta       = active_round_meta;
+                        t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
+                        {
+                            std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                            ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                        }
+                        ctx_omni->t2w_thread_info->cv.notify_one();
+                    }
+                    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+                    if (mem) {
+                        llama_memory_seq_rm(mem, 0, 0, -1);
+                    }
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                    tts_n_past                    = 0;
+                    audio_tokens.clear();
+                    all_audio_tokens.clear();
+                    llm_finish = false;
+                    tts_finish = false;
+                }
+            }
+            continue;
+        }
+        if (ctx_omni->duplex_mode && accumulated_is_end_of_turn && llm_finish) {
+            // turn 结束但没有新数据，调用 TTS flush buffer
+            if (turn_eos_flushed) {
+                print_with_timestamp("TTS Duplex: turn_eos already flushed, skipping TTS generation\n");
+            } else {
+                print_with_timestamp("TTS Duplex: no LLM data but is_end_of_turn=true, calling TTS to flush buffer\n");
+
+                const int            tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
+                std::vector<float>   empty_embeddings;
+                std::vector<int32_t> audio_tokens_out;
+                int                  n_tokens_for_tts  = 0;
+                int                  current_chunk_idx = chunk_idx;
+
+                bool tts_gen_success = omni_tts_generate_audio_tokens_local(
+                    ctx_omni, params, empty_embeddings, n_tokens_for_tts, tts_n_embd, current_chunk_idx,
+                    current_chunk_perf_idx, audio_tokens_out, true, active_round_meta, tts_wav_output_dir);
+
+                if (tts_gen_success) {
+                    all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
+                } else {
+                    if (ctx_omni->t2w_thread_info) {
+                        T2WOut * t2w_out = new T2WOut();
+                        t2w_out->audio_tokens.clear();
+                        t2w_out->is_final         = true;
+                        t2w_out->is_chunk_end     = false;
+                        t2w_out->round_meta       = active_round_meta;
+                        t2w_out->duplex_chunk_idx = current_chunk_perf_idx;
+                        {
+                            std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                            ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                        }
+                        ctx_omni->t2w_thread_info->cv.notify_one();
+                    }
+                }
+
+                turn_eos_flushed = true;
+            }
+
+            omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+            llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
+            if (mem) {
+                llama_memory_seq_rm(mem, 0, 0, -1);
+            }
+            ctx_omni->tts_n_past_accumulated = 0;
+            ctx_omni->tts_all_generated_tokens.clear();
+            ctx_omni->tts_condition_saved = false;
+            tts_n_past                    = 0;
+            audio_tokens.clear();
+            all_audio_tokens.clear();
+            llm_finish            = false;
+            tts_finish            = false;
+            ctx_omni->speek_done  = true;
+            ctx_omni->warmup_done = true;
+            ctx_omni->workers.speek_cv.notify_all();
+
+            llm_text.clear();
+            response.clear();
+            continue;
+        }
+        llm_text.clear();
+        response.clear();
+    }
+
+    print_with_timestamp("TTS thread (duplex mode) stopped\n");
+}
+
+void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_params * params) {
+    // TTS model state
+    int                      tts_n_past = 0;
+    std::vector<llama_token> audio_tokens;
+    std::vector<llama_token> all_audio_tokens;
+    std::string              debug_dir  = "";
+    bool                     tts_finish = false;
+    bool                     llm_finish = false;
+    int                      chunk_idx  = 0;
+    std::string              incomplete_bytes;
+
+    const std::string & base_output_dir   = ctx_omni->base_output_dir;
+    OmniRoundMeta       active_round_meta = omni_session_round_meta(ctx_omni);
+
+    // Helper function to create directory
+    auto create_dir = [](const std::string & dir_path) {
+        struct stat info;
+        if (stat(dir_path.c_str(), &info) != 0) {
+            if (!cross_platform_mkdir_p(dir_path)) {
+                LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
+                return false;
+            }
+            return true;
+        }
+        if (!(info.st_mode & S_IFDIR)) {
+            LOG_ERR("Output path exists but is not a directory: %s\n", dir_path.c_str());
+            return false;
+        }
+        return true;
+    };
+
+    auto get_round_output_dir = [&](const OmniRoundMeta & round_meta) -> std::string {
+        return omni_round_output_dir(base_output_dir, round_meta);
+    };
+
+    std::string current_round_dir    = get_round_output_dir(active_round_meta);
+    std::string tts_output_dir       = current_round_dir + "/tts_txt";
+    std::string llm_debug_output_dir = current_round_dir + "/llm_debug";
+    std::string tts_wav_output_dir   = current_round_dir + "/tts_wav";
+
+    int last_created_round_idx = -1;
+
+    auto update_output_dirs = [&]() {
+        current_round_dir    = get_round_output_dir(active_round_meta);
+        tts_output_dir       = current_round_dir + "/tts_txt";
+        llm_debug_output_dir = current_round_dir + "/llm_debug";
+        tts_wav_output_dir   = current_round_dir + "/tts_wav";
+
+        if (active_round_meta.round_idx != last_created_round_idx || active_round_meta.duplex_mode) {
+            create_dir(tts_output_dir);
+            create_dir(llm_debug_output_dir);
+            create_dir(tts_wav_output_dir);
+            last_created_round_idx = active_round_meta.round_idx;
+
+            if (!active_round_meta.duplex_mode) {
+                print_with_timestamp("TTS: 创建单工模式输出目录: %s\n", current_round_dir.c_str());
+            }
+        }
+    };
+
+    update_output_dirs();
+
+    auto create_wav_timing_file = [&]() {
+        std::string wav_timing_file = tts_wav_output_dir + "/wav_timing.txt";
+        FILE *      f_timing        = fopen(wav_timing_file.c_str(), "w");
+        if (f_timing) {
+            fprintf(f_timing, "# WAV file generation timing log\n");
+            fprintf(f_timing,
+                    "# Format: chunk_index, elapsed_time_ms (since stream_decode start), file_size_bytes, "
+                    "request_duration_ms\n");
+            fprintf(f_timing, "# Time 0 is when stream_decode() function starts\n");
+            fclose(f_timing);
+        }
+    };
+    create_wav_timing_file();
+
+    print_with_timestamp("TTS thread started\n");
+
+    // Multi Round Persistent Loop
+    while (ctx_omni->workers.tts_thread_running) {
+        if (!ctx_omni->workers.tts_thread_running) {
+            break;
+        }
+
+        // 打断检测：清空队列、重置状态
+        if (ctx_omni->break_event.load()) {
+            omni_clear_tts_queue(ctx_omni);
+            llm_finish = false;
+            tts_finish = false;
+            chunk_idx  = 0;
+            tts_n_past = 0;
+            audio_tokens.clear();
+            all_audio_tokens.clear();
+            incomplete_bytes.clear();
+            ctx_omni->tts_n_past_accumulated = 0;
+            ctx_omni->tts_all_generated_tokens.clear();
+            ctx_omni->tts_condition_saved = false;
+            continue;
+        }
+
+        std::string              llm_text = "";
+        std::vector<llama_token> current_chunk_token_ids;
+        std::vector<float>       current_chunk_hidden_states;
+        int                      current_chunk_n_embd = 0;
+
+        // Always wait for queue if not finished, or if finished but need to reset state
+        if (!llm_finish || (llm_finish && llm_text.empty())) {
+            std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+            auto &                       queue = ctx_omni->tts_thread_info->queue;
+            ctx_omni->tts_thread_info->cv.wait(lock, [&] {
+                return !queue.empty() || !ctx_omni->workers.tts_thread_running || ctx_omni->break_event.load();
+            });
+
+            if (ctx_omni->break_event.load()) {
+                lock.unlock();
+                continue;
+            }
+
+            if (!ctx_omni->workers.tts_thread_running) {
+                break;
+            }
+
+            // 每次只处理一个 chunk（与 Python 对齐）
+            if (!queue.empty()) {
+                LLMOut * llm_out = queue.front();
+                llm_finish |= llm_out->llm_finish;
+                active_round_meta = llm_out->round_meta;
+                if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
+                    llm_text  = llm_out->text;
+                    debug_dir = llm_out->debug_dir;
+                }
+                if (!llm_out->token_ids.empty() && !llm_out->hidden_states.empty()) {
+                    current_chunk_token_ids     = llm_out->token_ids;
+                    current_chunk_hidden_states = llm_out->hidden_states;
+                    current_chunk_n_embd        = llm_out->n_embd;
+
+                    std::string token_ids_str = "";
+                    for (size_t i = 0; i < current_chunk_token_ids.size() && i < 20; i++) {
+                        token_ids_str += std::to_string(current_chunk_token_ids[i]);
+                        if (i < current_chunk_token_ids.size() - 1 && i < 19) {
+                            token_ids_str += " ";
+                        }
+                    }
+                    if (current_chunk_token_ids.size() > 20) {
+                        token_ids_str += "...";
+                    }
+
+                    print_with_timestamp(
+                        "TTS<-LLM: chunk_idx=%d, text='%s', n_tokens=%zu, hidden_size=%zu, token_ids=[%s]\n", chunk_idx,
+                        llm_text.c_str(), current_chunk_token_ids.size(), current_chunk_hidden_states.size(),
+                        token_ids_str.c_str());
+                }
+                delete llm_out;
+                queue.pop();
+            }
+            lock.unlock();
+            ctx_omni->tts_thread_info->cv.notify_all();
+            update_output_dirs();
+
+            print_with_timestamp(
+                "TTS: after queue pop - speek_done=%d, llm_finish=%d, llm_text.empty=%d, token_ids.size=%zu\n",
+                ctx_omni->speek_done, llm_finish, llm_text.empty(), current_chunk_token_ids.size());
+
+            if (ctx_omni->speek_done && llm_finish) {
+                print_with_timestamp("TTS: speek_done=true and llm_finish=true, resetting state for next round\n");
+                if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
+                    ctx_omni->speek_done = false;
+                } else {
+                    llm_finish = false;
+                    llm_text.clear();
+                    chunk_idx  = 0;
+                    tts_n_past = 0;
+                    audio_tokens.clear();
+                    ctx_omni->tts_n_past_accumulated = 0;
+                    ctx_omni->tts_all_generated_tokens.clear();
+                    ctx_omni->tts_condition_saved = false;
+                    continue;
+                }
+            }
+        }
+
+        std::string & response = llm_text;
+        if (!incomplete_bytes.empty()) {
+            print_with_timestamp("TTS: prepending incomplete_bytes (len=%zu) to response (len=%zu)\n",
+                                 incomplete_bytes.length(), response.length());
+            response = incomplete_bytes + response;
+            incomplete_bytes.clear();
+        }
+        size_t incomplete_len = findIncompleteUtf8(response);
+        if (incomplete_len > 0) {
+            print_with_timestamp(
+                "TTS: detected incomplete UTF-8 sequence at end: incomplete_len=%zu, response_len=%zu\n",
+                incomplete_len, response.length());
+            incomplete_bytes = response.substr(response.size() - incomplete_len, incomplete_len);
+            response         = response.substr(0, response.size() - incomplete_len);
+            print_with_timestamp("TTS: after truncation: response_len=%zu, incomplete_bytes_len=%zu\n",
+                                 response.length(), incomplete_bytes.length());
+        } else {
+            incomplete_bytes.clear();
+        }
+
+        print_with_timestamp("TTS: before empty check - response.empty=%d, response='%s', llm_finish=%d\n",
+                             response.empty(), response.substr(0, 50).c_str(), llm_finish);
+
+        if (response.empty() && !llm_finish) {
+            if (ctx_omni->speek_done) {
+                print_with_timestamp(
+                    "TTS: speek_done=true with empty response, keeping state (waiting for stream_prefill)\n");
+                llm_finish = false;
+                chunk_idx  = 0;
+                tts_n_past = 0;
+                audio_tokens.clear();
+                ctx_omni->tts_n_past_accumulated = 0;
+                ctx_omni->tts_all_generated_tokens.clear();
+                ctx_omni->tts_condition_saved = false;
+            }
+            continue;
+        }
+        fflush(stdout);
+
+        if (response.empty() && llm_finish) {
+            print_with_timestamp("TTS: received llm_finish=true with no data, finalizing (tts_token_buffer=%zu)\n",
+                                 ctx_omni->tts_token_buffer.size());
+
+            if (ctx_omni->t2w_thread_info && !ctx_omni->tts_token_buffer.empty()) {
+                T2WOut * t2w_out = new T2WOut();
+                t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(), ctx_omni->tts_token_buffer.end());
+                t2w_out->is_final   = false;
+                t2w_out->round_meta = active_round_meta;
+                {
+                    std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                    ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                }
+                ctx_omni->t2w_thread_info->cv.notify_one();
+                print_with_timestamp("TTS: flushed %zu remaining tokens from tts_token_buffer\n",
+                                     ctx_omni->tts_token_buffer.size());
+                ctx_omni->tts_token_buffer.clear();
+            }
+
+            if (ctx_omni->t2w_thread_info) {
+                const OmniRoundMeta completed_round_meta = active_round_meta;
+                T2WOut *            t2w_final            = new T2WOut();
+                t2w_final->audio_tokens.clear();
+                t2w_final->is_final   = true;
+                t2w_final->round_meta = completed_round_meta;
+                {
+                    std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                    ctx_omni->t2w_thread_info->queue.push(t2w_final);
+                }
+                ctx_omni->t2w_thread_info->cv.notify_one();
+                print_with_timestamp("TTS: sent is_final=true to T2W (llm_finish with no data)\n");
+            }
+
+            ctx_omni->speek_done  = true;
+            ctx_omni->warmup_done = true;
+            ctx_omni->workers.speek_cv.notify_all();
+            print_with_timestamp("TTS: finished processing all chunks (llm_finish with no data path)\n");
+            tts_finish = false;
+            llm_finish = false;
+            chunk_idx  = 0;
+            tts_n_past = 0;
+            audio_tokens.clear();
+            ctx_omni->tts_n_past_accumulated = 0;
+            ctx_omni->tts_all_generated_tokens.clear();
+            ctx_omni->tts_condition_saved = false;
+            continue;
+        }
+
+        fflush(stdout);
+        print_with_timestamp("TTS: DEBUG before has_llm_data - token_ids.size=%zu, hidden_states.size=%zu, n_embd=%d\n",
+                             current_chunk_token_ids.size(), current_chunk_hidden_states.size(), current_chunk_n_embd);
+
+        bool has_llm_data =
+            (!current_chunk_token_ids.empty() && !current_chunk_hidden_states.empty() && current_chunk_n_embd > 0);
+
+        print_with_timestamp("TTS: has_llm_data=%d, token_ids=%zu, hidden_states=%zu, n_embd=%d, llm_finish=%d\n",
+                             has_llm_data, current_chunk_token_ids.size(), current_chunk_hidden_states.size(),
+                             current_chunk_n_embd, llm_finish);
+
+        if (has_llm_data) {
+            if (chunk_idx == 0 && !ctx_omni->duplex_mode) {
+                update_output_dirs();
+                create_wav_timing_file();
+            }
+
+            int current_chunk_idx = chunk_idx;
+
+            OmniTtsPreparedChunk prepared_chunk;
+            if (!omni_tts_prepare_simplex_chunk(ctx_omni, llm_debug_output_dir, current_chunk_idx, response,
+                                                current_chunk_token_ids, current_chunk_hidden_states,
+                                                current_chunk_n_embd, prepared_chunk)) {
+                continue;
+            }
+
+            int                  n_tokens_filtered = prepared_chunk.n_tokens_filtered;
+            const int            tts_n_embd        = prepared_chunk.tts_n_embd;
+            std::vector<float> & merged_embeddings = prepared_chunk.merged_embeddings;
+            const bool           merged_success    = prepared_chunk.merged_success;
+
+            bool is_final_text_chunk = llm_finish;
+
+            if (merged_success && !merged_embeddings.empty()) {
+                std::vector<int32_t> audio_tokens_chunk;
+                bool                 tts_gen_success = omni_tts_generate_audio_tokens_local_simplex(
+                    ctx_omni, params, merged_embeddings, n_tokens_filtered, tts_n_embd, current_chunk_idx,
+                    audio_tokens_chunk, active_round_meta, tts_wav_output_dir, is_final_text_chunk);
+                if (tts_gen_success) {
+                    std::string tokens_txt_file =
+                        tts_wav_output_dir + "/audio_tokens_chunk_" + std::to_string(current_chunk_idx) + ".txt";
+                    FILE * f_tokens = fopen(tokens_txt_file.c_str(), "w");
+                    if (f_tokens) {
+                        for (size_t i = 0; i < audio_tokens_chunk.size(); ++i) {
+                            fprintf(f_tokens, "%d", audio_tokens_chunk[i]);
+                            if (i < audio_tokens_chunk.size() - 1) {
+                                fprintf(f_tokens, ",");
+                            }
+                        }
+                        fprintf(f_tokens, "\n");
+                        fclose(f_tokens);
+                    }
+                    all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_chunk.begin(),
+                                            audio_tokens_chunk.end());
+                } else {
+                    LOG_ERR("TTS Local: failed for chunk %d\n", current_chunk_idx);
+                }
+            }
+
+            ++chunk_idx;
+            llm_text.clear();
+            response.clear();
+
+            if (llm_finish) {
+                if (!ctx_omni->tts_token_buffer.empty() && ctx_omni->t2w_thread_info) {
+                    print_with_timestamp("TTS: llm_finish=true, flushing remaining %zu tokens from tts_token_buffer\n",
+                                         ctx_omni->tts_token_buffer.size());
+                    T2WOut * t2w_out = new T2WOut();
+                    if (t2w_out) {
+                        t2w_out->audio_tokens.assign(ctx_omni->tts_token_buffer.begin(),
+                                                     ctx_omni->tts_token_buffer.end());
+                        t2w_out->is_final   = false;
+                        t2w_out->round_meta = active_round_meta;
+                        {
+                            std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                            ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                        }
+                        ctx_omni->t2w_thread_info->cv.notify_one();
+                    }
+                    ctx_omni->tts_token_buffer.clear();
+                }
+
+                tts_finish            = true;
+                ctx_omni->speek_done  = true;
+                ctx_omni->warmup_done = true;
+                ctx_omni->workers.speek_cv.notify_all();
+                print_with_timestamp("TTS: finished processing all chunks\n");
+
+                omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+                const OmniRoundMeta completed_round_meta = active_round_meta;
+
+                if (ctx_omni->t2w_thread_info) {
+                    T2WOut * t2w_out = new T2WOut();
+                    t2w_out->audio_tokens.clear();
+                    t2w_out->is_final   = true;
+                    t2w_out->round_meta = completed_round_meta;
+                    {
+                        std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
+                        ctx_omni->t2w_thread_info->queue.push(t2w_out);
+                    }
+                    ctx_omni->t2w_thread_info->cv.notify_one();
+                    print_with_timestamp("TTS: sent is_final=true to T2W queue (turn end)\n");
+                }
+                ctx_omni->tts_n_past_accumulated = 0;
+                ctx_omni->tts_all_generated_tokens.clear();
+                if (ctx_omni->duplex_mode) {
+                    ctx_omni->tts_condition_saved = false;
+                }
+
+                chunk_idx  = 0;
+                tts_n_past = 0;
+                audio_tokens.clear();
+                all_audio_tokens.clear();
+                llm_finish = false;
+                tts_finish = false;
+            }
+
+            continue;
+        }
+        llm_text.clear();
+        response.clear();
+    }
+
+    print_with_timestamp("TTS thread stopped\n");
 }

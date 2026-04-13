@@ -60,3 +60,7 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
                                                   const OmniRoundMeta &      round_meta,
                                                   const std::string &        output_dir          = "",
                                                   bool                       is_final_text_chunk = false);
+
+// TTS worker main loops — entry points called by tts_thread_func* wrappers in omni.cpp
+void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_params * params);
+void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_params * params);
