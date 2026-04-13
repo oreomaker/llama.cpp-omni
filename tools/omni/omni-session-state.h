@@ -66,8 +66,6 @@ struct OmniTurnState {
 };
 
 struct OmniSessionGate {
-    volatile bool prefill_requested = false;
-    bool prefill_done = true;
     volatile bool speech_ready = true;
     bool text_streaming = false;
     bool text_done = false;

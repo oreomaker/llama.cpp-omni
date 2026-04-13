@@ -123,7 +123,6 @@ void omni_turn_coordinator_prepare_decode(struct omni_context *       ctx_omni,
         omni_request_prefill(ctx_omni);
         print_with_timestamp("wait prefill done\n");
         omni_wait_for_prefill_completion(ctx_omni);
-        omni_reset_prefill_completion(ctx_omni);
     }
 
     if (ctx_omni->use_tts) {

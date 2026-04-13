@@ -1,5 +1,6 @@
 #include "omni-worker-coordinator.h"
 
+#include "omni-llm-stage.h"
 #include "omni-log.h"
 #include "omni-runtime-messages.h"
 #include "omni.h"
@@ -77,42 +78,11 @@ void omni_ensure_decode_workers_started(struct omni_context * ctx_omni, const Om
 }
 
 void omni_request_prefill(struct omni_context * ctx_omni) {
-    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
-        return;
-    }
-
-    ctx_omni->gate.prefill_requested = true;
-    ctx_omni->llm_thread_info->cv.notify_all();
+    omni_llm_stage_request_prefill_flush(ctx_omni);
 }
 
 void omni_wait_for_prefill_completion(struct omni_context * ctx_omni) {
-    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
-        return;
-    }
-
-    std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-    ctx_omni->workers.decode_cv.wait(lock, [&] { return ctx_omni->gate.prefill_done; });
-}
-
-void omni_reset_prefill_completion(struct omni_context * ctx_omni) {
-    if (ctx_omni != nullptr) {
-        ctx_omni->gate.prefill_done = false;
-    }
-}
-
-void omni_mark_prefill_started(struct omni_context * ctx_omni) {
-    if (ctx_omni != nullptr) {
-        ctx_omni->gate.prefill_done = false;
-    }
-}
-
-void omni_mark_prefill_completed(struct omni_context * ctx_omni) {
-    if (ctx_omni == nullptr) {
-        return;
-    }
-
-    ctx_omni->gate.prefill_done = true;
-    ctx_omni->workers.decode_cv.notify_all();
+    omni_llm_stage_wait_for_prefill_flush(ctx_omni);
 }
 
 void omni_request_worker_shutdown(struct omni_context * ctx_omni) {

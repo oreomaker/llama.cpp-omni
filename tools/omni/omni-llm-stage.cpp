@@ -28,6 +28,44 @@ struct LlmDecodeRuntime {
     bool llm_first_token_logged  = false;
 };
 
+bool omni_llm_stage_has_pending_prefill_flush(const struct LLMThreadInfo * llm_thread_info) {
+    return llm_thread_info != nullptr &&
+           llm_thread_info->prefill_flush_completed_seq < llm_thread_info->prefill_flush_requested_seq;
+}
+
+std::vector<omni_embeds *> omni_llm_stage_drain_prefill_queue(struct LLMThreadInfo * llm_thread_info) {
+    std::vector<omni_embeds *> llm_embeds;
+    if (llm_thread_info == nullptr) {
+        return llm_embeds;
+    }
+
+    auto & queue = llm_thread_info->queue;
+    while (!queue.empty()) {
+        llm_embeds.push_back(queue.front());
+        queue.pop();
+    }
+    return llm_embeds;
+}
+
+void omni_llm_stage_complete_prefill_flush(struct omni_context * ctx_omni, std::unique_lock<std::mutex> & lock) {
+    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
+        return;
+    }
+
+    auto * llm_thread_info = ctx_omni->llm_thread_info;
+    if (!llm_thread_info->queue.empty() || !omni_llm_stage_has_pending_prefill_flush(llm_thread_info)) {
+        return;
+    }
+
+    llm_thread_info->prefill_flush_completed_seq = llm_thread_info->prefill_flush_requested_seq;
+    if (ctx_omni->use_tts && !ctx_omni->duplex_mode) {
+        ctx_omni->gate.speech_ready = false;
+    }
+
+    lock.unlock();
+    ctx_omni->workers.decode_cv.notify_all();
+}
+
 bool omni_llm_stage_eval_tokens_with_hidden(struct omni_context *    ctx_omni,
                                             struct common_params *   params,
                                             std::vector<llama_token> tokens,
@@ -397,6 +435,174 @@ bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
     std::vector<llama_token> tokens  = common_tokenize(ctx_omni->ctx_llama, str_buf, add_bos, true);
     return omni_llm_stage_eval_tokens_with_hidden(ctx_omni, params, std::move(tokens), n_batch, n_past,
                                                   hidden_states);
+}
+
+void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
+                                  struct common_params *     params,
+                                  const struct omni_embeds & embeds) {
+    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
+        sliding_window_register_unit_start(ctx_omni);
+    }
+
+    if (!embeds.vision_embed.empty()) {
+        const int  n_chunks         = (int) embeds.vision_embed.size();
+        const int  tokens_per_chunk = (int) embeds.vision_embed[0].size() / hidden_size;
+        const int  n_audio_tokens   = embeds.audio_embed.size() / hidden_size;
+        const bool has_audio        = n_audio_tokens > 0;
+        const bool has_slices       = n_chunks > 1;
+
+        if (ctx_omni->duplex_mode) {
+            omni_llm_stage_eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->session.n_past,
+                                       false);
+        } else {
+            omni_llm_stage_eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->session.n_past,
+                                       false);
+        }
+
+        prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[0].data()), tokens_per_chunk,
+                         params->n_batch, &ctx_omni->session.n_past);
+        omni_llm_stage_eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->session.n_past, false);
+
+        if (has_slices) {
+            for (int i = 1; i < n_chunks; ++i) {
+                omni_llm_stage_eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->session.n_past,
+                                           false);
+                prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[i].data()), tokens_per_chunk,
+                                 params->n_batch, &ctx_omni->session.n_past);
+                omni_llm_stage_eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->session.n_past,
+                                           false);
+            }
+            omni_llm_stage_eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->session.n_past, false);
+        }
+
+        print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
+                             tokens_per_chunk, n_audio_tokens, has_slices);
+
+        if (has_audio) {
+            if (!ctx_omni->duplex_mode) {
+                omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
+                                           &ctx_omni->session.n_past, false);
+            }
+            prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
+                             params->n_batch, &ctx_omni->session.n_past);
+            if (!ctx_omni->duplex_mode) {
+                omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch,
+                                           &ctx_omni->session.n_past, false);
+            }
+        }
+    } else {
+        const int n_audio_tokens = embeds.audio_embed.size() / hidden_size;
+        print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
+
+        if (ctx_omni->duplex_mode) {
+            omni_llm_stage_eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->session.n_past, false);
+        } else {
+            omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
+                                       &ctx_omni->session.n_past, false);
+        }
+
+        if (n_audio_tokens > 0) {
+            prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
+                             params->n_batch, &ctx_omni->session.n_past);
+        }
+
+        if (!ctx_omni->duplex_mode) {
+            omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch,
+                                       &ctx_omni->session.n_past, false);
+        }
+    }
+
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
+        const std::string input_type = embeds.vision_embed.empty() ? "audio" : "omni";
+        sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
+    }
+}
+
+void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni) {
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
+        sliding_window_enforce(ctx_omni);
+    }
+}
+
+void omni_llm_stage_request_prefill_flush(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+        ++ctx_omni->llm_thread_info->prefill_flush_requested_seq;
+    }
+    ctx_omni->llm_thread_info->cv.notify_all();
+}
+
+void omni_llm_stage_wait_for_prefill_flush(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+    const uint64_t               requested_seq = ctx_omni->llm_thread_info->prefill_flush_requested_seq;
+    ctx_omni->workers.decode_cv.wait(lock, [&] {
+        return ctx_omni->llm_thread_info->prefill_flush_completed_seq >= requested_seq ||
+               !ctx_omni->workers.llm_thread_running;
+    });
+}
+
+void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params) {
+    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
+        return;
+    }
+
+    print_with_timestamp("LLM thread started\n");
+
+    while (ctx_omni->workers.llm_thread_running) {
+        std::vector<omni_embeds *> llm_embeds;
+
+        {
+            std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+            auto *                       llm_thread_info = ctx_omni->llm_thread_info;
+            llm_thread_info->cv.wait(lock, [&] {
+                return !llm_thread_info->queue.empty() || omni_llm_stage_has_pending_prefill_flush(llm_thread_info) ||
+                       !ctx_omni->workers.llm_thread_running;
+            });
+
+            if (!ctx_omni->workers.llm_thread_running) {
+                break;
+            }
+
+            if (llm_thread_info->queue.empty()) {
+                omni_llm_stage_complete_prefill_flush(ctx_omni, lock);
+                continue;
+            }
+
+            print_with_timestamp("LLM thread: start prefill, n_past=%d, n_keep=%d, n_ctx=%d\n", ctx_omni->session.n_past,
+                                 ctx_omni->session.prompt.n_keep, params->n_ctx);
+            print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n", ctx_omni->session.n_past);
+
+            llm_embeds = omni_llm_stage_drain_prefill_queue(llm_thread_info);
+            lock.unlock();
+        }
+
+        print_with_timestamp("Batch processing %zu llm prefill\n", llm_embeds.size());
+        ctx_omni->llm_thread_info->cv.notify_all();
+
+        for (auto * embeds : llm_embeds) {
+            omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
+            delete embeds;
+        }
+
+        print_with_timestamp("LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",
+                             ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep,
+                             ctx_omni->session.n_past - ctx_omni->session.prompt.n_keep, ctx_omni->duplex_mode);
+
+        omni_llm_stage_finalize_prefill(ctx_omni);
+
+        std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+        omni_llm_stage_complete_prefill_flush(ctx_omni, lock);
+    }
 }
 
 void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni) {

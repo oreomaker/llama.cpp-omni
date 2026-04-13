@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -54,6 +55,8 @@ struct LLMThreadInfo {
     std::queue<omni_embeds *>             queue;
     std::mutex                            mtx;
     std::condition_variable               cv;
+    uint64_t                              prefill_flush_requested_seq = 0;
+    uint64_t                              prefill_flush_completed_seq = 0;
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
