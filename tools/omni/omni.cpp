@@ -65,13 +65,6 @@
 #endif
 
 //
-// Forward declarations
-//
-static void llm_thread_func(struct omni_context * ctx_omni, common_params * params);
-static void tts_thread_func(struct omni_context * ctx_omni, common_params * params);
-static void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params * params);
-
-//
 // omni structure
 //
 namespace {
@@ -1863,9 +1856,9 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
 
     if (setup.should_start_workers) {
         const OmniWorkerThreadFns worker_fns = {
-            llm_thread_func,
-            tts_thread_func,
-            tts_thread_func_duplex,
+            omni_llm_stage_worker_loop,
+            omni_tts_worker_loop_simplex,
+            omni_tts_worker_loop_duplex,
             t2w_thread_func,
         };
         omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
@@ -1939,10 +1932,6 @@ static bool omni_submit_llm_prefill(struct omni_context * ctx_omni, std::unique_
     lock.unlock();
     ctx_omni->llm_thread_info->cv.notify_all();
     return true;
-}
-
-static void llm_thread_func(omni_context * ctx_omni, common_params * params) {
-    omni_llm_stage_worker_loop(ctx_omni, params);
 }
 
 // Helper function to play WAV file
@@ -2128,15 +2117,6 @@ static void move_old_output_to_archive() {
 // 1. 不需要 simplex_round_idx 管理和 round_XXX 输出目录
 // 2. TTS KV cache 跨 chunk 保持（由 is_end_of_turn 控制是否重置）
 // 3. 使用 generate_audio_tokens_local（双工版本，max_audio_tokens=26）
-// ==============================================================================
-static void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params * params) {
-    omni_tts_worker_loop_duplex(ctx_omni, params);
-}
-
-static void tts_thread_func(struct omni_context * ctx_omni, common_params * params) {
-    omni_tts_worker_loop_simplex(ctx_omni, params);
-}
-
 bool stream_prefill(struct omni_context * ctx_omni,
                     const std::string &   aud_fname,
                     const std::string &   img_fname,
@@ -2192,9 +2172,9 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 
     const OmniLlmStageDecodeRequest request = { std::move(debug_dir), round_idx };
     const OmniWorkerThreadFns       worker_fns = {
-        llm_thread_func,
-        tts_thread_func,
-        tts_thread_func_duplex,
+        omni_llm_stage_worker_loop,
+        omni_tts_worker_loop_simplex,
+        omni_tts_worker_loop_duplex,
         t2w_thread_func,
     };
 
