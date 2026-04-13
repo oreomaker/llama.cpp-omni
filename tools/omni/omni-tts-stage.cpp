@@ -1445,7 +1445,7 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
     bool          need_phase2    = false;
 
     for (int t = 0; t < max_audio_tokens; ++t) {
-        if (ctx_omni->break_event.load()) {
+        if (ctx_omni->gate.break_event.load()) {
             print_with_timestamp("TTS Simplex: break_event detected at step %d, stopping immediately\n", t);
             break;
         }
@@ -1509,7 +1509,7 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
         }
     }
 
-    if (need_phase2 && !ctx_omni->break_event.load()) {
+    if (need_phase2 && !ctx_omni->gate.break_event.load()) {
         print_with_timestamp("TTS Simplex Phase2: injecting text_eos_embed + audio_bos at n_past=%d\n", n_past_tts);
 
         std::vector<float> text_eos_embed(tts_n_embd, 0.0f);
@@ -1532,7 +1532,7 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
 
         if (inject_ok) {
             for (int t2 = 0; t2 < max_audio_tokens; ++t2) {
-                if (ctx_omni->break_event.load()) {
+                if (ctx_omni->gate.break_event.load()) {
                     print_with_timestamp("TTS Simplex Phase2: break_event at step %d\n", t2);
                     break;
                 }
@@ -1931,7 +1931,7 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
         }
 
         // 双工模式打断检测
-        if (ctx_omni->break_event.load()) {
+        if (ctx_omni->gate.break_event.load()) {
             omni_clear_tts_queue(ctx_omni);
             llm_finish = false;
             tts_finish = false;
@@ -1964,10 +1964,10 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
             std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
             auto &                       queue = ctx_omni->tts_thread_info->queue;
             ctx_omni->tts_thread_info->cv.wait(lock, [&] {
-                return !queue.empty() || !ctx_omni->workers.tts_thread_running || ctx_omni->break_event.load();
+                return !queue.empty() || !ctx_omni->workers.tts_thread_running || ctx_omni->gate.break_event.load();
             });
 
-            if (ctx_omni->break_event.load()) {
+            if (ctx_omni->gate.break_event.load()) {
                 lock.unlock();
                 continue;
             }
@@ -1998,7 +1998,7 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
                 accumulated_is_end_of_turn |= llm_out->is_end_of_turn;
                 active_round_meta = llm_out->round_meta;
 
-                if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
+                if (!ctx_omni->gate.speech_ready || ctx_omni->duplex_mode) {
                     llm_text += llm_out->text;
                     debug_dir = llm_out->debug_dir;
                 }
@@ -2018,14 +2018,14 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
             print_with_timestamp(
                 "TTS Duplex: after queue - speek_done=%d, llm_finish=%d, token_ids.size=%zu, is_end_of_turn=%d, "
                 "llm_text.len=%zu\n",
-                ctx_omni->speek_done ? 1 : 0, llm_finish ? 1 : 0, current_chunk_token_ids.size(),
+                ctx_omni->gate.speech_ready ? 1 : 0, llm_finish ? 1 : 0, current_chunk_token_ids.size(),
                 accumulated_is_end_of_turn ? 1 : 0, llm_text.size());
 
-            if (ctx_omni->speek_done && llm_finish) {
+            if (ctx_omni->gate.speech_ready && llm_finish) {
                 if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
-                    ctx_omni->speek_done = false;
+                    ctx_omni->gate.speech_ready = false;
                 } else if (ctx_omni->duplex_mode && accumulated_is_end_of_turn) {
-                    ctx_omni->speek_done = false;
+                    ctx_omni->gate.speech_ready = false;
                     print_with_timestamp("TTS Duplex: is_end_of_turn=true, will call TTS to flush buffer\n");
                 } else {
                     // LISTEN/CHUNK_EOS 且没有实际文本
@@ -2065,7 +2065,7 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
 
         // Skip empty responses
         if (response.empty() && !llm_finish) {
-            if (ctx_omni->speek_done) {
+            if (ctx_omni->gate.speech_ready) {
                 llm_finish = false;
                 if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
                     // 保持状态
@@ -2094,7 +2094,7 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
 
         // Handle empty final chunk
         if (text_tokens.empty() && response.empty() && llm_finish) {
-            ctx_omni->speek_done  = true;
+            ctx_omni->gate.speech_ready  = true;
             ctx_omni->warmup_done = true;
             ctx_omni->workers.speek_cv.notify_all();
 
@@ -2213,7 +2213,7 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
             // Handle final chunk
             if (llm_finish) {
                 tts_finish            = true;
-                ctx_omni->speek_done  = true;
+                ctx_omni->gate.speech_ready  = true;
                 ctx_omni->warmup_done = true;
                 ctx_omni->workers.speek_cv.notify_all();
 
@@ -2317,7 +2317,7 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
             all_audio_tokens.clear();
             llm_finish            = false;
             tts_finish            = false;
-            ctx_omni->speek_done  = true;
+            ctx_omni->gate.speech_ready  = true;
             ctx_omni->warmup_done = true;
             ctx_omni->workers.speek_cv.notify_all();
 
@@ -2417,7 +2417,7 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
         }
 
         // 打断检测：清空队列、重置状态
-        if (ctx_omni->break_event.load()) {
+        if (ctx_omni->gate.break_event.load()) {
             omni_clear_tts_queue(ctx_omni);
             llm_finish = false;
             tts_finish = false;
@@ -2442,10 +2442,10 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
             std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
             auto &                       queue = ctx_omni->tts_thread_info->queue;
             ctx_omni->tts_thread_info->cv.wait(lock, [&] {
-                return !queue.empty() || !ctx_omni->workers.tts_thread_running || ctx_omni->break_event.load();
+                return !queue.empty() || !ctx_omni->workers.tts_thread_running || ctx_omni->gate.break_event.load();
             });
 
-            if (ctx_omni->break_event.load()) {
+            if (ctx_omni->gate.break_event.load()) {
                 lock.unlock();
                 continue;
             }
@@ -2459,7 +2459,7 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
                 LLMOut * llm_out = queue.front();
                 llm_finish |= llm_out->llm_finish;
                 active_round_meta = llm_out->round_meta;
-                if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
+                if (!ctx_omni->gate.speech_ready || ctx_omni->duplex_mode) {
                     llm_text  = llm_out->text;
                     debug_dir = llm_out->debug_dir;
                 }
@@ -2493,12 +2493,12 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
 
             print_with_timestamp(
                 "TTS: after queue pop - speek_done=%d, llm_finish=%d, llm_text.empty=%d, token_ids.size=%zu\n",
-                ctx_omni->speek_done, llm_finish, llm_text.empty(), current_chunk_token_ids.size());
+                ctx_omni->gate.speech_ready, llm_finish, llm_text.empty(), current_chunk_token_ids.size());
 
-            if (ctx_omni->speek_done && llm_finish) {
+            if (ctx_omni->gate.speech_ready && llm_finish) {
                 print_with_timestamp("TTS: speek_done=true and llm_finish=true, resetting state for next round\n");
                 if (ctx_omni->duplex_mode && !current_chunk_token_ids.empty()) {
-                    ctx_omni->speek_done = false;
+                    ctx_omni->gate.speech_ready = false;
                 } else {
                     llm_finish = false;
                     llm_text.clear();
@@ -2537,7 +2537,7 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
                              response.empty(), response.substr(0, 50).c_str(), llm_finish);
 
         if (response.empty() && !llm_finish) {
-            if (ctx_omni->speek_done) {
+            if (ctx_omni->gate.speech_ready) {
                 print_with_timestamp(
                     "TTS: speek_done=true with empty response, keeping state (waiting for stream_prefill)\n");
                 llm_finish = false;
@@ -2585,7 +2585,7 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
                 print_with_timestamp("TTS: sent is_final=true to T2W (llm_finish with no data)\n");
             }
 
-            ctx_omni->speek_done  = true;
+            ctx_omni->gate.speech_ready  = true;
             ctx_omni->warmup_done = true;
             ctx_omni->workers.speek_cv.notify_all();
             print_with_timestamp("TTS: finished processing all chunks (llm_finish with no data path)\n");
@@ -2683,7 +2683,7 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
                 }
 
                 tts_finish            = true;
-                ctx_omni->speek_done  = true;
+                ctx_omni->gate.speech_ready  = true;
                 ctx_omni->warmup_done = true;
                 ctx_omni->workers.speek_cv.notify_all();
                 print_with_timestamp("TTS: finished processing all chunks\n");

@@ -81,7 +81,7 @@ void omni_request_prefill(struct omni_context * ctx_omni) {
         return;
     }
 
-    ctx_omni->need_speek = true;
+    ctx_omni->gate.prefill_requested = true;
     ctx_omni->llm_thread_info->cv.notify_all();
 }
 

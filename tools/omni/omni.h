@@ -140,22 +140,6 @@ struct omni_context {
     OmniTurnState        turn;
     OmniSessionGate      gate;
 
-    // 兼容层：旧字段名继续保留，但实际所有权收敛到 session / turn / gate 子对象。
-    int &                    n_past;
-    int &                    n_keep;
-    std::vector<int> &       round_start_positions;
-    int &                    max_preserved_context;
-    SlidingWindowConfig &    sliding_window_config;
-    std::vector<UnitEntry> & unit_history;
-    int &                    next_unit_id;
-    int &                    pending_unit_id;
-    int &                    pending_unit_start_cache_len;
-    int &                    system_preserve_length;
-    int &                    position_offset;
-    int &                    sliding_event_count;
-    int &                    total_dropped_tokens;
-    int &                    total_dropped_units;
-
     bool                   async = false;
     std::thread            llm_thread;
     std::thread            tts_thread;
@@ -165,34 +149,8 @@ struct omni_context {
     struct T2WThreadInfo * t2w_thread_info = NULL;
     OmniWorkerState        workers;
 
-    volatile bool & need_speek;
-    volatile bool & speek_done;
-
     // 预热标志：第一轮对话视为预热（例如音色克隆参考音频），完成后设为 true
     std::atomic<bool> warmup_done{ false };
-
-    // ==================== 双工模式状态 ====================
-    // 当前轮次是否已结束（用于决策是否允许切换到 listen 状态）
-    // Python: self.current_turn_ended
-    bool & current_turn_ended;
-
-    // 打断事件标志
-    // break_event: 打断当前生成，但保持会话活跃（用于双工模式的用户打断）
-    //              打断后可继续调用 prefill/decode
-    std::atomic<bool> & break_event;
-
-    // session_stop_event: 终止整个会话（预留，目前未使用）
-    //                     用于彻底关闭当前会话，需要重新 omni_init
-    std::atomic<bool> & session_stop_event;
-
-    // 🔧 [双工模式] 记录当前 decode 是否以 <|listen|> 结束
-    // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
-    std::atomic<bool> & ended_with_listen;
-
-    // 🔧 [与 Python 对齐] LLM 生成结束标志
-    // 当 LLM 检测到 end token 时设置为 true
-    // TTS 线程检查此标志来决定是否添加 text_eos_embed
-    std::atomic<bool> & llm_generation_done;
 
     // ==================== 双工模式参数 ====================
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
@@ -207,9 +165,6 @@ struct omni_context {
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
     // duplex: 双工模式，模型可以在任意时刻决定听/说切换
     bool duplex_mode = false;
-
-    // 系统 prompt 是否已初始化（防止 stream_prefill index=0 被重复调用导致 prompt 重复）
-    bool & system_prompt_initialized;
 
     class AudioInputManager * audio_input_manager = NULL;
 
@@ -247,8 +202,6 @@ struct omni_context {
     std::mutex              text_mtx;
     std::condition_variable text_cv;
     std::deque<std::string> text_queue;
-    bool &                  text_streaming;
-    bool &                  text_done_flag;
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;
@@ -343,10 +296,6 @@ struct omni_context {
     // 每次取 28 个 tokens (25 main + 3 lookahead)，处理后移动 25 个，保留 3 个重叠
     std::vector<int32_t> token2wav_buffer;
     int                  token2wav_wav_idx = 0;  // 输出 WAV 文件计数器
-    int &                wav_turn_base;          // 每轮对话结束时 +1000，用于区分不同轮次的 WAV 文件
-
-    // 🔧 [单工模式] 当前轮次索引（用于创建 round_000、round_001 等子目录）
-    int & simplex_round_idx;
 
     // ==================== 特殊 Token ID ====================
     // 在 omni_init 时从词表查找并缓存

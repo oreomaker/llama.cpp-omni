@@ -105,12 +105,12 @@ void omni_t2w_init_state(struct omni_context * ctx_omni, OmniT2WStageState & sta
 bool omni_t2w_handle_break(struct omni_context *       ctx_omni,
                            OmniT2WStageState &         state,
                            const OmniT2WBackendHooks & hooks) {
-    if (ctx_omni == nullptr || !ctx_omni->break_event.load()) {
+    if (ctx_omni == nullptr || !ctx_omni->gate.break_event.load()) {
         return false;
     }
 
     omni_t2w_clear_queue(ctx_omni);
-    ctx_omni->break_event.store(false);
+    ctx_omni->gate.break_event.store(false);
     omni_t2w_reset_local_state(state);
     if (hooks.on_break) {
         hooks.on_break(ctx_omni, state);
@@ -131,13 +131,13 @@ bool omni_t2w_collect_batch(struct omni_context * ctx_omni,
 
     std::unique_lock<std::mutex> lock(mtx);
     cv.wait(lock,
-            [&] { return !queue.empty() || !ctx_omni->workers.t2w_thread_running || ctx_omni->break_event.load(); });
+            [&] { return !queue.empty() || !ctx_omni->workers.t2w_thread_running || ctx_omni->gate.break_event.load(); });
 
     if (!ctx_omni->workers.t2w_thread_running && queue.empty()) {
         return false;
     }
 
-    if (ctx_omni->break_event.load()) {
+    if (ctx_omni->gate.break_event.load()) {
         return true;
     }
 
@@ -281,7 +281,7 @@ void omni_t2w_run_backend(struct omni_context * ctx_omni, const OmniT2WBackendHo
             break;
         }
 
-        if (ctx_omni->break_event.load()) {
+        if (ctx_omni->gate.break_event.load()) {
             continue;
         }
 

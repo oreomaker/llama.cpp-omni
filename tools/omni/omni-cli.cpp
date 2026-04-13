@@ -158,7 +158,7 @@ static void print_model_paths(const OmniModelPaths & paths) {
 void test_case(struct omni_context *ctx_omni, common_params& params, std::string data_path_prefix, int cnt){
     // 🔧 单工模式：先 prefill 所有输入，然后 decode 一次生成完整回复
     // 使用同步模式 prefill，避免 async 模式下的竞态条件
-    ctx_omni->system_prompt_initialized = false;
+    ctx_omni->session.prompt.system_prompt_initialized = false;
     bool orig_async = ctx_omni->async;
     ctx_omni->async = false;  // 使用同步模式 prefill，确保所有数据被处理
     

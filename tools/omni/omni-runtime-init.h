@@ -27,7 +27,7 @@ bool omni_init_tts_runtime(struct omni_context *  ctx_omni,
                             int                   tts_gpu_layers);
 
 // Init APM (always) and VPM (when media_type == 2).
-// Sets ctx_omni->n_past = 0.
+// Sets ctx_omni->session.n_past = 0.
 bool omni_init_audio_vision_runtime(struct omni_context *  ctx_omni,
                                      struct common_params * params);
 

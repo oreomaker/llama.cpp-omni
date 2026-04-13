@@ -289,7 +289,7 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             break;
         }
 
-        bool ended_listen = ctx_omni->ended_with_listen.load();
+        bool ended_listen = ctx_omni->turn.ended_with_listen.load();
 
         // stream_decode 返回后从 text_queue 读取生成的文本
         std::string generated_text;
@@ -326,7 +326,7 @@ static void duplex_test_case(struct omni_context * ctx_omni,
         chunks_completed++;
 
         printf("  prefill: %.3f s | decode: %.3f s | total: %.3f s | n_past: %d\n", prefill_dt, decode_dt,
-               prefill_dt + decode_dt, ctx_omni->n_past);
+               prefill_dt + decode_dt, ctx_omni->session.n_past);
         if (ended_listen) {
             printf("  决策: <|listen|>\n");
         } else {
@@ -357,7 +357,7 @@ static void duplex_test_case(struct omni_context * ctx_omni,
     printf("  avg decode:  %.1f ms\n", chunks_completed > 0 ? total_decode_s / chunks_completed * 1000.0 : 0);
     printf("  avg/chunk:   %.1f ms\n", chunks_completed > 0 ? total_dt / chunks_completed * 1000.0 : 0);
     printf("  speak: %d | listen: %d\n", speak_count, listen_count);
-    printf("  最终 n_past: %d\n", ctx_omni->n_past);
+    printf("  最终 n_past: %d\n", ctx_omni->session.n_past);
     printf("========================================\n");
 }
 

@@ -214,7 +214,7 @@ bool omni_init_audio_vision_runtime(struct omni_context * ctx_omni, struct commo
         return false;
     }
 
-    ctx_omni->n_past = 0;
+    ctx_omni->session.n_past = 0;
 
     if (ctx_omni->media_type == 2) {
         LOG_INF("init vision....");

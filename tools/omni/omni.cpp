@@ -88,35 +88,7 @@ struct omni_output {
     int                        idx;
 };
 
-omni_context::omni_context() :
-    n_past(session.n_past),
-    n_keep(session.prompt.n_keep),
-    round_start_positions(session.round_start_positions),
-    max_preserved_context(session.max_preserved_context),
-    sliding_window_config(session.sliding_window_config),
-    unit_history(session.unit_history),
-    next_unit_id(session.next_unit_id),
-    pending_unit_id(session.pending_unit_id),
-    pending_unit_start_cache_len(session.pending_unit_start_cache_len),
-    system_preserve_length(session.prompt.system_preserve_length),
-    position_offset(session.position_offset),
-    sliding_event_count(session.sliding_event_count),
-    total_dropped_tokens(session.total_dropped_tokens),
-    total_dropped_units(session.total_dropped_units),
-    need_speek(gate.prefill_requested),
-    speek_done(gate.speech_ready),
-    current_turn_ended(turn.current_turn_ended),
-    break_event(gate.break_event),
-    session_stop_event(gate.session_stop_event),
-    ended_with_listen(turn.ended_with_listen),
-    llm_generation_done(gate.llm_generation_done),
-    system_prompt_initialized(session.prompt.system_prompt_initialized),
-    text_streaming(gate.text_streaming),
-    text_done_flag(gate.text_done),
-    wav_turn_base(session.current_round.wav_turn_base),
-    simplex_round_idx(session.current_round.round_idx) {
-    session.current_round.duplex_mode = false;
-}
+omni_context::omni_context() = default;
 
 omni_context::~omni_context() = default;
 
@@ -2050,7 +2022,7 @@ static void omni_set_language(struct omni_context * ctx_omni, const std::string 
     }
 
     // 🔧 [关键] 重置 system_prompt_initialized，让下次 stream_prefill(index=0) 重新 prefill system prompt
-    ctx_omni->system_prompt_initialized = false;
+    ctx_omni->session.prompt.system_prompt_initialized = false;
 
     print_with_timestamp(
         "omni_set_language: prompts updated for language '%s', system_prompt_initialized reset to false\n",
@@ -2062,21 +2034,21 @@ static void process_audio(struct omni_context * ctx_omni,
                           common_params *       params,
                           bool                  save_spk_emb = false) {
     (void) save_spk_emb;
-    LOG_INF("%s: audio token past: %d\n", __func__, ctx_omni->n_past);
-    omni_eval_embed(ctx_omni->ctx_llama, embeds, params->n_batch, &ctx_omni->n_past);
-    LOG_INF("%s: audio token past after eval: %d\n", __func__, ctx_omni->n_past);
+    LOG_INF("%s: audio token past: %d\n", __func__, ctx_omni->session.n_past);
+    omni_eval_embed(ctx_omni->ctx_llama, embeds, params->n_batch, &ctx_omni->session.n_past);
+    LOG_INF("%s: audio token past after eval: %d\n", __func__, ctx_omni->session.n_past);
 }
 
 static void eval_prefix(struct omni_context * ctx_omni, common_params * params) {
     std::string prefix = "<|im_start|>user\n";
     std::cout << "prefix : " << prefix << '\n';
-    eval_string(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->n_past, false);
+    eval_string(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->session.n_past, false);
 }
 
 static void eval_prefix_with_hidden(struct omni_context * ctx_omni, common_params * params, float *& hidden_states) {
     std::string prefix = "<|im_start|>user\n";
     std::cout << "prefix : " << prefix << '\n';
-    eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->n_past, false, hidden_states);
+    eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->session.n_past, false, hidden_states);
 }
 
 namespace {
@@ -2126,7 +2098,7 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
     }
 
     print_with_timestamp("stream_prefill: n_past = %d\n voice_clone_prompt = %s\n assistant_prompt = %s\n",
-                         ctx_omni->n_past, prompts.voice_clone_prompt.c_str(), prompts.assistant_prompt.c_str());
+                         ctx_omni->session.n_past, prompts.voice_clone_prompt.c_str(), prompts.assistant_prompt.c_str());
 
     const std::string bootstrap_ref_audio = omni_get_bootstrap_ref_audio_path(ctx_omni, aud_fname);
     if (!ctx_omni->duplex_mode || bootstrap_ref_audio != aud_fname) {
@@ -2134,7 +2106,7 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
     }
 
     eval_string(ctx_omni, ctx_omni->params, prompts.voice_clone_prompt.c_str(), ctx_omni->params->n_batch,
-                &ctx_omni->n_past, false);
+                &ctx_omni->session.n_past, false);
 
     auto   ref_audio_embed_start = std::chrono::high_resolution_clock::now();
     auto * ref_audio_embeds      = omni_audio_embed_make_with_filename(
@@ -2144,24 +2116,24 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
     if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
         print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
         prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos,
-                         ctx_omni->params->n_batch, &ctx_omni->n_past);
+                         ctx_omni->params->n_batch, &ctx_omni->session.n_past);
         omni_embed_free(ref_audio_embeds);
     } else {
         print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
     }
 
     eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(), ctx_omni->params->n_batch,
-                &ctx_omni->n_past, false);
+                &ctx_omni->session.n_past, false);
 
-    ctx_omni->system_prompt_initialized = true;
-    ctx_omni->n_keep                    = ctx_omni->n_past;
+    ctx_omni->session.prompt.system_prompt_initialized = true;
+    ctx_omni->session.prompt.n_keep                    = ctx_omni->session.n_past;
     print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n",
-                         ctx_omni->n_keep);
+                         ctx_omni->session.prompt.n_keep);
     eval_prefix(ctx_omni, ctx_omni->params);
 
     print_with_timestamp("stream_prefill(index=0): system prompt 初始化完成，ref_audio 已在其中 prefill\n");
     sliding_window_register_system_prompt(ctx_omni);
-    print_with_timestamp("n_past = %d\n", ctx_omni->n_past);
+    print_with_timestamp("n_past = %d\n", ctx_omni->session.n_past);
 
     if (setup.should_start_workers) {
         const OmniWorkerThreadFns worker_fns = {
@@ -2231,7 +2203,7 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                          const struct omni_embeds & embeds) {
     const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
-    if (ctx_omni->sliding_window_config.mode != "off") {
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
         sliding_window_register_unit_start(ctx_omni);
     }
 
@@ -2243,23 +2215,23 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         const bool has_slices       = n_chunks > 1;
 
         if (ctx_omni->duplex_mode) {
-            eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->n_past, false);
+            eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->session.n_past, false);
         } else {
-            eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->n_past, false);
+            eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->session.n_past, false);
         }
 
         prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[0].data()), tokens_per_chunk,
-                         params->n_batch, &ctx_omni->n_past);
-        eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->n_past, false);
+                         params->n_batch, &ctx_omni->session.n_past);
+        eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->session.n_past, false);
 
         if (has_slices) {
             for (int i = 1; i < n_chunks; ++i) {
-                eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->n_past, false);
+                eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->session.n_past, false);
                 prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[i].data()), tokens_per_chunk,
-                                 params->n_batch, &ctx_omni->n_past);
-                eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->n_past, false);
+                                 params->n_batch, &ctx_omni->session.n_past);
+                eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->session.n_past, false);
             }
-            eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->n_past, false);
+            eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->session.n_past, false);
         }
 
         print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
@@ -2267,12 +2239,12 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
 
         if (has_audio) {
             if (!ctx_omni->duplex_mode) {
-                eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
+                eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->session.n_past, false);
             }
             prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
-                             params->n_batch, &ctx_omni->n_past);
+                             params->n_batch, &ctx_omni->session.n_past);
             if (!ctx_omni->duplex_mode) {
-                eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
+                eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->session.n_past, false);
             }
         }
     } else {
@@ -2280,29 +2252,29 @@ static void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
 
         if (ctx_omni->duplex_mode) {
-            eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->n_past, false);
+            eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->session.n_past, false);
         } else {
-            eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->n_past, false);
+            eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch, &ctx_omni->session.n_past, false);
         }
 
         if (n_audio_tokens > 0) {
             prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
-                             params->n_batch, &ctx_omni->n_past);
+                             params->n_batch, &ctx_omni->session.n_past);
         }
 
         if (!ctx_omni->duplex_mode) {
-            eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->n_past, false);
+            eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->session.n_past, false);
         }
     }
 
-    if (ctx_omni->sliding_window_config.mode != "off") {
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
         const std::string input_type = embeds.vision_embed.empty() ? "audio" : "omni";
         sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
     }
 }
 
 static void omni_finalize_llm_prefill(struct omni_context * ctx_omni) {
-    if (ctx_omni->sliding_window_config.mode != "off") {
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
         sliding_window_enforce(ctx_omni);
     }
 }
@@ -2358,7 +2330,7 @@ static void llm_thread_func(omni_context * ctx_omni, common_params * params) {
         // 2. need_speek 为 true（需要开始生成文本）
         // 3. llm_thread_running 为 false（线程需要停止）
         ctx_omni->llm_thread_info->cv.wait(
-            lock, [&] { return !queue.empty() || ctx_omni->need_speek || !ctx_omni->workers.llm_thread_running; });
+            lock, [&] { return !queue.empty() || ctx_omni->gate.prefill_requested || !ctx_omni->workers.llm_thread_running; });
 
         // 检查是否需要停止线程
         if (!ctx_omni->workers.llm_thread_running) {
@@ -2368,15 +2340,15 @@ static void llm_thread_func(omni_context * ctx_omni, common_params * params) {
         // ========== 分支1：处理队列中的嵌入数据（前缀填充） ==========
         if (!queue.empty()) {
             // 🔧 [诊断] 打印 prefill 开始时的 n_past
-            print_with_timestamp("LLM thread: start prefill, n_past=%d, n_keep=%d, n_ctx=%d\n", ctx_omni->n_past,
-                                 ctx_omni->n_keep, params->n_ctx);
+            print_with_timestamp("LLM thread: start prefill, n_past=%d, n_keep=%d, n_ctx=%d\n", ctx_omni->session.n_past,
+                                 ctx_omni->session.prompt.n_keep, params->n_ctx);
 
             // 🔧 [修复] prefill 阶段不清除 KV cache，保持累积
             // 无论单工还是双工模式，prefill 都是累积用户输入
             // KV cache 只在以下情况清除：
             //   1. 新会话开始（通过 reset API）
             //   2. 滑动窗口触发（context 满了）
-            print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n", ctx_omni->n_past);
+            print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n", ctx_omni->session.n_past);
 
             // 标记前缀填充未完成，防止解码线程过早开始
             omni_mark_prefill_started(ctx_omni);
@@ -2417,7 +2389,7 @@ static void llm_thread_func(omni_context * ctx_omni, common_params * params) {
 
             // 🔧 [诊断] 打印 prefill 结束后的 n_past
             print_with_timestamp("LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",
-                                 ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->n_past - ctx_omni->n_keep,
+                                 ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep, ctx_omni->session.n_past - ctx_omni->session.prompt.n_keep,
                                  ctx_omni->duplex_mode);
 
             omni_finalize_llm_prefill(ctx_omni);
@@ -2428,17 +2400,17 @@ static void llm_thread_func(omni_context * ctx_omni, common_params * params) {
         // 1. 所有嵌入数据都已处理完成（队列为空）
         // 2. 解码线程设置了 need_speek = true，表示需要开始生成文本
 
-        if (queue.empty() && ctx_omni->need_speek) {
+        if (queue.empty() && ctx_omni->gate.prefill_requested) {
             // 标记前缀填充完成
             omni_mark_prefill_completed(ctx_omni);
 
             // 如果使用TTS，重置speek_done标志，允许TTS线程开始工作
             if (ctx_omni->use_tts && !ctx_omni->duplex_mode) {
-                ctx_omni->speek_done = false;
+                ctx_omni->gate.speech_ready = false;
             }
 
             // 重置need_speek标志
-            ctx_omni->need_speek = false;
+            ctx_omni->gate.prefill_requested = false;
 
             // 通知等待的解码线程：前缀填充已完成，可以开始生成文本了
         }
@@ -2665,7 +2637,7 @@ bool stream_prefill(struct omni_context * ctx_omni,
 
     // 🔧 [诊断] 打印 stream_prefill 结束时的状态
     print_with_timestamp("\n\nc++ finish stream_prefill(index=%d). n_past=%d, n_keep=%d, n_ctx=%d\n\n", index,
-                         ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx);
+                         ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep, ctx_omni->params->n_ctx);
     return true;
 }
 
@@ -2721,13 +2693,13 @@ static void omni_apply_decode_prefix(struct omni_context * ctx_omni, const std::
 
     if (ctx_omni->use_tts) {
         print_with_timestamp("📍 [单工TTS] 添加 assistant prompt: \"%s\", n_past=%d\n", prompt.c_str(),
-                             ctx_omni->n_past);
+                             ctx_omni->session.n_past);
     }
 
-    eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
+    eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
 
     if (ctx_omni->use_tts) {
-        print_with_timestamp("📍 [单工TTS] assistant prompt 完成, n_past=%d\n", ctx_omni->n_past);
+        print_with_timestamp("📍 [单工TTS] assistant prompt 完成, n_past=%d\n", ctx_omni->session.n_past);
     }
 }
 
@@ -2748,7 +2720,7 @@ static void omni_mark_decode_turn_end(struct omni_context * ctx_omni, OmniTokenT
     if (token_type == OmniTokenType::TURN_EOS || token_type == OmniTokenType::TTS_EOS ||
         token_type == OmniTokenType::EOS) {
         is_end_of_turn               = true;
-        ctx_omni->current_turn_ended = true;
+        ctx_omni->turn.current_turn_ended = true;
         print_with_timestamp(
             "LLM Duplex: turn_eos detected (type=%d), "
             "set is_end_of_turn=true (not breaking, wait for chunk_eos)\n",
@@ -2758,17 +2730,17 @@ static void omni_mark_decode_turn_end(struct omni_context * ctx_omni, OmniTokenT
 
 static void omni_handle_decode_end_token(struct omni_context * ctx_omni, OmniTokenType token_type) {
     if (!ctx_omni->duplex_mode) {
-        ctx_omni->llm_generation_done.store(true);
+        ctx_omni->gate.llm_generation_done.store(true);
         print_with_timestamp("LLM: detected end token, set llm_generation_done=true\n");
     }
 
     if (token_type == OmniTokenType::TURN_EOS || token_type == OmniTokenType::TTS_EOS ||
         token_type == OmniTokenType::EOS) {
-        ctx_omni->current_turn_ended = true;
+        ctx_omni->turn.current_turn_ended = true;
     }
 
     if (token_type == OmniTokenType::LISTEN && ctx_omni->duplex_mode) {
-        ctx_omni->ended_with_listen = true;
+        ctx_omni->turn.ended_with_listen = true;
 
         if (ctx_omni->async) {
             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
@@ -2822,7 +2794,7 @@ static void omni_dispatch_decode_chunk_to_tts(struct omni_context *            c
 
     LLMOut * llm_out          = new LLMOut();
     llm_out->text             = response;
-    llm_out->n_past           = ctx_omni->n_past;
+    llm_out->n_past           = ctx_omni->session.n_past;
     llm_out->llm_finish       = llm_finish;
     llm_out->debug_dir        = request.debug_dir;
     llm_out->round_meta       = omni_session_round_meta(ctx_omni);
@@ -2854,7 +2826,7 @@ static void omni_dispatch_decode_chunk_to_tts(struct omni_context *            c
         return ctx_omni->tts_thread_info->queue.size() < static_cast<size_t>(ctx_omni->tts_thread_info->MAX_QUEUE_SIZE);
     });
 
-    if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
+    if (!ctx_omni->gate.speech_ready || ctx_omni->duplex_mode) {
         ctx_omni->tts_thread_info->queue.push(llm_out);
         ctx_omni->tts_thread_info->cv.notify_all();
     } else {
@@ -2864,13 +2836,13 @@ static void omni_dispatch_decode_chunk_to_tts(struct omni_context *            c
 
 static void omni_finish_decode_text_stream(struct omni_context * ctx_omni) {
     std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
-    if (!ctx_omni->duplex_mode || !ctx_omni->ended_with_listen) {
+    if (!ctx_omni->duplex_mode || !ctx_omni->turn.ended_with_listen) {
         ctx_omni->text_queue.push_back("__END_OF_TURN__");
     }
 
-    ctx_omni->text_done_flag = true;
+    ctx_omni->gate.text_done = true;
     ctx_omni->text_cv.notify_all();
-    ctx_omni->text_streaming = false;
+    ctx_omni->gate.text_streaming = false;
 }
 
 bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
@@ -2894,7 +2866,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     std::string      response;
 
     for (; runtime.generated_decode_tokens < runtime.max_tgt_len;) {
-        if (ctx_omni->break_event.load()) {
+        if (ctx_omni->gate.break_event.load()) {
             runtime.llm_finish = true;
             break;
         }
@@ -2926,7 +2898,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             // 🔧 [重要] 循环直到收集到 step_size 个有效 token，而不是生成 step_size 个 token
             // 🔧 [P0-打断检测] 检测 break_event，支持双工模式下的打断
             // 🔧 [P2-chunk限制] 检测 max_new_speak_tokens_per_chunk，便于及时响应打断
-            while (jl < runtime.step_size && !runtime.llm_finish && !ctx_omni->break_event.load() &&
+            while (jl < runtime.step_size && !runtime.llm_finish && !ctx_omni->gate.break_event.load() &&
                    !chunk_limit_reached) {
                 // streaming llm
                 const char * tmp           = nullptr;
@@ -2937,7 +2909,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
                     // 使用新函数获取token文本、hidden state和token ID
                     tmp = llama_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler,
-                                                           ctx_omni->n_past, hidden_states, sampled_token);
+                                                           ctx_omni->session.n_past, hidden_states, sampled_token);
                 }
 
                 total_tokens_generated++;
@@ -3028,7 +3000,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
                 // Feed chunk_eos token to model (update KV cache)
                 std::vector<llama_token>    chunk_eos_tokens = { ctx_omni->special_token_chunk_eos };
-                eval_tokens(ctx_omni, ctx_omni->params, chunk_eos_tokens, ctx_omni->params->n_batch, &ctx_omni->n_past);
+                eval_tokens(ctx_omni, ctx_omni->params, chunk_eos_tokens, ctx_omni->params->n_batch, &ctx_omni->session.n_past);
             }
             // 这样 SSE 流会结束，客户端可以再次调用 decode
             runtime.llm_finish           = true;
@@ -3041,7 +3013,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
             // Feed </unit> token to model (update KV cache)
             std::vector<llama_token>    unit_end_tokens = { ctx_omni->special_token_unit_end };
-            eval_tokens(ctx_omni, ctx_omni->params, unit_end_tokens, ctx_omni->params->n_batch, &ctx_omni->n_past);
+            eval_tokens(ctx_omni, ctx_omni->params, unit_end_tokens, ctx_omni->params->n_batch, &ctx_omni->session.n_past);
         }
         fflush(stdout);
         runtime.generated_decode_tokens += total_tokens_generated;
@@ -3067,14 +3039,14 @@ bool stop_speek(struct omni_context * ctx_omni) {
 
 bool clean_kvcache(struct omni_context * ctx_omni) {
     if (ctx_omni->clean_kvcache) {
-        print_with_timestamp("🧹 clean_kvcache: 清理 KV cache, 删除范围=[%d, %d), n_keep=%d\n", ctx_omni->n_keep,
-                             ctx_omni->n_past, ctx_omni->n_keep);
+        print_with_timestamp("🧹 clean_kvcache: 清理 KV cache, 删除范围=[%d, %d), n_keep=%d\n", ctx_omni->session.prompt.n_keep,
+                             ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep);
 
         // 获取 memory 对象并清理 KV cache
         llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
         if (mem) {
             // 删除 [n_keep, n_past) 范围的所有 token，保留 system prompt 等
-            bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->n_keep, ctx_omni->n_past);
+            bool rm_ok = llama_memory_seq_rm(mem, 0, ctx_omni->session.prompt.n_keep, ctx_omni->session.n_past);
             if (!rm_ok) {
                 print_with_timestamp("🧹 clean_kvcache: llama_memory_seq_rm 失败\n");
             } else {
@@ -3085,14 +3057,14 @@ bool clean_kvcache(struct omni_context * ctx_omni) {
         }
 
         // 重置 n_past 到 n_keep
-        int old_n_past   = ctx_omni->n_past;
-        ctx_omni->n_past = ctx_omni->n_keep;
-        print_with_timestamp("🧹 clean_kvcache: n_past 从 %d 重置到 %d\n", old_n_past, ctx_omni->n_past);
+        int old_n_past   = ctx_omni->session.n_past;
+        ctx_omni->session.n_past = ctx_omni->session.prompt.n_keep;
+        print_with_timestamp("🧹 clean_kvcache: n_past 从 %d 重置到 %d\n", old_n_past, ctx_omni->session.n_past);
 
         // 🔧 [#39 滑动窗口] 重置滑窗状态，但保留 n_keep 对应的 system prompt 区间
         sliding_window_reset_after_kvcache_clean(ctx_omni);
         print_with_timestamp("🧹 clean_kvcache: 滑窗状态已重置, system_preserve_length=%d\n",
-                             ctx_omni->system_preserve_length);
+                             ctx_omni->session.prompt.system_preserve_length);
     } else {
         print_with_timestamp("🧹 clean_kvcache: clean_kvcache=false, 跳过清理\n");
     }
