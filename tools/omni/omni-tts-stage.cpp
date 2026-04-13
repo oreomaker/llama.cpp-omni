@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/sampling.h"
 #include "omni-impl.h"
+#include "omni-log.h"
 #include "omni-output.h"
 #include "omni-worker-coordinator.h"
 #include "omni.h"
@@ -33,8 +34,6 @@
 #    include <sys/stat.h>
 #    include <sys/types.h>
 #endif
-
-void print_with_timestamp(const char * format, ...);
 
 namespace {
 

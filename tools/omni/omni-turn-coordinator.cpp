@@ -1,13 +1,12 @@
 #include "omni-turn-coordinator.h"
 
 #include "common/common.h"
+#include "omni-log.h"
 #include "omni-session-state.h"
 #include "omni-sliding-window.h"
 #include "omni.h"
 
 #include <chrono>
-
-void print_with_timestamp(const char * format, ...);
 
 static const char * omni_turn_close_kind_name(OmniTurnCloseKind kind) {
     return kind == OmniTurnCloseKind::abort ? "abort" : "finish";

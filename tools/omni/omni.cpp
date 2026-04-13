@@ -8,6 +8,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "omni-impl.h"
+#include "omni-log.h"
 #include "omni-output.h"
 #include "omni-python-t2w.h"
 #include "omni-runtime-init.h"
@@ -32,7 +33,6 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,7 +66,6 @@
 //
 // Forward declarations
 //
-void        print_with_timestamp(const char * format, ...);
 static void llm_thread_func(struct omni_context * ctx_omni, common_params * params);
 static void tts_thread_func(struct omni_context * ctx_omni, common_params * params);
 static void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params * params);
@@ -1831,31 +1830,6 @@ static bool is_audio_token(llama_token token, int audio_bos_token_id = 151687, i
     // Audio tokens are typically in range [audio_bos_token_id, audio_bos_token_id + num_audio_tokens)
     // Check if token is in the audio token range
     return (token >= audio_bos_token_id && token < audio_bos_token_id + num_audio_tokens);
-}
-
-//
-// omni main
-//
-void print_with_timestamp(const char * format, ...) {
-    // 获取当前时间
-    auto now       = std::chrono::system_clock::now();
-    auto in_time_t = std::chrono::system_clock::to_time_t(now);
-    auto ms        = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-    // 格式化时间戳
-    std::tm buf;
-#ifdef _WIN32
-    localtime_s(&buf, &in_time_t);
-#else
-    localtime_r(&in_time_t, &buf);
-#endif
-    std::cout << std::put_time(&buf, "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count() << " ";
-
-    // 打印格式化字符串
-    va_list args;
-    va_start(args, format);
-    vprintf(format, args);
-    va_end(args);
 }
 
 struct omni_context * omni_init(struct common_params * params,

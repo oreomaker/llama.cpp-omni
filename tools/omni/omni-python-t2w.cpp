@@ -1,6 +1,7 @@
 #include "omni-python-t2w.h"
 
 #include "omni-impl.h"
+#include "omni-log.h"
 #include "omni.h"
 
 #include <cstdio>
@@ -8,26 +9,23 @@
 #include <cstring>
 
 #ifdef _WIN32
-#include <direct.h>
-#include <io.h>
-#include <process.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <windows.h>
+#    include <direct.h>
+#    include <io.h>
+#    include <process.h>
+#    include <sys/stat.h>
+#    include <sys/types.h>
+#    include <windows.h>
 #else
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#    include <signal.h>
+#    include <sys/types.h>
+#    include <sys/wait.h>
+#    include <unistd.h>
 #endif
 
-void print_with_timestamp(const char * format, ...);
-
 static bool omni_python_t2w_has_status(const std::string & response, const char * status) {
-    const std::string plain = std::string("\"status\":\"") + status + "\"";
+    const std::string plain  = std::string("\"status\":\"") + status + "\"";
     const std::string spaced = std::string("\"status\": \"") + status + "\"";
-    return response.find(plain) != std::string::npos ||
-           response.find(spaced) != std::string::npos;
+    return response.find(plain) != std::string::npos || response.find(spaced) != std::string::npos;
 }
 
 bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
@@ -36,7 +34,7 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
     }
 
     const std::string script_path = ctx_omni->python_t2w_script_dir + "/token2wav_service.py";
-    FILE * check = fopen(script_path.c_str(), "r");
+    FILE *            check       = fopen(script_path.c_str(), "r");
     if (check == nullptr) {
         LOG_ERR("Python T2W: 脚本不存在: %s\n", script_path.c_str());
         return false;
@@ -47,8 +45,8 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
 
 #ifdef _WIN32
     SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
+    sa.nLength              = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle       = TRUE;
     sa.lpSecurityDescriptor = NULL;
 
     HANDLE hStdinRead;
@@ -70,13 +68,13 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
     }
     SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si;
+    STARTUPINFOA        si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.hStdInput = hStdinRead;
+    si.cb         = sizeof(si);
+    si.hStdInput  = hStdinRead;
     si.hStdOutput = hStdoutWrite;
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
     si.dwFlags |= STARTF_USESTDHANDLES;
     ZeroMemory(&pi, sizeof(pi));
 
@@ -85,7 +83,7 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
     }
 
     const std::string win_cmd = "python \"" + script_path + "\"";
-    char cmd_buf[2048];
+    char              cmd_buf[2048];
     strncpy(cmd_buf, win_cmd.c_str(), sizeof(cmd_buf) - 1);
     cmd_buf[sizeof(cmd_buf) - 1] = '\0';
 
@@ -104,7 +102,7 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
 
     ctx_omni->python_t2w_pid = (int) (intptr_t) pi.hProcess;
 
-    const int stdin_fd = _open_osfhandle((intptr_t) hStdinWrite, 0);
+    const int stdin_fd  = _open_osfhandle((intptr_t) hStdinWrite, 0);
     const int stdout_fd = _open_osfhandle((intptr_t) hStdoutRead, 0);
     if (stdin_fd < 0 || stdout_fd < 0) {
         LOG_ERR("Python T2W: _open_osfhandle 失败\n");
@@ -113,7 +111,7 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
         return false;
     }
 
-    ctx_omni->python_t2w_stdin = _fdopen(stdin_fd, "w");
+    ctx_omni->python_t2w_stdin  = _fdopen(stdin_fd, "w");
     ctx_omni->python_t2w_stdout = _fdopen(stdout_fd, "r");
 #else
     int stdin_pipe[2];
@@ -151,8 +149,8 @@ bool omni_start_python_t2w_service(struct omni_context * ctx_omni) {
     close(stdin_pipe[0]);
     close(stdout_pipe[1]);
 
-    ctx_omni->python_t2w_pid = pid;
-    ctx_omni->python_t2w_stdin = fdopen(stdin_pipe[1], "w");
+    ctx_omni->python_t2w_pid    = pid;
+    ctx_omni->python_t2w_stdin  = fdopen(stdin_pipe[1], "w");
     ctx_omni->python_t2w_stdout = fdopen(stdout_pipe[0], "r");
 #endif
 
@@ -220,9 +218,10 @@ void omni_stop_python_t2w_service(struct omni_context * ctx_omni) {
     print_with_timestamp("Python T2W: 服务已停止\n");
 }
 
-bool omni_send_python_t2w_command(struct omni_context * ctx_omni, const std::string & cmd_json, std::string & response) {
-    if (!ctx_omni->python_t2w_initialized ||
-        ctx_omni->python_t2w_stdin == nullptr ||
+bool omni_send_python_t2w_command(struct omni_context * ctx_omni,
+                                  const std::string &   cmd_json,
+                                  std::string &         response) {
+    if (!ctx_omni->python_t2w_initialized || ctx_omni->python_t2w_stdin == nullptr ||
         ctx_omni->python_t2w_stdout == nullptr) {
         return false;
     }
@@ -253,12 +252,9 @@ bool omni_init_python_t2w_model(struct omni_context * ctx_omni, const std::strin
     }
 
     char cmd[1024];
-    snprintf(
-        cmd,
-        sizeof(cmd),
-        "{\"cmd\":\"init\",\"model_dir\":\"%s\",\"device\":\"%s\",\"float16\":true,\"n_timesteps\":5}",
-        ctx_omni->python_t2w_model_dir.c_str(),
-        python_device.c_str());
+    snprintf(cmd, sizeof(cmd),
+             "{\"cmd\":\"init\",\"model_dir\":\"%s\",\"device\":\"%s\",\"float16\":true,\"n_timesteps\":5}",
+             ctx_omni->python_t2w_model_dir.c_str(), python_device.c_str());
 
     std::string response;
     if (!omni_send_python_t2w_command(ctx_omni, cmd, response)) {
@@ -284,13 +280,12 @@ bool omni_set_python_t2w_ref_audio(struct omni_context * ctx_omni, const std::st
     return omni_python_t2w_has_status(response, "ok");
 }
 
-bool omni_process_python_t2w_tokens(
-    struct omni_context * ctx_omni,
-    const std::vector<int32_t> & tokens,
-    bool last_chunk,
-    const std::string & output_path,
-    double & inference_time_ms,
-    double & audio_duration) {
+bool omni_process_python_t2w_tokens(struct omni_context *        ctx_omni,
+                                    const std::vector<int32_t> & tokens,
+                                    bool                         last_chunk,
+                                    const std::string &          output_path,
+                                    double &                     inference_time_ms,
+                                    double &                     audio_duration) {
     std::string tokens_json = "[";
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (i > 0) {
@@ -301,13 +296,8 @@ bool omni_process_python_t2w_tokens(
     tokens_json += "]";
 
     char cmd[8192];
-    snprintf(
-        cmd,
-        sizeof(cmd),
-        "{\"cmd\":\"process\",\"tokens\":%s,\"last_chunk\":%s,\"output_path\":\"%s\"}",
-        tokens_json.c_str(),
-        last_chunk ? "true" : "false",
-        output_path.c_str());
+    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"process\",\"tokens\":%s,\"last_chunk\":%s,\"output_path\":\"%s\"}",
+             tokens_json.c_str(), last_chunk ? "true" : "false", output_path.c_str());
 
     std::string response;
     if (!omni_send_python_t2w_command(ctx_omni, cmd, response)) {

@@ -1,19 +1,16 @@
 #include "omni-sliding-window.h"
 
-#include "omni.h"
-
 #include "common/common.h"
+#include "omni-log.h"
+#include "omni.h"
 
 #include <algorithm>
 
-void print_with_timestamp(const char * format, ...);
-
-static bool omni_sliding_eval_tokens(
-        struct omni_context * ctx_omni,
-        struct common_params * params,
-        std::vector<llama_token> tokens,
-        int n_batch,
-        int * n_past) {
+static bool omni_sliding_eval_tokens(struct omni_context *    ctx_omni,
+                                     struct common_params *   params,
+                                     std::vector<llama_token> tokens,
+                                     int                      n_batch,
+                                     int *                    n_past) {
     const int n_tokens = (int) tokens.size();
     kv_cache_slide_window(ctx_omni, params, n_tokens);
 
@@ -26,7 +23,7 @@ static bool omni_sliding_eval_tokens(
             break;
         }
 
-        llama_batch batch = llama_batch_get_one(tokens.data() + i, n_eval);
+        llama_batch            batch = llama_batch_get_one(tokens.data() + i, n_eval);
         std::vector<llama_pos> pos_vec;
         if (batch.pos == nullptr) {
             pos_vec.resize(n_eval);
@@ -45,15 +42,14 @@ static bool omni_sliding_eval_tokens(
     return true;
 }
 
-static bool omni_sliding_eval_string(
-        struct omni_context * ctx_omni,
-        struct common_params * params,
-        const char * str,
-        int n_batch,
-        int * n_past,
-        bool add_bos) {
-    std::string str_buf = str;
-    std::vector<llama_token> tokens = common_tokenize(ctx_omni->ctx_llama, str_buf, add_bos, true);
+static bool omni_sliding_eval_string(struct omni_context *  ctx_omni,
+                                     struct common_params * params,
+                                     const char *           str,
+                                     int                    n_batch,
+                                     int *                  n_past,
+                                     bool                   add_bos) {
+    std::string              str_buf = str;
+    std::vector<llama_token> tokens  = common_tokenize(ctx_omni->ctx_llama, str_buf, add_bos, true);
     return omni_sliding_eval_tokens(ctx_omni, params, std::move(tokens), n_batch, n_past);
 }
 
@@ -72,21 +68,20 @@ void kv_cache_slide_window(struct omni_context * ctx_omni, struct common_params 
     }
 
     print_with_timestamp("⚠️ KV Cache 滑动窗口触发: n_past=%d, chunk_size=%d, n_ctx=%d, n_keep=%d, 轮次数=%zu\n",
-                         ctx_omni->n_past, chunk_size, n_ctx, ctx_omni->n_keep,
-                         ctx_omni->round_start_positions.size());
+                         ctx_omni->n_past, chunk_size, n_ctx, ctx_omni->n_keep, ctx_omni->round_start_positions.size());
 
-    int n_discard = 0;
+    int n_discard      = 0;
     int delete_end_pos = ctx_omni->n_keep;
 
     if (ctx_omni->max_preserved_context > 0 && ctx_omni->round_start_positions.size() >= 1) {
-        const auto & rounds = ctx_omni->round_start_positions;
-        int cumulative_length = 0;
-        int keep_from_round = (int) rounds.size();
-        const int total_rounds = (int) rounds.size();
+        const auto & rounds            = ctx_omni->round_start_positions;
+        int          cumulative_length = 0;
+        int          keep_from_round   = (int) rounds.size();
+        const int    total_rounds      = (int) rounds.size();
 
         for (int i = total_rounds - 1; i >= 0; --i) {
-            const int round_start = (i == 0) ? ctx_omni->n_keep : rounds[i - 1];
-            const int round_end = rounds[i];
+            const int round_start  = (i == 0) ? ctx_omni->n_keep : rounds[i - 1];
+            const int round_end    = rounds[i];
             const int round_length = round_end - round_start;
 
             if (cumulative_length + round_length > ctx_omni->max_preserved_context) {
@@ -102,13 +97,13 @@ void kv_cache_slide_window(struct omni_context * ctx_omni, struct common_params 
         }
 
         const int delete_start = ctx_omni->n_keep;
-        delete_end_pos = (keep_from_round == 0) ? ctx_omni->n_keep : rounds[keep_from_round - 1];
+        delete_end_pos         = (keep_from_round == 0) ? ctx_omni->n_keep : rounds[keep_from_round - 1];
 
         if (delete_end_pos > delete_start) {
             n_discard = delete_end_pos - delete_start;
 
-            print_with_timestamp("⚠️ 按轮次删除: 删除轮次 0-%d，保留轮次 %d-%d，保留长度=%d\n",
-                                 keep_from_round - 1, keep_from_round, total_rounds - 1, cumulative_length);
+            print_with_timestamp("⚠️ 按轮次删除: 删除轮次 0-%d，保留轮次 %d-%d，保留长度=%d\n", keep_from_round - 1,
+                                 keep_from_round, total_rounds - 1, cumulative_length);
 
             std::vector<int> new_rounds;
             for (int i = keep_from_round; i < total_rounds; ++i) {
@@ -116,8 +111,8 @@ void kv_cache_slide_window(struct omni_context * ctx_omni, struct common_params 
             }
             ctx_omni->round_start_positions = new_rounds;
 
-            print_with_timestamp("⚠️ 更新轮次边界: 新边界数=%zu，首轮结束位置=%d\n",
-                                 new_rounds.size(), new_rounds.empty() ? -1 : new_rounds[0]);
+            print_with_timestamp("⚠️ 更新轮次边界: 新边界数=%zu，首轮结束位置=%d\n", new_rounds.size(),
+                                 new_rounds.empty() ? -1 : new_rounds[0]);
         } else {
             print_with_timestamp("⚠️ 没有可删除的完整轮次（keep_from_round=%d），回退到按比例删除\n", keep_from_round);
             n_discard = 0;
@@ -126,12 +121,12 @@ void kv_cache_slide_window(struct omni_context * ctx_omni, struct common_params 
 
     if (n_discard == 0) {
         const int n_left = ctx_omni->n_past - ctx_omni->n_keep;
-        n_discard = n_left / 2;
-        delete_end_pos = ctx_omni->n_keep + n_discard;
+        n_discard        = n_left / 2;
+        delete_end_pos   = ctx_omni->n_keep + n_discard;
 
         if (n_left <= 0 || n_discard <= 0) {
-            print_with_timestamp("⚠️ KV Cache 滑动窗口: 边界检查失败 n_left=%d, n_discard=%d，跳过滑动\n",
-                                 n_left, n_discard);
+            print_with_timestamp("⚠️ KV Cache 滑动窗口: 边界检查失败 n_left=%d, n_discard=%d，跳过滑动\n", n_left,
+                                 n_discard);
             return;
         }
 
@@ -144,12 +139,12 @@ void kv_cache_slide_window(struct omni_context * ctx_omni, struct common_params 
         ctx_omni->round_start_positions = new_rounds;
 
         print_with_timestamp("⚠️ 按比例删除后轮次边界: 剩余 %zu 个轮次\n", new_rounds.size());
-        print_with_timestamp("⚠️ 按比例删除: n_left=%d, n_discard=%d, 删除范围=[%d, %d)\n",
-                             n_left, n_discard, ctx_omni->n_keep, delete_end_pos);
+        print_with_timestamp("⚠️ 按比例删除: n_left=%d, n_discard=%d, 删除范围=[%d, %d)\n", n_left, n_discard,
+                             ctx_omni->n_keep, delete_end_pos);
     }
 
-    print_with_timestamp("⚠️ KV Cache 滑动窗口执行: 删除范围=[%d, %d), n_discard=%d\n",
-                         ctx_omni->n_keep, delete_end_pos, n_discard);
+    print_with_timestamp("⚠️ KV Cache 滑动窗口执行: 删除范围=[%d, %d), n_discard=%d\n", ctx_omni->n_keep, delete_end_pos,
+                         n_discard);
 
     llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
     if (mem) {
@@ -171,14 +166,14 @@ void sliding_window_reset(struct omni_context * ctx_omni) {
     const int old_unit_count = (int) ctx_omni->unit_history.size();
 
     ctx_omni->unit_history.clear();
-    ctx_omni->next_unit_id = 0;
-    ctx_omni->pending_unit_id = -1;
+    ctx_omni->next_unit_id                 = 0;
+    ctx_omni->pending_unit_id              = -1;
     ctx_omni->pending_unit_start_cache_len = 0;
-    ctx_omni->system_preserve_length = 0;
-    ctx_omni->position_offset = 0;
-    ctx_omni->sliding_event_count = 0;
-    ctx_omni->total_dropped_tokens = 0;
-    ctx_omni->total_dropped_units = 0;
+    ctx_omni->system_preserve_length       = 0;
+    ctx_omni->position_offset              = 0;
+    ctx_omni->sliding_event_count          = 0;
+    ctx_omni->total_dropped_tokens         = 0;
+    ctx_omni->total_dropped_units          = 0;
 
     if (old_unit_count > 0) {
         print_with_timestamp("[SW] reset: cleared %d units, all sliding window state reset\n", old_unit_count);
@@ -199,23 +194,20 @@ int sliding_window_register_unit_start(struct omni_context * ctx_omni) {
         return -1;
     }
 
-    ctx_omni->pending_unit_id = ctx_omni->next_unit_id;
+    ctx_omni->pending_unit_id              = ctx_omni->next_unit_id;
     ctx_omni->pending_unit_start_cache_len = get_cache_length(ctx_omni);
 
     print_with_timestamp("[SW] unit_start: pending_unit_id=%d, cache_len=%d, preserve=%d, units=%zu\n",
-                         ctx_omni->pending_unit_id,
-                         ctx_omni->pending_unit_start_cache_len,
-                         ctx_omni->system_preserve_length,
-                         ctx_omni->unit_history.size());
+                         ctx_omni->pending_unit_id, ctx_omni->pending_unit_start_cache_len,
+                         ctx_omni->system_preserve_length, ctx_omni->unit_history.size());
 
     return ctx_omni->pending_unit_id;
 }
 
-void sliding_window_register_unit_end(
-        struct omni_context * ctx_omni,
-        const std::string & input_type,
-        const std::vector<llama_token> & generated_tokens,
-        bool is_listen) {
+void sliding_window_register_unit_end(struct omni_context *            ctx_omni,
+                                      const std::string &              input_type,
+                                      const std::vector<llama_token> & generated_tokens,
+                                      bool                             is_listen) {
     if (ctx_omni == nullptr) {
         return;
     }
@@ -226,29 +218,30 @@ void sliding_window_register_unit_end(
     }
 
     const int current_cache_len = get_cache_length(ctx_omni);
-    const int unit_len = current_cache_len - ctx_omni->pending_unit_start_cache_len;
+    const int unit_len          = current_cache_len - ctx_omni->pending_unit_start_cache_len;
 
     if (unit_len > 0) {
         UnitEntry entry;
-        entry.unit_id = ctx_omni->pending_unit_id;
-        entry.length = unit_len;
-        entry.type = input_type;
+        entry.unit_id          = ctx_omni->pending_unit_id;
+        entry.length           = unit_len;
+        entry.type             = input_type;
         entry.generated_tokens = generated_tokens;
-        entry.is_listen = is_listen;
+        entry.is_listen        = is_listen;
 
         ctx_omni->unit_history.push_back(entry);
 
-        print_with_timestamp("[SW] unit_end: unit_id=%d type=%s len=%d gen_tokens=%zu is_listen=%d | cache=%d preserve=%d total_units=%zu\n",
-                             entry.unit_id, entry.type.c_str(), entry.length,
-                             entry.generated_tokens.size(), entry.is_listen,
-                             current_cache_len, ctx_omni->system_preserve_length,
-                             ctx_omni->unit_history.size());
+        print_with_timestamp(
+            "[SW] unit_end: unit_id=%d type=%s len=%d gen_tokens=%zu is_listen=%d | cache=%d preserve=%d "
+            "total_units=%zu\n",
+            entry.unit_id, entry.type.c_str(), entry.length, entry.generated_tokens.size(), entry.is_listen,
+            current_cache_len, ctx_omni->system_preserve_length, ctx_omni->unit_history.size());
     } else {
-        print_with_timestamp("[SW] WARNING: unit_end: unit_id=%d has zero length (start=%d, current=%d), not recorded\n",
-                             ctx_omni->pending_unit_id, ctx_omni->pending_unit_start_cache_len, current_cache_len);
+        print_with_timestamp(
+            "[SW] WARNING: unit_end: unit_id=%d has zero length (start=%d, current=%d), not recorded\n",
+            ctx_omni->pending_unit_id, ctx_omni->pending_unit_start_cache_len, current_cache_len);
     }
 
-    ctx_omni->pending_unit_id = -1;
+    ctx_omni->pending_unit_id              = -1;
     ctx_omni->pending_unit_start_cache_len = 0;
     ctx_omni->next_unit_id++;
 }
@@ -270,11 +263,11 @@ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int l
     }
 
     const int cache_len_before = get_cache_length(ctx_omni);
-    const int preserve = ctx_omni->system_preserve_length;
+    const int preserve         = ctx_omni->system_preserve_length;
 
     if (cache_len_before <= preserve) {
-        print_with_timestamp("[SW] drop_tokens: cache_len=%d <= preserve=%d, nothing to drop\n",
-                             cache_len_before, preserve);
+        print_with_timestamp("[SW] drop_tokens: cache_len=%d <= preserve=%d, nothing to drop\n", cache_len_before,
+                             preserve);
         return false;
     }
 
@@ -297,7 +290,8 @@ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int l
         ctx_omni->position_offset += length;
 
         print_with_timestamp("[SW] drop_tokens: SUCCESS, dropped %d tokens from [%d, %d), cache %d -> %d, offset=%d\n",
-                             length, preserve, preserve + length, cache_len_before, ctx_omni->n_past, ctx_omni->position_offset);
+                             length, preserve, preserve + length, cache_len_before, ctx_omni->n_past,
+                             ctx_omni->position_offset);
     } else {
         print_with_timestamp("[SW] drop_tokens: FAILED to drop %d tokens\n", length);
     }
@@ -311,9 +305,7 @@ static bool sliding_window_drop_unit(struct omni_context * ctx_omni, int unit_id
     }
 
     auto it = std::find_if(ctx_omni->unit_history.begin(), ctx_omni->unit_history.end(),
-                           [unit_id](const UnitEntry & entry) {
-                               return entry.unit_id == unit_id;
-                           });
+                           [unit_id](const UnitEntry & entry) { return entry.unit_id == unit_id; });
     if (it == ctx_omni->unit_history.end()) {
         return false;
     }
@@ -333,8 +325,8 @@ static bool sliding_window_drop_unit(struct omni_context * ctx_omni, int unit_id
 
     const int cache_after = get_cache_length(ctx_omni);
     print_with_timestamp("[SW] 🗑️ DROPPED unit_id=%d type=%s len=%d gen_tokens=%zu | cache %d -> %d, offset=%d\n",
-                         it->unit_id, it->type.c_str(), it->length, it->generated_tokens.size(),
-                         cache_before, cache_after, ctx_omni->position_offset);
+                         it->unit_id, it->type.c_str(), it->length, it->generated_tokens.size(), cache_before,
+                         cache_after, ctx_omni->position_offset);
 
     ctx_omni->unit_history.erase(it);
     return true;
@@ -376,11 +368,11 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
         return false;
     }
 
-    print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: cache=%d > high_water=%d, target=low_water=%d\n",
-                         cache_len_before, cfg.high_water_tokens, cfg.low_water_tokens);
+    print_with_timestamp("[SW] ⚡ SLIDING TRIGGERED: cache=%d > high_water=%d, target=low_water=%d\n", cache_len_before,
+                         cfg.high_water_tokens, cfg.low_water_tokens);
 
     int dropped_count = 0;
-    int cache_len = cache_len_before;
+    int cache_len     = cache_len_before;
 
     while (cache_len > cfg.low_water_tokens) {
         if (!sliding_window_drop_next_unit(ctx_omni)) {
@@ -402,14 +394,15 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
         }
         const bool is_consistent = expected == cache_len;
 
-        print_with_timestamp("[SW] ✅ SLIDING DONE: cache %d -> %d, dropped %d units, remaining %zu units | consistency: expected=%d actual=%d %s\n",
-                             cache_len_before, cache_len, dropped_count, ctx_omni->unit_history.size(),
-                             expected, cache_len, is_consistent ? "✓" : "✗ MISMATCH!");
+        print_with_timestamp(
+            "[SW] ✅ SLIDING DONE: cache %d -> %d, dropped %d units, remaining %zu units | consistency: expected=%d "
+            "actual=%d %s\n",
+            cache_len_before, cache_len, dropped_count, ctx_omni->unit_history.size(), expected, cache_len,
+            is_consistent ? "✓" : "✗ MISMATCH!");
 
         if (!is_consistent) {
             print_with_timestamp("[SW] ❌ CONSISTENCY ERROR! preserve=%d + sum(units)=%d != cache=%d, offset=%d\n",
-                                 ctx_omni->system_preserve_length,
-                                 expected - ctx_omni->system_preserve_length,
+                                 ctx_omni->system_preserve_length, expected - ctx_omni->system_preserve_length,
                                  cache_len, ctx_omni->position_offset);
         }
     }
@@ -423,28 +416,23 @@ void omni_finalize_decode_round(struct omni_context * ctx_omni) {
     }
 
     const int reserved_space = 1024;
-    const int n_ctx = ctx_omni->params->n_ctx;
+    const int n_ctx          = ctx_omni->params->n_ctx;
 
     if (ctx_omni->n_past > n_ctx - reserved_space) {
-        print_with_timestamp("⚠️ Decode 结束滑窗检查: n_past=%d > n_ctx-reserved=%d，需要滑窗\n",
-                             ctx_omni->n_past, n_ctx - reserved_space);
+        print_with_timestamp("⚠️ Decode 结束滑窗检查: n_past=%d > n_ctx-reserved=%d，需要滑窗\n", ctx_omni->n_past,
+                             n_ctx - reserved_space);
         kv_cache_slide_window(ctx_omni, ctx_omni->params, reserved_space);
     } else {
-        print_with_timestamp("📍 Decode 结束: n_past=%d, 剩余空间=%d, 无需滑窗\n",
-                             ctx_omni->n_past, n_ctx - ctx_omni->n_past);
+        print_with_timestamp("📍 Decode 结束: n_past=%d, 剩余空间=%d, 无需滑窗\n", ctx_omni->n_past,
+                             n_ctx - ctx_omni->n_past);
     }
 
     ctx_omni->round_start_positions.push_back(ctx_omni->n_past);
-    print_with_timestamp("📍 轮次 %zu 结束，记录边界于 n_past=%d\n",
-                         ctx_omni->round_start_positions.size(), ctx_omni->n_past);
+    print_with_timestamp("📍 轮次 %zu 结束，记录边界于 n_past=%d\n", ctx_omni->round_start_positions.size(),
+                         ctx_omni->n_past);
 
-    const bool prefix_ok = omni_sliding_eval_string(
-        ctx_omni,
-        ctx_omni->params,
-        "<|im_end|>\n<|im_start|>user\n",
-        ctx_omni->params->n_batch,
-        &ctx_omni->n_past,
-        false);
+    const bool prefix_ok = omni_sliding_eval_string(ctx_omni, ctx_omni->params, "<|im_end|>\n<|im_start|>user\n",
+                                                    ctx_omni->params->n_batch, &ctx_omni->n_past, false);
     if (!prefix_ok) {
         print_with_timestamp("⚠️ 为下一轮准备 user 前缀失败，n_past=%d\n", ctx_omni->n_past);
         return;

@@ -1,9 +1,8 @@
 #include "omni-worker-coordinator.h"
 
+#include "omni-log.h"
 #include "omni-runtime-messages.h"
 #include "omni.h"
-
-void print_with_timestamp(const char * format, ...);
 
 void omni_clear_tts_queue(struct omni_context * ctx_omni, const char * log_reason) {
     if (ctx_omni == nullptr || ctx_omni->tts_thread_info == nullptr) {

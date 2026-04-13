@@ -5,6 +5,7 @@
 #include "common/sampling.h"
 #include "llama.h"
 #include "omni-impl.h"
+#include "omni-log.h"
 #include "omni-python-t2w.h"
 #include "omni-worker-coordinator.h"
 #include "omni.h"
@@ -26,9 +27,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-
-// print_with_timestamp is defined in omni.cpp
-void print_with_timestamp(const char * format, ...);
 
 // ── Static model-loading helpers (moved from omni.cpp) ───────────────────
 
