@@ -1,9 +1,9 @@
 #include "omni-turn-coordinator.h"
 
+#include "common/common.h"
 #include "omni-session-state.h"
 #include "omni-sliding-window.h"
 #include "omni.h"
-#include "common/common.h"
 
 #include <chrono>
 
@@ -13,17 +13,16 @@ static const char * omni_turn_close_kind_name(OmniTurnCloseKind kind) {
     return kind == OmniTurnCloseKind::abort ? "abort" : "finish";
 }
 
-static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(
-        struct omni_context * ctx_omni,
-        OmniTurnCloseKind kind) {
+static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(struct omni_context * ctx_omni,
+                                                                    OmniTurnCloseKind     kind) {
     OmniTurnCloseResult result;
     if (ctx_omni == nullptr) {
         return result;
     }
 
     result.completed_round = omni_session_round_meta(ctx_omni);
-    result.active_round = result.completed_round;
-    result.interrupted = kind == OmniTurnCloseKind::abort;
+    result.active_round    = result.completed_round;
+    result.interrupted     = kind == OmniTurnCloseKind::abort;
 
     if (ctx_omni->duplex_mode || ctx_omni->current_turn_ended) {
         result.turn_closed = ctx_omni->current_turn_ended;
@@ -33,14 +32,12 @@ static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(
     omni_finalize_decode_round(ctx_omni);
     ctx_omni->current_turn_ended = true;
 
-    result.turn_closed = true;
+    result.turn_closed  = true;
     result.active_round = omni_session_make_round_meta(ctx_omni, result.completed_round.round_idx + 1);
     omni_session_set_round_meta(ctx_omni, result.active_round);
 
-    print_with_timestamp("TurnCoordinator: %s simplex turn round_idx=%d -> %d\n",
-                         omni_turn_close_kind_name(kind),
-                         result.completed_round.round_idx,
-                         result.active_round.round_idx);
+    print_with_timestamp("TurnCoordinator: %s simplex turn round_idx=%d -> %d\n", omni_turn_close_kind_name(kind),
+                         result.completed_round.round_idx, result.active_round.round_idx);
     return result;
 }
 
@@ -50,7 +47,7 @@ OmniPrefillSetup omni_turn_coordinator_prepare_prefill(struct omni_context * ctx
         return setup;
     }
 
-    setup.need_bootstrap = index == 0 && !ctx_omni->system_prompt_initialized;
+    setup.need_bootstrap       = index == 0 && !ctx_omni->system_prompt_initialized;
     setup.should_start_workers = setup.need_bootstrap && ctx_omni->async;
 
     if (!(ctx_omni->use_tts && index == 0 && !ctx_omni->duplex_mode)) {
@@ -67,9 +64,8 @@ OmniPrefillSetup omni_turn_coordinator_prepare_prefill(struct omni_context * ctx
 
         print_with_timestamp("TTS: 等待上一轮语音生成完成\n");
         std::unique_lock<std::mutex> lock(ctx_omni->workers.speek_mtx);
-        const bool wait_ok = ctx_omni->workers.speek_cv.wait_for(lock, std::chrono::seconds(5), [&] {
-            return ctx_omni->speek_done || ctx_omni->break_event.load();
-        });
+        const bool                   wait_ok = ctx_omni->workers.speek_cv.wait_for(
+            lock, std::chrono::seconds(5), [&] { return ctx_omni->speek_done || ctx_omni->break_event.load(); });
         if (!wait_ok) {
             ctx_omni->speek_done = true;
         }
@@ -77,33 +73,31 @@ OmniPrefillSetup omni_turn_coordinator_prepare_prefill(struct omni_context * ctx
 
     ctx_omni->speek_done = false;
     if (ctx_omni->tts_thread_info != nullptr) {
-        omni_clear_tts_queue(
-            ctx_omni,
-            ctx_omni->warmup_done.load() ? "stream_prefill: cleared TTS queue for new turn" : nullptr);
+        omni_clear_tts_queue(ctx_omni,
+                             ctx_omni->warmup_done.load() ? "stream_prefill: cleared TTS queue for new turn" : nullptr);
     }
 
     return setup;
 }
 
-void omni_turn_coordinator_prepare_decode(
-        struct omni_context * ctx_omni,
-        int round_idx,
-        const OmniWorkerThreadFns & worker_fns) {
+void omni_turn_coordinator_prepare_decode(struct omni_context *       ctx_omni,
+                                          int                         round_idx,
+                                          const OmniWorkerThreadFns & worker_fns) {
     if (ctx_omni == nullptr) {
         return;
     }
 
     if (round_idx >= 0 && !ctx_omni->duplex_mode && ctx_omni->simplex_round_idx != round_idx) {
-        print_with_timestamp("📍 [轮次同步] 调用方指定 round_idx=%d，当前 simplex_round_idx=%d，强制同步\n",
-                             round_idx, ctx_omni->simplex_round_idx);
+        print_with_timestamp("📍 [轮次同步] 调用方指定 round_idx=%d，当前 simplex_round_idx=%d，强制同步\n", round_idx,
+                             ctx_omni->simplex_round_idx);
         omni_session_set_round_index(ctx_omni, round_idx);
     } else {
         omni_session_sync_round_meta(ctx_omni);
     }
 
     ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
-    print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n",
-                         ctx_omni->n_past, ctx_omni->n_keep, ctx_omni->params->n_ctx, ctx_omni->duplex_mode);
+    print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n", ctx_omni->n_past,
+                         ctx_omni->n_keep, ctx_omni->params->n_ctx, ctx_omni->duplex_mode);
 
     ctx_omni->current_turn_ended = false;
     if (!ctx_omni->duplex_mode) {
@@ -136,10 +130,9 @@ void omni_turn_coordinator_prepare_decode(
     }
 }
 
-OmniTurnCloseResult omni_turn_coordinator_close(
-        struct omni_context * ctx_omni,
-        OmniTurnCloseKind kind,
-        const char * reason) {
+OmniTurnCloseResult omni_turn_coordinator_close(struct omni_context * ctx_omni,
+                                                OmniTurnCloseKind     kind,
+                                                const char *          reason) {
     OmniTurnCloseResult result;
     if (ctx_omni == nullptr) {
         return result;
@@ -167,22 +160,20 @@ OmniTurnCloseResult omni_turn_coordinator_close(
         result = omni_turn_coordinator_close_simplex_turn(ctx_omni, kind);
     } else {
         result.completed_round = omni_session_round_meta(ctx_omni);
-        result.active_round = result.completed_round;
-        result.interrupted = kind == OmniTurnCloseKind::abort;
+        result.active_round    = result.completed_round;
+        result.interrupted     = kind == OmniTurnCloseKind::abort;
         if (kind == OmniTurnCloseKind::abort) {
-            result.turn_closed = true;
+            result.turn_closed           = true;
             ctx_omni->current_turn_ended = true;
         } else {
             result.turn_closed = ctx_omni->current_turn_ended;
         }
     }
 
-    print_with_timestamp("TurnCoordinator: close(kind=%s, reason=%s, duplex_mode=%d, turn_was_ended=%d, round_idx=%d, next_round_idx=%d)\n",
-                         omni_turn_close_kind_name(kind),
-                         reason != nullptr ? reason : "none",
-                         ctx_omni->duplex_mode ? 1 : 0,
-                         turn_was_ended ? 1 : 0,
-                         result.completed_round.round_idx,
-                         result.active_round.round_idx);
+    print_with_timestamp(
+        "TurnCoordinator: close(kind=%s, reason=%s, duplex_mode=%d, turn_was_ended=%d, round_idx=%d, "
+        "next_round_idx=%d)\n",
+        omni_turn_close_kind_name(kind), reason != nullptr ? reason : "none", ctx_omni->duplex_mode ? 1 : 0,
+        turn_was_ended ? 1 : 0, result.completed_round.round_idx, result.active_round.round_idx);
     return result;
 }

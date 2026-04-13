@@ -1,25 +1,24 @@
 #include "omni-runtime-init.h"
 
-#include "omni.h"
+#include "audition.h"
+#include "common/common.h"
+#include "common/sampling.h"
+#include "llama.h"
 #include "omni-impl.h"
 #include "omni-python-t2w.h"
 #include "omni-worker-coordinator.h"
-#include "vision.h"
-#include "audition.h"
+#include "omni.h"
 #include "token2wav/token2wav-impl.h"
-
-#include "llama.h"
-#include "common/common.h"
-#include "common/sampling.h"
+#include "vision.h"
 
 #ifdef _WIN32
-    #include <sys/stat.h>
-    #include <sys/types.h>
-    #define stat _stat
-    #define S_IFDIR _S_IFDIR
+#    include <sys/stat.h>
+#    include <sys/types.h>
+#    define stat    _stat
+#    define S_IFDIR _S_IFDIR
 #else
-    #include <sys/stat.h>
-    #include <sys/types.h>
+#    include <sys/stat.h>
+#    include <sys/types.h>
 #endif
 
 #include <cstring>
@@ -33,12 +32,12 @@ void print_with_timestamp(const char * format, ...);
 
 // ── Static model-loading helpers (moved from omni.cpp) ───────────────────
 
-static struct llama_model * llama_init(common_params * params, std::string model_path) {
+static struct llama_model * llama_init(common_params * params, const std::string & model_path) {
     llama_backend_init();
     llama_numa_init(params->numa);
 
     llama_model_params model_params = common_model_params_to_llama(*params);
-    llama_model * model             = llama_load_model_from_file(model_path.c_str(), model_params);
+    llama_model *      model        = llama_load_model_from_file(model_path.c_str(), model_params);
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
         return NULL;
@@ -47,8 +46,9 @@ static struct llama_model * llama_init(common_params * params, std::string model
 }
 
 // TTS专用模型加载 - 支持独立的GPU层数设置
-static struct llama_model * llama_init_tts(common_params * params, std::string model_path,
-                                            int n_gpu_layers_override = -1) {
+static struct llama_model * llama_init_tts(common_params *     params,
+                                           const std::string & model_path,
+                                           int                 n_gpu_layers_override = -1) {
     llama_backend_init();
     llama_numa_init(params->numa);
 
@@ -77,15 +77,13 @@ void omni_init_prompt_templates(struct omni_context * ctx_omni, bool duplex_mode
             "<|im_start|>system\nStreaming Duplex Conversation! You are a helpful assistant.\n<|audio_start|>";
         ctx_omni->omni_assistant_prompt = "<|audio_end|><|im_end|>\n";
     } else {
-        ctx_omni->audio_voice_clone_prompt =
-            "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
+        ctx_omni->audio_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
         ctx_omni->audio_assistant_prompt =
             "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。"
             "请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。"
             "<|im_end|>\n<|im_start|>user\n";
 
-        ctx_omni->omni_voice_clone_prompt =
-            "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
+        ctx_omni->omni_voice_clone_prompt = "<|im_start|>system\n模仿音频样本的音色并生成新的内容。\n<|audio_start|>";
         ctx_omni->omni_assistant_prompt =
             "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。"
             "请用高自然度的方式和用户聊天。<|im_end|>\n<|im_start|>user\n";
@@ -94,15 +92,17 @@ void omni_init_prompt_templates(struct omni_context * ctx_omni, bool duplex_mode
 
 // ── LLM runtime ───────────────────────────────────────────────────────────
 
-bool omni_init_llm_runtime(struct omni_context * ctx_omni, struct common_params * params,
-                            struct llama_model * existing_model, struct llama_context * existing_ctx) {
+bool omni_init_llm_runtime(struct omni_context *  ctx_omni,
+                           struct common_params * params,
+                           struct llama_model *   existing_model,
+                           struct llama_context * existing_ctx) {
     llama_model *   model     = nullptr;
     llama_context * ctx_llama = nullptr;
 
     if (existing_model != nullptr && existing_ctx != nullptr) {
         print_with_timestamp("=== omni_init: reusing existing LLM model and context\n");
-        model     = existing_model;
-        ctx_llama = existing_ctx;
+        model                = existing_model;
+        ctx_llama            = existing_ctx;
         ctx_omni->owns_model = false;
 
         llama_memory_t mem = llama_get_memory(ctx_llama);
@@ -128,16 +128,18 @@ bool omni_init_llm_runtime(struct omni_context * ctx_omni, struct common_params 
         ctx_omni->owns_model = true;
     }
 
-    ctx_omni->ctx_llama  = ctx_llama;
-    ctx_omni->model      = model;
+    ctx_omni->ctx_llama   = ctx_llama;
+    ctx_omni->model       = model;
     ctx_omni->ctx_sampler = common_sampler_init(model, params->sampling);
     return true;
 }
 
 // ── TTS runtime ───────────────────────────────────────────────────────────
 
-bool omni_init_tts_runtime(struct omni_context * ctx_omni, struct common_params * params,
-                            const std::string & tts_bin_dir, int tts_gpu_layers) {
+bool omni_init_tts_runtime(struct omni_context *  ctx_omni,
+                           struct common_params * params,
+                           const std::string &    tts_bin_dir,
+                           int                    tts_gpu_layers) {
     print_with_timestamp("=== omni_init: loading TTS model\n");
     print_with_timestamp("TTS model: loading with n_gpu_layers=%d\n", tts_gpu_layers);
 
@@ -158,17 +160,16 @@ bool omni_init_tts_runtime(struct omni_context * ctx_omni, struct common_params 
     }
 
     // 🔧 TTS流式采样参数 - 与 Python ras_sampling 对齐
-    common_params_sampling tts_sampling  = params->sampling;
-    tts_sampling.temp                    = 0.8f;
-    tts_sampling.top_p                   = 0.85f;
-    tts_sampling.top_k                   = 25;
-    tts_sampling.penalty_repeat          = 1.05f;
-    tts_sampling.min_p                   = 0.01f;
-    tts_sampling.penalty_last_n          = 16;
-    struct common_sampler * tts_sampler  = common_sampler_init(tts_model, tts_sampling);
-    print_with_timestamp("TTS sampler: temp=%.2f, top_p=%.2f, top_k=%d, rep_penalty=%.2f\n",
-                         tts_sampling.temp, tts_sampling.top_p, tts_sampling.top_k,
-                         tts_sampling.penalty_repeat);
+    common_params_sampling tts_sampling = params->sampling;
+    tts_sampling.temp                   = 0.8f;
+    tts_sampling.top_p                  = 0.85f;
+    tts_sampling.top_k                  = 25;
+    tts_sampling.penalty_repeat         = 1.05f;
+    tts_sampling.min_p                  = 0.01f;
+    tts_sampling.penalty_last_n         = 16;
+    struct common_sampler * tts_sampler = common_sampler_init(tts_model, tts_sampling);
+    print_with_timestamp("TTS sampler: temp=%.2f, top_p=%.2f, top_k=%d, rep_penalty=%.2f\n", tts_sampling.temp,
+                         tts_sampling.top_p, tts_sampling.top_k, tts_sampling.penalty_repeat);
 
     ctx_omni->model_tts       = tts_model;
     ctx_omni->ctx_tts_llama   = ctx_tts_llama;
@@ -207,12 +208,11 @@ bool omni_init_audio_vision_runtime(struct omni_context * ctx_omni, struct commo
     }
 
     print_with_timestamp("=== omni_init: loading APM model\n");
-    ctx_omni->ctx_audio = audition_init(params->apm_model.c_str(),
-                                         audition_context_params{true, GGML_LOG_LEVEL_INFO});
+    ctx_omni->ctx_audio =
+        audition_init(params->apm_model.c_str(), audition_context_params{ true, GGML_LOG_LEVEL_INFO });
     print_with_timestamp("APM: init from %s\n", params->apm_model.c_str());
     if (ctx_omni->ctx_audio == nullptr) {
-        LOG_ERR("%s: error: failed to init audition model from %s\n", __func__,
-                params->apm_model.c_str());
+        LOG_ERR("%s: error: failed to init audition model from %s\n", __func__, params->apm_model.c_str());
         return false;
     }
 
@@ -221,17 +221,14 @@ bool omni_init_audio_vision_runtime(struct omni_context * ctx_omni, struct commo
     if (ctx_omni->media_type == 2) {
         LOG_INF("init vision....");
         const char * vision_path = ctx_omni->params->vpm_model.c_str();
-        auto *       ctx_vision  = vision_init(vision_path,
-                                               vision_context_params{true, GGML_LOG_LEVEL_INFO, nullptr});
-        ctx_omni->ctx_vision = ctx_vision;
+        auto *       ctx_vision = vision_init(vision_path, vision_context_params{ true, GGML_LOG_LEVEL_INFO, nullptr });
+        ctx_omni->ctx_vision    = ctx_vision;
 
         if (ctx_vision && !ctx_omni->params->vision_coreml_model_path.empty()) {
             struct stat coreml_stat;
             if (stat(ctx_omni->params->vision_coreml_model_path.c_str(), &coreml_stat) == 0) {
-                vision_set_coreml_model_path(ctx_vision,
-                                              ctx_omni->params->vision_coreml_model_path.c_str());
-                LOG_INF("Vision CoreML model path set to: %s\n",
-                        ctx_omni->params->vision_coreml_model_path.c_str());
+                vision_set_coreml_model_path(ctx_vision, ctx_omni->params->vision_coreml_model_path.c_str());
+                LOG_INF("Vision CoreML model path set to: %s\n", ctx_omni->params->vision_coreml_model_path.c_str());
             } else {
                 LOG_WRN("Vision CoreML model path does not exist: %s, skipping ANE\n",
                         ctx_omni->params->vision_coreml_model_path.c_str());
@@ -244,8 +241,9 @@ bool omni_init_audio_vision_runtime(struct omni_context * ctx_omni, struct commo
 
 // ── Token2Wav runtime ─────────────────────────────────────────────────────
 
-void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::string & tts_bin_dir,
-                                  const std::string & token2wav_device) {
+void omni_init_token2wav_runtime(struct omni_context * ctx_omni,
+                                 const std::string &   tts_bin_dir,
+                                 const std::string &   token2wav_device) {
     ctx_omni->token2wav_initialized = false;
 
     // 🔧 如果使用 Python Token2Wav，跳过 C++ 的初始化以节省显存
@@ -264,11 +262,9 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
         std::ifstream f(encoder_test);
         if (!f.good()) {
             ctx_omni->token2wav_model_dir = "tools/omni/token2wav-gguf";
-            print_with_timestamp("Token2Wav: trying fallback path %s\n",
-                                 ctx_omni->token2wav_model_dir.c_str());
+            print_with_timestamp("Token2Wav: trying fallback path %s\n", ctx_omni->token2wav_model_dir.c_str());
         } else {
-            print_with_timestamp("Token2Wav: found models in %s\n",
-                                 ctx_omni->token2wav_model_dir.c_str());
+            print_with_timestamp("Token2Wav: found models in %s\n", ctx_omni->token2wav_model_dir.c_str());
         }
     }
 
@@ -278,9 +274,8 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
     std::string vocoder_gguf       = ctx_omni->token2wav_model_dir + "/hifigan2.gguf";
     std::string prompt_cache_gguf  = ctx_omni->token2wav_model_dir + "/prompt_cache.gguf";
 
-    bool all_files_exist                      = true;
-    std::vector<std::string> gguf_files       = {encoder_gguf, flow_matching_gguf,
-                                                  flow_extra_gguf, vocoder_gguf};
+    bool                     all_files_exist = true;
+    std::vector<std::string> gguf_files      = { encoder_gguf, flow_matching_gguf, flow_extra_gguf, vocoder_gguf };
     for (const auto & file : gguf_files) {
         std::ifstream f(file);
         if (!f.good()) {
@@ -293,20 +288,18 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
         print_with_timestamp("Token2Wav: all model files found, initializing session...\n");
         ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
 
-        std::string device_token2mel = token2wav_device;
+        const std::string & device_token2mel = token2wav_device;
 
         // Vocoder 设备策略：CUDA 跟随 token2wav_device，否则强制 CPU
         const char * voc_dev_env = getenv("OMNI_VOC_DEVICE");
         std::string  device_vocoder;
         if (voc_dev_env) {
             device_vocoder = voc_dev_env;
-            print_with_timestamp("Token2Wav: vocoder device overridden by OMNI_VOC_DEVICE=%s\n",
-                                 voc_dev_env);
+            print_with_timestamp("Token2Wav: vocoder device overridden by OMNI_VOC_DEVICE=%s\n", voc_dev_env);
         } else {
 #ifdef GGML_USE_CUDA
             device_vocoder = token2wav_device;
-            print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n",
-                                 device_vocoder.c_str());
+            print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
 #else
             device_vocoder = "cpu";
             print_with_timestamp("Token2Wav: non-CUDA backend, vocoder using CPU for better performance\n");
@@ -320,35 +313,37 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
 
         bool use_prompt_bundle = false;
         {
-            std::ifstream f1(spk_file), f2(tokens_file), f3(mel_file);
+            std::ifstream f1(spk_file);
+            std::ifstream f2(tokens_file);
+            std::ifstream f3(mel_file);
             use_prompt_bundle = f1.good() && f2.good() && f3.good();
         }
 
         bool init_ok = false;
         print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
         init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
-            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-            vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+            encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf, vocoder_gguf, device_token2mel,
+            device_vocoder, 5, 1.0f);
         if (!init_ok && use_prompt_bundle) {
             print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n",
                                  prompt_bundle_dir.c_str());
             init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(
-                encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
-                vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir, vocoder_gguf, device_token2mel,
+                device_vocoder, 5, 1.0f);
         }
         if (!init_ok) {
             print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
             ctx_omni->token2wav_session.reset();
             ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
-            init_ok                     = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
-                encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                vocoder_gguf, "cpu", "cpu", 5, 1.0f);
+            init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(encoder_gguf, flow_matching_gguf,
+                                                                               flow_extra_gguf, prompt_cache_gguf,
+                                                                               vocoder_gguf, "cpu", "cpu", 5, 1.0f);
         }
 
         if (init_ok) {
             ctx_omni->token2wav_initialized = true;
             ctx_omni->token2wav_buffer.clear();
-            ctx_omni->token2wav_buffer  = {4218, 4218, 4218};
+            ctx_omni->token2wav_buffer  = { 4218, 4218, 4218 };
             ctx_omni->token2wav_wav_idx = 0;
             print_with_timestamp("Token2Wav: initialized successfully\n");
         } else {
@@ -356,8 +351,7 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
             print_with_timestamp("Token2Wav: initialization failed\n");
         }
     } else {
-        print_with_timestamp("Token2Wav: model files not found in %s\n",
-                             ctx_omni->token2wav_model_dir.c_str());
+        print_with_timestamp("Token2Wav: model files not found in %s\n", ctx_omni->token2wav_model_dir.c_str());
     }
 
     // ── Python Token2Wav ──────────────────────────────────────────────────
@@ -375,11 +369,9 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
     ctx_omni->python_t2w_script_dir = t2w_script_dir;
     ctx_omni->python_t2w_model_dir  = t2w_script_dir + "/token2wav";
 
-    std::string ref_audio_path =
-        "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
+    std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
 
-    print_with_timestamp("Python T2W: script_dir=%s, model_dir=%s\n",
-                         ctx_omni->python_t2w_script_dir.c_str(),
+    print_with_timestamp("Python T2W: script_dir=%s, model_dir=%s\n", ctx_omni->python_t2w_script_dir.c_str(),
                          ctx_omni->python_t2w_model_dir.c_str());
 
     if (ctx_omni->use_python_token2wav) {
@@ -399,8 +391,7 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni, const std::stri
         } else {
             const char * env_cuda_visible = getenv("CUDA_VISIBLE_DEVICES");
             if (env_cuda_visible && strlen(env_cuda_visible) > 0) {
-                print_with_timestamp("Python T2W: 继承外部 CUDA_VISIBLE_DEVICES=%s (与 C++ 共用)\n",
-                                     env_cuda_visible);
+                print_with_timestamp("Python T2W: 继承外部 CUDA_VISIBLE_DEVICES=%s (与 C++ 共用)\n", env_cuda_visible);
             } else if (token2wav_device.find("gpu") != std::string::npos) {
                 size_t colon_pos = token2wav_device.find(':');
                 if (colon_pos != std::string::npos) {

@@ -38,19 +38,17 @@ void print_with_timestamp(const char * format, ...);
 
 namespace {
 
-static void duplex_timing_mark_tts_done(struct omni_context * ctx_omni, int chunk_idx) {
+void duplex_timing_mark_tts_done(struct omni_context * ctx_omni, int chunk_idx) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
     auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
-    if (timing.tts_audio_token_ms < 0.0) {
-        timing.tts_audio_token_ms = 0.0;
-    }
-    timing.tts_done = true;
+    timing.tts_audio_token_ms          = std::max(timing.tts_audio_token_ms, 0.0);
+    timing.tts_done                    = true;
 }
 
-static size_t findIncompleteUtf8(const std::string & str) {
+size_t findIncompleteUtf8(const std::string & str) {
     if (str.empty()) {
         return 0;
     }
@@ -117,15 +115,12 @@ struct OmniTtsComputationDebugData {
     std::vector<float> projected_hidden_after_norm;
 };
 
-static double omni_tts_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
-                                         const std::chrono::high_resolution_clock::time_point & end) {
+double omni_tts_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
+                                  const std::chrono::high_resolution_clock::time_point & end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-static void omni_tts_duplex_timing_note(struct omni_context * ctx_omni,
-                                        int                   chunk_idx,
-                                        double                ms,
-                                        int                   audio_token_count) {
+void omni_tts_duplex_timing_note(struct omni_context * ctx_omni, int chunk_idx, double ms, int audio_token_count) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
         return;
     }
@@ -137,23 +132,21 @@ static void omni_tts_duplex_timing_note(struct omni_context * ctx_omni,
     timing.tts_done = true;
 }
 
-static std::mt19937 * omni_tts_get_sampler_rng(struct common_sampler * smpl) {
+std::mt19937 * omni_tts_get_sampler_rng(struct common_sampler * smpl) {
     void * rng_ptr = common_sampler_get_rng(smpl);
     return static_cast<std::mt19937 *>(rng_ptr);
 }
 
-static bool omni_tts_eval_tokens(struct omni_context *    ctx_omni,
-                                 common_params *          params,
-                                 std::vector<llama_token> tokens,
-                                 int                      n_batch,
-                                 int *                    n_past_tts) {
+bool omni_tts_eval_tokens(struct omni_context *    ctx_omni,
+                          common_params *          params,
+                          std::vector<llama_token> tokens,
+                          int                      n_batch,
+                          int *                    n_past_tts) {
     (void) params;
     const int N = (int) tokens.size();
     for (int i = 0; i < N; i += n_batch) {
         int n_eval = (int) tokens.size() - i;
-        if (n_eval > n_batch) {
-            n_eval = n_batch;
-        }
+        n_eval     = std::min(n_eval, n_batch);
         if (n_eval == 0) {
             break;
         }
@@ -183,7 +176,7 @@ static bool omni_tts_eval_tokens(struct omni_context *    ctx_omni,
     return true;
 }
 
-static void omni_tts_save_logits_to_file(const char * filepath, const float * logits, int num_tokens, int token_index) {
+void omni_tts_save_logits_to_file(const char * filepath, const float * logits, int num_tokens, int token_index) {
     char full_path[512];
     snprintf(full_path, sizeof(full_path), "%s/logits_%03d.bin", filepath, token_index);
 
@@ -199,10 +192,10 @@ static void omni_tts_save_logits_to_file(const char * filepath, const float * lo
     fclose(f);
 }
 
-static void omni_tts_save_hidden_states_to_file(const char *  filepath,
-                                                const float * hidden_states,
-                                                int           hidden_size,
-                                                int           token_index) {
+void omni_tts_save_hidden_states_to_file(const char *  filepath,
+                                         const float * hidden_states,
+                                         int           hidden_size,
+                                         int           token_index) {
     char full_path[512];
     snprintf(full_path, sizeof(full_path), "%s/hidden_states_%03d.bin", filepath, token_index);
 
@@ -218,12 +211,10 @@ static void omni_tts_save_hidden_states_to_file(const char *  filepath,
     fclose(f);
 }
 
-static int omni_tts_random_sampling(const float * logits, int num_tokens, std::mt19937 & rng) {
+int omni_tts_random_sampling(const float * logits, int num_tokens, std::mt19937 & rng) {
     float max_logit = logits[0];
     for (int i = 1; i < num_tokens; ++i) {
-        if (logits[i] > max_logit) {
-            max_logit = logits[i];
-        }
+        max_logit = std::max(logits[i], max_logit);
     }
 
     std::vector<float> probs(num_tokens);
@@ -249,11 +240,11 @@ static int omni_tts_random_sampling(const float * logits, int num_tokens, std::m
     return num_tokens - 1;
 }
 
-static void omni_tts_apply_repetition_penalty(float *                  logits,
-                                              int                      num_tokens,
-                                              const std::vector<int> & decoded_tokens,
-                                              float                    penalty,
-                                              int                      past_window = 16) {
+void omni_tts_apply_repetition_penalty(float *                  logits,
+                                       int                      num_tokens,
+                                       const std::vector<int> & decoded_tokens,
+                                       float                    penalty,
+                                       int                      past_window = 16) {
     if (decoded_tokens.empty() || penalty == 1.0f) {
         return;
     }
@@ -279,17 +270,15 @@ static void omni_tts_apply_repetition_penalty(float *                  logits,
     }
 }
 
-static int omni_tts_nucleus_sampling_with_min_keep(const float *  logits,
-                                                   int            num_tokens,
-                                                   float          top_p,
-                                                   int            top_k,
-                                                   int            min_tokens_to_keep,
-                                                   std::mt19937 & rng) {
+int omni_tts_nucleus_sampling_with_min_keep(const float *  logits,
+                                            int            num_tokens,
+                                            float          top_p,
+                                            int            top_k,
+                                            int            min_tokens_to_keep,
+                                            std::mt19937 & rng) {
     float max_logit = logits[0];
     for (int i = 1; i < num_tokens; ++i) {
-        if (logits[i] > max_logit) {
-            max_logit = logits[i];
-        }
+        max_logit = std::max(logits[i], max_logit);
     }
 
     std::vector<float> probs(num_tokens);
@@ -349,10 +338,7 @@ static int omni_tts_nucleus_sampling_with_min_keep(const float *  logits,
     return filtered_indices.back();
 }
 
-static bool omni_tts_emb_text(struct omni_context * ctx_omni,
-                              llama_token           token_id,
-                              float *               embedding_out,
-                              int                   tts_n_embd) {
+bool omni_tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, float * embedding_out, int tts_n_embd) {
     if (!ctx_omni->emb_text_weight) {
         LOG_ERR("TTS: emb_text_weight not loaded\n");
         return false;
@@ -373,12 +359,12 @@ static bool omni_tts_emb_text(struct omni_context * ctx_omni,
     return true;
 }
 
-static bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
-                                        const float *         llm_hidden_states,
-                                        int                   n_tokens,
-                                        int                   llm_n_embd,
-                                        float *               projected_hidden_states,
-                                        int                   tts_n_embd) {
+bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
+                                 const float *         llm_hidden_states,
+                                 int                   n_tokens,
+                                 int                   llm_n_embd,
+                                 float *               projected_hidden_states,
+                                 int                   tts_n_embd) {
     if (ctx_omni->projector.initialized) {
         if (llm_n_embd != ctx_omni->projector.hparams.in_dim) {
             LOG_ERR("TTS: llm_n_embd (%d) != projector in_dim (%d)\n", llm_n_embd, ctx_omni->projector.hparams.in_dim);
@@ -450,7 +436,7 @@ static bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
     return true;
 }
 
-static void omni_tts_normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f) {
+void omni_tts_normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f) {
     for (int t = 0; t < n_tokens; ++t) {
         float * vec     = embeddings + t * n_embd;
         float   norm_sq = 0.0f;
@@ -488,13 +474,13 @@ static void omni_tts_normalize_l2_per_token(float * embeddings, int n_tokens, in
     }
 }
 
-static const std::vector<llama_token> OMNI_TTS_SPECIAL_TOKEN_IDS = {
+const std::vector<llama_token> OMNI_TTS_SPECIAL_TOKEN_IDS = {
     151667, 151668, 151704, 151706, 151705, 151718, 151721, 151717, 271,
 };
 
-static const std::set<llama_token> OMNI_TTS_KNOWN_EMPTY_TOKEN_IDS = {};
+const std::set<llama_token> OMNI_TTS_KNOWN_EMPTY_TOKEN_IDS = {};
 
-static bool omni_tts_is_valid_token_internal(llama_token tid) {
+bool omni_tts_is_valid_token_internal(llama_token tid) {
     for (llama_token sid : OMNI_TTS_SPECIAL_TOKEN_IDS) {
         if (tid == sid) {
             return false;
@@ -508,9 +494,9 @@ static bool omni_tts_is_valid_token_internal(llama_token tid) {
     return OMNI_TTS_KNOWN_EMPTY_TOKEN_IDS.find(tid) == OMNI_TTS_KNOWN_EMPTY_TOKEN_IDS.end();
 }
 
-static void omni_tts_filter_special_tokens(std::vector<llama_token> & token_ids,
-                                           std::vector<float> &       hidden_states,
-                                           int                        n_embd) {
+void omni_tts_filter_special_tokens(std::vector<llama_token> & token_ids,
+                                    std::vector<float> &       hidden_states,
+                                    int                        n_embd) {
     if (hidden_states.size() != token_ids.size() * (size_t) n_embd) {
         LOG_ERR("filter_special_tokens: hidden_states size (%zu) != token_ids.size() * n_embd (%zu * %d)\n",
                 hidden_states.size(), token_ids.size(), n_embd);
@@ -558,12 +544,12 @@ static void omni_tts_filter_special_tokens(std::vector<llama_token> & token_ids,
     hidden_states = std::move(filtered_hidden_states);
 }
 
-static bool omni_tts_write_binary_chunk(const std::string & path,
-                                        const void *        data,
-                                        size_t              elem_size,
-                                        size_t              elem_count,
-                                        const int32_t *     header       = nullptr,
-                                        size_t              header_count = 0) {
+bool omni_tts_write_binary_chunk(const std::string & path,
+                                 const void *        data,
+                                 size_t              elem_size,
+                                 size_t              elem_count,
+                                 const int32_t *     header       = nullptr,
+                                 size_t              header_count = 0) {
     FILE * f = fopen(path.c_str(), "wb");
     if (f == nullptr) {
         return false;
@@ -578,7 +564,7 @@ static bool omni_tts_write_binary_chunk(const std::string & path,
     return true;
 }
 
-static std::string omni_tts_clean_duplex_debug_text(const std::string & llm_text) {
+std::string omni_tts_clean_duplex_debug_text(const std::string & llm_text) {
     std::string clean_text = llm_text;
     size_t      pos        = 0;
     while ((pos = clean_text.find("[[")) != std::string::npos) {
@@ -600,14 +586,14 @@ static std::string omni_tts_clean_duplex_debug_text(const std::string & llm_text
     return clean_text;
 }
 
-static bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omni,
-                                               const std::vector<llama_token> & filtered_token_ids,
-                                               const std::vector<float> &       filtered_hidden_states,
-                                               int                              current_chunk_n_embd,
-                                               bool                             append_audio_bos,
-                                               const char *                     missing_weight_log,
-                                               OmniTtsPreparedChunk &           prepared_chunk,
-                                               OmniTtsComputationDebugData *    debug_data) {
+bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omni,
+                                        const std::vector<llama_token> & filtered_token_ids,
+                                        const std::vector<float> &       filtered_hidden_states,
+                                        int                              current_chunk_n_embd,
+                                        bool                             append_audio_bos,
+                                        const char *                     missing_weight_log,
+                                        OmniTtsPreparedChunk &           prepared_chunk,
+                                        OmniTtsComputationDebugData *    debug_data) {
     prepared_chunk.tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
     if (!ctx_omni->emb_text_weight || !ctx_omni->projector_semantic_linear1_weight) {
         print_with_timestamp("%s\n", missing_weight_log);
@@ -668,13 +654,13 @@ static bool omni_tts_compute_merged_embeddings(struct omni_context *            
     return true;
 }
 
-static void omni_tts_write_duplex_debug_dump(const std::string &              llm_debug_output_dir,
-                                             int                              current_chunk_idx,
-                                             const std::string &              llm_text,
-                                             const std::vector<llama_token> & current_chunk_token_ids,
-                                             const std::vector<float> &       current_chunk_hidden_states,
-                                             int                              current_chunk_n_embd,
-                                             const OmniTtsPreparedChunk &     prepared_chunk) {
+void omni_tts_write_duplex_debug_dump(const std::string &              llm_debug_output_dir,
+                                      int                              current_chunk_idx,
+                                      const std::string &              llm_text,
+                                      const std::vector<llama_token> & current_chunk_token_ids,
+                                      const std::vector<float> &       current_chunk_hidden_states,
+                                      int                              current_chunk_n_embd,
+                                      const OmniTtsPreparedChunk &     prepared_chunk) {
     const std::string clean_text = omni_tts_clean_duplex_debug_text(llm_text);
     if (!clean_text.empty()) {
         const std::string text_file = llm_debug_output_dir + "/llm_text.txt";
@@ -730,14 +716,14 @@ static void omni_tts_write_duplex_debug_dump(const std::string &              ll
     }
 }
 
-static void omni_tts_write_simplex_debug_dump(const std::string &                 llm_debug_output_dir,
-                                              int                                 current_chunk_idx,
-                                              const std::string &                 response,
-                                              const std::vector<llama_token> &    current_chunk_token_ids,
-                                              const std::vector<float> &          current_chunk_hidden_states,
-                                              int                                 current_chunk_n_embd,
-                                              const OmniTtsPreparedChunk &        prepared_chunk,
-                                              const OmniTtsComputationDebugData & debug_data) {
+void omni_tts_write_simplex_debug_dump(const std::string &                 llm_debug_output_dir,
+                                       int                                 current_chunk_idx,
+                                       const std::string &                 response,
+                                       const std::vector<llama_token> &    current_chunk_token_ids,
+                                       const std::vector<float> &          current_chunk_hidden_states,
+                                       int                                 current_chunk_n_embd,
+                                       const OmniTtsPreparedChunk &        prepared_chunk,
+                                       const OmniTtsComputationDebugData & debug_data) {
     const std::string chunk_dir = llm_debug_output_dir + "/chunk_" + std::to_string(current_chunk_idx);
     omni_ensure_directory(chunk_dir);
 
@@ -879,14 +865,14 @@ static void omni_tts_write_simplex_debug_dump(const std::string &               
     }
 }
 
-static llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *          smpl,
-                                                          struct omni_context *            ctx_omni,
-                                                          common_params *                  params,
-                                                          int *                            n_past_tts,
-                                                          const std::vector<llama_token> * all_generated_tokens,
-                                                          int                              token_index_in_chunk,
-                                                          bool                             force_no_eos = false,
-                                                          bool is_final_text_chunk                      = false) {
+llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *          smpl,
+                                                   struct omni_context *            ctx_omni,
+                                                   common_params *                  params,
+                                                   int *                            n_past_tts,
+                                                   const std::vector<llama_token> * all_generated_tokens,
+                                                   int                              token_index_in_chunk,
+                                                   bool                             force_no_eos        = false,
+                                                   bool                             is_final_text_chunk = false) {
     const bool is_audio_bos =
         (all_generated_tokens == nullptr || all_generated_tokens->empty()) && (token_index_in_chunk == 0);
     if (is_audio_bos) {
@@ -1039,15 +1025,15 @@ static llama_token omni_tts_sample_token_simplex_internal(struct common_sampler 
     return id;
 }
 
-static llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl,
-                                                  struct omni_context *            ctx_omni,
-                                                  common_params *                  params,
-                                                  int *                            n_past_tts,
-                                                  const std::vector<llama_token> * all_generated_tokens,
-                                                  const std::vector<llama_token> * chunk_generated_tokens,
-                                                  int                              token_index_in_chunk,
-                                                  bool                             force_no_eos,
-                                                  bool                             is_final_text_chunk = false) {
+llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl,
+                                           struct omni_context *            ctx_omni,
+                                           common_params *                  params,
+                                           int *                            n_past_tts,
+                                           const std::vector<llama_token> * all_generated_tokens,
+                                           const std::vector<llama_token> * chunk_generated_tokens,
+                                           int                              token_index_in_chunk,
+                                           bool                             force_no_eos,
+                                           bool                             is_final_text_chunk = false) {
     const char * logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
 
     const bool is_first_token_overall =

@@ -53,11 +53,7 @@ struct OmniT2WBackendHooks {
         process_window;
 };
 
-static void omni_t2w_note_timing(struct omni_context * ctx_omni,
-                                 int                   chunk_idx,
-                                 double                ms,
-                                 int                   window_count,
-                                 bool                  done) {
+void omni_t2w_note_timing(struct omni_context * ctx_omni, int chunk_idx, double ms, int window_count, bool done) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
         return;
     }
@@ -71,21 +67,21 @@ static void omni_t2w_note_timing(struct omni_context * ctx_omni,
     }
 }
 
-static std::vector<int32_t> omni_t2w_initial_buffer() {
+std::vector<int32_t> omni_t2w_initial_buffer() {
     return { 4218, 4218, 4218 };
 }
 
-static void omni_t2w_reset_local_state(OmniT2WStageState & state) {
+void omni_t2w_reset_local_state(OmniT2WStageState & state) {
     state.token_buffer = omni_t2w_initial_buffer();
     state.wav_idx      = 0;
 }
 
-static bool omni_t2w_round_meta_changed(const OmniRoundMeta & lhs, const OmniRoundMeta & rhs) {
+bool omni_t2w_round_meta_changed(const OmniRoundMeta & lhs, const OmniRoundMeta & rhs) {
     return lhs.round_idx != rhs.round_idx || lhs.wav_turn_base != rhs.wav_turn_base ||
            lhs.duplex_mode != rhs.duplex_mode;
 }
 
-static void omni_t2w_clear_queue(struct omni_context * ctx_omni) {
+void omni_t2w_clear_queue(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr || ctx_omni->t2w_thread_info == nullptr) {
         return;
     }
@@ -100,15 +96,15 @@ static void omni_t2w_clear_queue(struct omni_context * ctx_omni) {
     }
 }
 
-static void omni_t2w_init_state(struct omni_context * ctx_omni, OmniT2WStageState & state) {
+void omni_t2w_init_state(struct omni_context * ctx_omni, OmniT2WStageState & state) {
     state.active_round_meta = omni_session_round_meta(ctx_omni);
     state.last_round_idx    = state.active_round_meta.round_idx;
     omni_ensure_round_tts_wav_output_dir(ctx_omni->base_output_dir, state.active_round_meta, &state.tts_wav_output_dir);
 }
 
-static bool omni_t2w_handle_break(struct omni_context *       ctx_omni,
-                                  OmniT2WStageState &         state,
-                                  const OmniT2WBackendHooks & hooks) {
+bool omni_t2w_handle_break(struct omni_context *       ctx_omni,
+                           OmniT2WStageState &         state,
+                           const OmniT2WBackendHooks & hooks) {
     if (ctx_omni == nullptr || !ctx_omni->break_event.load()) {
         return false;
     }
@@ -122,9 +118,9 @@ static bool omni_t2w_handle_break(struct omni_context *       ctx_omni,
     return true;
 }
 
-static bool omni_t2w_collect_batch(struct omni_context * ctx_omni,
-                                   bool                  preserve_duplex_chunk_boundaries,
-                                   OmniT2WBatch &        batch) {
+bool omni_t2w_collect_batch(struct omni_context * ctx_omni,
+                            bool                  preserve_duplex_chunk_boundaries,
+                            OmniT2WBatch &        batch) {
     if (ctx_omni == nullptr || ctx_omni->t2w_thread_info == nullptr) {
         return false;
     }
@@ -168,10 +164,10 @@ static bool omni_t2w_collect_batch(struct omni_context * ctx_omni,
     return true;
 }
 
-static void omni_t2w_update_round_state(struct omni_context *       ctx_omni,
-                                        OmniT2WStageState &         state,
-                                        const OmniT2WBatch &        batch,
-                                        const OmniT2WBackendHooks & hooks) {
+void omni_t2w_update_round_state(struct omni_context *       ctx_omni,
+                                 OmniT2WStageState &         state,
+                                 const OmniT2WBatch &        batch,
+                                 const OmniT2WBackendHooks & hooks) {
     if (ctx_omni == nullptr) {
         return;
     }
@@ -193,7 +189,7 @@ static void omni_t2w_update_round_state(struct omni_context *       ctx_omni,
     }
 }
 
-static bool omni_t2w_need_flush(const struct omni_context * ctx_omni, const OmniT2WBatch & batch) {
+bool omni_t2w_need_flush(const struct omni_context * ctx_omni, const OmniT2WBatch & batch) {
     if (ctx_omni == nullptr) {
         return false;
     }
@@ -205,16 +201,16 @@ static bool omni_t2w_need_flush(const struct omni_context * ctx_omni, const Omni
     return batch.is_final;
 }
 
-static std::string omni_t2w_next_wav_path(const OmniT2WStageState & state) {
+std::string omni_t2w_next_wav_path(const OmniT2WStageState & state) {
     return state.tts_wav_output_dir + "/wav_" + std::to_string(state.active_round_meta.wav_turn_base + state.wav_idx) +
            ".wav";
 }
 
-static void omni_t2w_log_wav_result(struct omni_context *       ctx_omni,
-                                    const OmniT2WBackendHooks & hooks,
-                                    const OmniT2WStageState &   state,
-                                    double                      inference_time_ms,
-                                    double                      audio_duration) {
+void omni_t2w_log_wav_result(struct omni_context *       ctx_omni,
+                             const OmniT2WBackendHooks & hooks,
+                             const OmniT2WStageState &   state,
+                             double                      inference_time_ms,
+                             double                      audio_duration) {
     if (ctx_omni == nullptr || audio_duration <= 0.0) {
         return;
     }
@@ -234,9 +230,9 @@ static void omni_t2w_log_wav_result(struct omni_context *       ctx_omni,
                          (long long) elapsed_ms);
 }
 
-static void omni_t2w_slide_token_buffer(struct omni_context *  ctx_omni,
-                                        std::vector<int32_t> & token_buffer,
-                                        bool                   is_last_window) {
+void omni_t2w_slide_token_buffer(struct omni_context *  ctx_omni,
+                                 std::vector<int32_t> & token_buffer,
+                                 bool                   is_last_window) {
     size_t slide_amount = 0;
 
     if (ctx_omni == nullptr) {
@@ -271,7 +267,7 @@ static void omni_t2w_slide_token_buffer(struct omni_context *  ctx_omni,
     token_buffer.erase(token_buffer.begin(), token_buffer.begin() + slide_amount);
 }
 
-static void omni_t2w_run_backend(struct omni_context * ctx_omni, const OmniT2WBackendHooks & hooks) {
+void omni_t2w_run_backend(struct omni_context * ctx_omni, const OmniT2WBackendHooks & hooks) {
     OmniT2WStageState state;
     omni_t2w_init_state(ctx_omni, state);
 
@@ -365,22 +361,22 @@ static void omni_t2w_run_backend(struct omni_context * ctx_omni, const OmniT2WBa
     }
 }
 
-static bool omni_t2w_process_python_window(struct omni_context *        ctx_omni,
-                                           const OmniT2WStageState &    state,
-                                           const std::vector<int32_t> & window,
-                                           bool                         is_last_window,
-                                           double &                     inference_time_ms,
-                                           double &                     audio_duration) {
+bool omni_t2w_process_python_window(struct omni_context *        ctx_omni,
+                                    const OmniT2WStageState &    state,
+                                    const std::vector<int32_t> & window,
+                                    bool                         is_last_window,
+                                    double &                     inference_time_ms,
+                                    double &                     audio_duration) {
     return omni_process_python_t2w_tokens(ctx_omni, window, is_last_window, omni_t2w_next_wav_path(state),
                                           inference_time_ms, audio_duration);
 }
 
-static bool omni_t2w_process_cpp_window(struct omni_context *        ctx_omni,
-                                        const OmniT2WStageState &    state,
-                                        const std::vector<int32_t> & window,
-                                        bool                         is_last_window,
-                                        double &                     inference_time_ms,
-                                        double &                     audio_duration) {
+bool omni_t2w_process_cpp_window(struct omni_context *        ctx_omni,
+                                 const OmniT2WStageState &    state,
+                                 const std::vector<int32_t> & window,
+                                 bool                         is_last_window,
+                                 double &                     inference_time_ms,
+                                 double &                     audio_duration) {
     if (ctx_omni == nullptr || !ctx_omni->token2wav_session) {
         return false;
     }
@@ -409,7 +405,7 @@ static bool omni_t2w_process_cpp_window(struct omni_context *        ctx_omni,
     return true;
 }
 
-static void t2w_thread_func_python(struct omni_context * ctx_omni, struct common_params * params) {
+void t2w_thread_func_python(struct omni_context * ctx_omni, struct common_params * params) {
     (void) params;
     print_with_timestamp("T2W thread (Python) started\n");
     fflush(stdout);
@@ -440,7 +436,7 @@ static void t2w_thread_func_python(struct omni_context * ctx_omni, struct common
     fflush(stdout);
 }
 
-static void t2w_thread_func_cpp(struct omni_context * ctx_omni, struct common_params * params) {
+void t2w_thread_func_cpp(struct omni_context * ctx_omni, struct common_params * params) {
     (void) params;
     print_with_timestamp("T2W thread (C++) started\n");
     fflush(stdout);

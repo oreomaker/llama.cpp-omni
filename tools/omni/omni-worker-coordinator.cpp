@@ -1,6 +1,5 @@
 #include "omni-worker-coordinator.h"
 
-#include "omni-impl.h"
 #include "omni-runtime-messages.h"
 #include "omni.h"
 
@@ -12,7 +11,7 @@ void omni_clear_tts_queue(struct omni_context * ctx_omni, const char * log_reaso
     }
 
     std::lock_guard<std::mutex> tts_lock(ctx_omni->tts_thread_info->mtx);
-    auto & tts_queue = ctx_omni->tts_thread_info->queue;
+    auto &                      tts_queue = ctx_omni->tts_thread_info->queue;
     while (!tts_queue.empty()) {
         LLMOut * old_out = tts_queue.front();
         tts_queue.pop();
@@ -24,7 +23,9 @@ void omni_clear_tts_queue(struct omni_context * ctx_omni, const char * log_reaso
     }
 }
 
-static void omni_start_tts_worker_if_needed(struct omni_context * ctx_omni, const OmniWorkerThreadFns & worker_fns, const char * prefix) {
+static void omni_start_tts_worker_if_needed(struct omni_context *       ctx_omni,
+                                            const OmniWorkerThreadFns & worker_fns,
+                                            const char *                prefix) {
     if (!ctx_omni->use_tts || ctx_omni->tts_thread.joinable()) {
         return;
     }
@@ -39,13 +40,15 @@ static void omni_start_tts_worker_if_needed(struct omni_context * ctx_omni, cons
     }
 }
 
-static void omni_start_t2w_worker_if_needed(struct omni_context * ctx_omni, const OmniWorkerThreadFns & worker_fns, const char * prefix) {
+static void omni_start_t2w_worker_if_needed(struct omni_context *       ctx_omni,
+                                            const OmniWorkerThreadFns & worker_fns,
+                                            const char *                prefix) {
     if (!ctx_omni->use_tts || ctx_omni->t2w_thread_info == nullptr || ctx_omni->t2w_thread.joinable()) {
         return;
     }
 
     ctx_omni->workers.t2w_thread_running = true;
-    ctx_omni->t2w_thread = std::thread(worker_fns.t2w, ctx_omni, ctx_omni->params);
+    ctx_omni->t2w_thread                 = std::thread(worker_fns.t2w, ctx_omni, ctx_omni->params);
     print_with_timestamp("%screate t2w thread%s\n", prefix, prefix[0] == '\0' ? " success" : "");
 }
 
@@ -57,7 +60,7 @@ void omni_ensure_prefill_workers_started(struct omni_context * ctx_omni, const O
     print_with_timestamp("create llm & tts thread\n");
     if (!ctx_omni->llm_thread.joinable()) {
         ctx_omni->workers.llm_thread_running = true;
-        ctx_omni->llm_thread = std::thread(worker_fns.llm, ctx_omni, ctx_omni->params);
+        ctx_omni->llm_thread                 = std::thread(worker_fns.llm, ctx_omni, ctx_omni->params);
         print_with_timestamp("create llm thread success\n");
     }
 

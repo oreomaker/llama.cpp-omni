@@ -7,12 +7,12 @@
 struct OmniWorkerState {
     std::condition_variable decode_cv;
 
-    std::mutex speek_mtx;
+    std::mutex              speek_mtx;
     std::condition_variable speek_cv;
 
-    std::atomic<bool> llm_thread_running{true};
-    std::atomic<bool> tts_thread_running{true};
-    std::atomic<bool> t2w_thread_running{true};
+    std::atomic<bool> llm_thread_running{ true };
+    std::atomic<bool> tts_thread_running{ true };
+    std::atomic<bool> t2w_thread_running{ true };
 
     std::mutex buffer_mutex;
 };
