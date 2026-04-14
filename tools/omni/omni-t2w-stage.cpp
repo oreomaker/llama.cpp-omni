@@ -202,8 +202,7 @@ bool omni_t2w_need_flush(const struct omni_context * ctx_omni, const OmniT2WBatc
 }
 
 std::string omni_t2w_next_wav_path(const OmniT2WStageState & state) {
-    return state.tts_wav_output_dir + "/wav_" + std::to_string(state.active_round_meta.wav_turn_base + state.wav_idx) +
-           ".wav";
+    return omni_tts_wav_file_path(state.tts_wav_output_dir, state.active_round_meta, state.wav_idx);
 }
 
 void omni_t2w_log_wav_result(struct omni_context *       ctx_omni,
@@ -224,10 +223,10 @@ void omni_t2w_log_wav_result(struct omni_context *       ctx_omni,
         print_with_timestamp("🎉 首响时间 (First Audio Response): %lldms\n", (long long) elapsed_ms);
     }
 
-    const float rtf = (float) (inference_time_ms / 1000.0) / (float) audio_duration;
-    print_with_timestamp("%s: wav_%d.wav | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n", hooks.log_prefix,
-                         state.active_round_meta.wav_turn_base + state.wav_idx, audio_duration, inference_time_ms, rtf,
-                         (long long) elapsed_ms);
+    const float       rtf      = (float) (inference_time_ms / 1000.0) / (float) audio_duration;
+    const std::string wav_name = omni_tts_wav_file_name(state.active_round_meta, state.wav_idx);
+    print_with_timestamp("%s: %s | %.2fs audio | %.1fms inference | RTF=%.2f | t=%lldms\n", hooks.log_prefix,
+                         wav_name.c_str(), audio_duration, inference_time_ms, rtf, (long long) elapsed_ms);
 }
 
 void omni_t2w_slide_token_buffer(struct omni_context *  ctx_omni,
@@ -338,12 +337,13 @@ void omni_t2w_run_backend(struct omni_context * ctx_omni, const OmniT2WBackendHo
 
             if (is_last_window) {
                 if (batch.is_final) {
-                    const int last_wav_idx =
-                        state.wav_idx > 0 ? state.active_round_meta.wav_turn_base + state.wav_idx - 1 : 0;
-                    if (omni_write_generation_done_flag(state.tts_wav_output_dir, last_wav_idx) &&
+                    const std::string last_wav_name =
+                        state.wav_idx > 0 ? omni_tts_wav_file_name(state.active_round_meta, state.wav_idx - 1) : "";
+                    if (omni_write_generation_done_flag(state.tts_wav_output_dir, last_wav_name) &&
                         hooks.log_done_flag) {
-                        print_with_timestamp("%s: 写入结束标记 %s/generation_done.flag (last_wav=%d)\n",
-                                             hooks.log_prefix, state.tts_wav_output_dir.c_str(), last_wav_idx);
+                        print_with_timestamp("%s: 写入结束标记 %s/generation_done.flag (last_wav=%s)\n",
+                                             hooks.log_prefix, state.tts_wav_output_dir.c_str(),
+                                             last_wav_name.empty() ? "<none>" : last_wav_name.c_str());
                     }
                     omni_t2w_reset_local_state(state);
                     if (hooks.on_final_flush) {
@@ -422,7 +422,10 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, struct common_params
     hooks.on_empty_final = [](struct omni_context * ctx, OmniT2WStageState &) {
         omni_reset_python_t2w_cache(ctx);
     };
-    hooks.on_final_flush = [](struct omni_context * ctx, OmniT2WStageState &) {
+    hooks.on_final_flush = [](struct omni_context * ctx, OmniT2WStageState & state) {
+        if (!state.tts_wav_output_dir.empty()) {
+            omni_merge_wav_files(state.tts_wav_output_dir, 0);
+        }
         omni_reset_python_t2w_cache(ctx);
     };
     hooks.is_ready = [](struct omni_context * ctx) {
@@ -447,6 +450,11 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, struct common_params * 
     hooks.reset_buffer_on_round_change     = true;
     hooks.note_duplex_timing               = true;
     hooks.log_done_flag                    = true;
+    hooks.on_final_flush                   = [](struct omni_context *, OmniT2WStageState & state) {
+        if (!state.tts_wav_output_dir.empty()) {
+            omni_merge_wav_files(state.tts_wav_output_dir, 0);
+        }
+    };
     hooks.is_ready                         = [](struct omni_context * ctx) {
         return ctx != nullptr && ctx->token2wav_initialized && ctx->token2wav_session != nullptr;
     };

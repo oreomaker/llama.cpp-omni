@@ -1543,6 +1543,10 @@ struct omni_context * omni_init(struct common_params * params,
     print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode,
                          base_output_dir.c_str());
 
+    if (!base_output_dir.empty()) {
+        omni_archive_output_dir(base_output_dir, base_output_dir + ".old");
+    }
+
     omni_init_prompt_templates(ctx_omni, duplex_mode);
 
     // ── 2. LLM runtime ───────────────────────────────────────────────────

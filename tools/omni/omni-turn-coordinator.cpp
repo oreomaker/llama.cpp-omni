@@ -167,6 +167,17 @@ OmniTurnCloseResult omni_turn_coordinator_close(struct omni_context * ctx_omni,
             ctx_omni->turn.current_turn_ended = true;
         } else {
             result.turn_closed = ctx_omni->turn.current_turn_ended;
+
+            // Duplex also needs a per-turn round advance so downstream WAV naming
+            // does not restart from wav_0 and overwrite the previous turn's audio.
+            if (ctx_omni->duplex_mode && result.turn_closed) {
+                result.active_round = omni_session_make_round_meta(ctx_omni, result.completed_round.round_idx + 1);
+                omni_session_set_round_meta(ctx_omni, result.active_round);
+
+                print_with_timestamp("TurnCoordinator: %s duplex turn round_idx=%d -> %d\n",
+                                     omni_turn_close_kind_name(kind), result.completed_round.round_idx,
+                                     result.active_round.round_idx);
+            }
         }
     }
 

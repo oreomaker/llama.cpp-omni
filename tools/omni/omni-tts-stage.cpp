@@ -2227,8 +2227,6 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
                 ctx_omni->warmup_done = true;
                 ctx_omni->workers.speek_cv.notify_all();
 
-                omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
-
                 if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
                     // LISTEN/CHUNK_EOS: 保持 TTS 状态
                     if (ctx_omni->t2w_thread_info) {
@@ -2314,7 +2312,6 @@ void omni_tts_worker_loop_duplex(struct omni_context * ctx_omni, struct common_p
                 turn_eos_flushed = true;
             }
 
-            omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
             llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
             if (mem) {
                 llama_memory_seq_rm(mem, 0, 0, -1);
@@ -2698,7 +2695,6 @@ void omni_tts_worker_loop_simplex(struct omni_context * ctx_omni, struct common_
                 ctx_omni->workers.speek_cv.notify_all();
                 print_with_timestamp("TTS: finished processing all chunks\n");
 
-                omni_merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
                 const OmniRoundMeta completed_round_meta = active_round_meta;
 
                 if (ctx_omni->t2w_thread_info) {

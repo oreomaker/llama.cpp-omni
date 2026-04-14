@@ -33,6 +33,28 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+using OmniWavOrderKey = std::pair<int, int>;
+
+bool omni_parse_turn_chunk_wav_name(const std::string & filename, OmniWavOrderKey * out_key) {
+    if (out_key == nullptr) {
+        return false;
+    }
+
+    int turn_idx  = -1;
+    int chunk_idx = -1;
+    int matched   = 0;
+    const int count =
+        std::sscanf(filename.c_str(), "turn_%d_chunk_%d.wav%n", &turn_idx, &chunk_idx, &matched);
+    if (count != 2 || matched != (int) filename.size() || turn_idx < 0 || chunk_idx < 0) {
+        return false;
+    }
+
+    *out_key = { turn_idx, chunk_idx };
+    return true;
+}
+}  // namespace
+
 bool cross_platform_mkdir_p(const std::string & path) {
     if (path.empty()) {
         return false;
@@ -159,7 +181,18 @@ bool omni_ensure_round_tts_wav_output_dir(
     return omni_ensure_directory(dir);
 }
 
-bool omni_write_generation_done_flag(const std::string & output_dir, int last_wav_idx) {
+std::string omni_tts_wav_file_name(const OmniRoundMeta & round_meta, int chunk_idx) {
+    char wav_name[64];
+    std::snprintf(wav_name, sizeof(wav_name), "turn_%04d_chunk_%04d.wav", std::max(0, round_meta.round_idx),
+                  std::max(0, chunk_idx));
+    return std::string(wav_name);
+}
+
+std::string omni_tts_wav_file_path(const std::string & output_dir, const OmniRoundMeta & round_meta, int chunk_idx) {
+    return output_dir + "/" + omni_tts_wav_file_name(round_meta, chunk_idx);
+}
+
+bool omni_write_generation_done_flag(const std::string & output_dir, const std::string & last_wav_name) {
     const std::string done_flag_path = output_dir + "/generation_done.flag";
     FILE * flag_file = fopen(done_flag_path.c_str(), "w");
     if (flag_file == nullptr) {
@@ -167,7 +200,7 @@ bool omni_write_generation_done_flag(const std::string & output_dir, int last_wa
         return false;
     }
 
-    fprintf(flag_file, "%d\n", last_wav_idx);
+    fprintf(flag_file, "%s\n", last_wav_name.c_str());
     fclose(flag_file);
     return true;
 }
@@ -332,10 +365,11 @@ void omni_archive_output_dir(const std::string & base_output_dir, const std::str
 }
 
 void omni_merge_wav_files(const std::string & output_dir, int num_chunks) {
+    (void) num_chunks;
     const std::string merged_file = output_dir + "/tts_output_merged.wav";
-    std::vector<std::pair<int, std::string>> indexed_chunk_files;
+    std::vector<std::pair<OmniWavOrderKey, std::string>> indexed_chunk_files;
 
-    // 当前运行链路实际由 T2W 生成 wav_*.wav，这里按数字后缀排序收集。
+    // 只扫描新的 turn-chunk 命名格式，避免再依赖隐式数字编码。
     try {
         if (fs::exists(output_dir) && fs::is_directory(output_dir)) {
             for (const auto & entry : fs::directory_iterator(output_dir)) {
@@ -343,21 +377,9 @@ void omni_merge_wav_files(const std::string & output_dir, int num_chunks) {
                     continue;
                 }
 
-                const std::string filename = entry.path().filename().string();
-                if (filename.rfind("wav_", 0) != 0 || entry.path().extension() != ".wav") {
-                    continue;
-                }
-
-                const std::string stem = entry.path().stem().string();
-                const std::string index_str = stem.substr(4);
-                if (index_str.empty()) {
-                    continue;
-                }
-
-                const bool is_numeric = std::all_of(index_str.begin(), index_str.end(), [](unsigned char ch) {
-                    return std::isdigit(ch) != 0;
-                });
-                if (!is_numeric) {
+                OmniWavOrderKey     order_key;
+                const std::string   filename = entry.path().filename().string();
+                if (!omni_parse_turn_chunk_wav_name(filename, &order_key)) {
                     continue;
                 }
 
@@ -367,22 +389,11 @@ void omni_merge_wav_files(const std::string & output_dir, int num_chunks) {
                     continue;
                 }
 
-                indexed_chunk_files.emplace_back(std::stoi(index_str), entry.path().string());
+                indexed_chunk_files.emplace_back(order_key, entry.path().string());
             }
         }
     } catch (const std::exception & e) {
         LOG_WRN("TTS: failed to scan wav files in %s: %s\n", output_dir.c_str(), e.what());
-    }
-
-    // 兼容旧目录格式：如果没有 wav_*.wav，再回退到 tts_output_chunk_*.wav。
-    if (indexed_chunk_files.empty() && num_chunks > 0) {
-        for (int i = 0; i < num_chunks; ++i) {
-            const std::string chunk_file = output_dir + "/tts_output_chunk_" + std::to_string(i) + ".wav";
-            struct stat st;
-            if (stat(chunk_file.c_str(), &st) == 0 && st.st_size > 0) {
-                indexed_chunk_files.emplace_back(i, chunk_file);
-            }
-        }
     }
 
     if (indexed_chunk_files.empty()) {
