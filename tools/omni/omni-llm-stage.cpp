@@ -348,6 +348,10 @@ void omni_llm_stage_dispatch_decode_chunk_to_tts(struct omni_context *          
     if (!ctx_omni->gate.speech_ready || ctx_omni->duplex_mode) {
         ctx_omni->tts_thread_info->queue.push(llm_out);
         ctx_omni->tts_thread_info->cv.notify_all();
+        // SLO: record LLM dispatch timestamp for cascade jitter analysis
+        if (ctx_omni->duplex_mode) {
+            duplex_timing_note_llm_dispatch(ctx_omni, llm_out->duplex_chunk_idx);
+        }
     } else {
         delete llm_out;
     }

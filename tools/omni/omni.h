@@ -1,3 +1,5 @@
+#pragma once
+
 #include "ggml.h"
 #include "llama.h"
 #include "omni-runtime-messages.h"
@@ -126,6 +128,7 @@ struct OmniTTSProjectorRuntime {
 };
 
 struct omni_duplex_chunk_timing {
+    // Per-stage durations (existing)
     double vit_embedding_ms       = -1.0;
     double audio_embedding_ms     = -1.0;
     double tts_audio_token_ms     = -1.0;
@@ -134,6 +137,23 @@ struct omni_duplex_chunk_timing {
     int    token2wav_window_count = 0;
     bool   tts_done               = false;
     bool   token2wav_done         = false;
+
+    // SLO metrics: absolute timestamps for cascade jitter analysis
+    std::chrono::high_resolution_clock::time_point chunk_start_time;
+    bool   chunk_start_recorded = false;
+
+    // TTFA and E2E latency (computed by T2W stage)
+    double ttfa_ms        = -1.0;
+    double e2e_latency_ms = -1.0;
+
+    // WAV output timestamps (relative to chunk_start_time, in ms)
+    std::vector<double> wav_timestamps_ms;
+
+    // LLM dispatch timestamps (relative to chunk_start_time, in ms)
+    std::vector<double> llm_dispatch_timestamps_ms;
+
+    // TTS dispatch timestamps (relative to chunk_start_time, in ms)
+    std::vector<double> tts_dispatch_timestamps_ms;
 };
 
 struct omni_context {
@@ -377,6 +397,12 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni);
 bool omni_get_duplex_chunk_timing(struct omni_context *             ctx_omni,
                                   int                               chunk_idx,
                                   struct omni_duplex_chunk_timing * out_timing);
+
+// SLO timestamp recording (called from pipeline stages)
+void duplex_timing_note_chunk_start(struct omni_context * ctx_omni, int chunk_idx);
+void duplex_timing_note_llm_dispatch(struct omni_context * ctx_omni, int chunk_idx);
+void duplex_timing_note_tts_dispatch(struct omni_context * ctx_omni, int chunk_idx);
+void duplex_timing_note_wav_output(struct omni_context * ctx_omni, int chunk_idx);
 
 // 停止所有线程（在 join 之前调用）
 void omni_stop_threads(struct omni_context * ctx_omni);

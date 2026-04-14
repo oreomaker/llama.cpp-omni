@@ -21,6 +21,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
+#include "omni-slo-metrics.h"
 #include "omni.h"
 
 #include <chrono>
@@ -212,6 +213,31 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
             })).c_str());
     }
     printf("\n========================================\n");
+}
+
+static void generate_slo_report(struct omni_context * ctx_omni, const std::vector<ChunkTimingReport> & chunk_reports) {
+    // Collect speak chunk indices (chunks where model decided to speak)
+    std::vector<int> speak_chunk_indices;
+    for (const auto & report : chunk_reports) {
+        if (!report.ended_with_listen && report.chunk_idx >= 0) {
+            speak_chunk_indices.push_back(report.chunk_idx);
+        }
+    }
+
+    if (speak_chunk_indices.empty()) {
+        printf("\n[SLO] No speak turns — skipping SLO report.\n");
+        return;
+    }
+
+    // Copy timing data under lock
+    std::unordered_map<int, omni_duplex_chunk_timing> timings_copy;
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+        timings_copy = ctx_omni->duplex_chunk_timings;
+    }
+
+    SessionSLOReport slo_report = compute_session_slo_report(timings_copy, speak_chunk_indices);
+    print_slo_report(slo_report);
 }
 
 // ==================== 双工测试核心 ====================
@@ -517,7 +543,7 @@ int main(int argc, char ** argv) {
 
     // 关键: duplex_mode=true
     auto * ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                                /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                                /*tts_gpu_layers=*/-1, /*token2wav_device=*/"gpu",
                                 /*duplex_mode=*/true,
                                 /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
                                 /*base_output_dir=*/output_dir);
@@ -572,6 +598,7 @@ int main(int argc, char ** argv) {
             refresh_chunk_timing_report(ctx_omni, report);
         }
         print_chunk_timing_summary(chunk_reports, ctx_omni->use_tts);
+        generate_slo_report(ctx_omni, chunk_reports);
 
         llama_perf_context_print(ctx_omni->ctx_llama);
         omni_free(ctx_omni);
@@ -622,6 +649,7 @@ int main(int argc, char ** argv) {
             refresh_chunk_timing_report(ctx_omni, report);
         }
         print_chunk_timing_summary(chunk_reports, ctx_omni->use_tts);
+        generate_slo_report(ctx_omni, chunk_reports);
 
         llama_perf_context_print(ctx_omni->ctx_llama);
         omni_free(ctx_omni);

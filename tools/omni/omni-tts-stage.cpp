@@ -1857,6 +1857,7 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
                 ctx_omni->t2w_thread_info->queue.push(t2w_out);
             }
             ctx_omni->t2w_thread_info->cv.notify_one();
+            duplex_timing_note_tts_dispatch(ctx_omni, duplex_chunk_idx);
             stream_buffer.clear();
         }
 
@@ -1878,6 +1879,7 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
             ctx_omni->t2w_thread_info->queue.push(t2w_out);
         }
         ctx_omni->t2w_thread_info->cv.notify_one();
+        duplex_timing_note_tts_dispatch(ctx_omni, duplex_chunk_idx);
     }
 
     common_sampler_free(tts_sampler);

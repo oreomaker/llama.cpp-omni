@@ -34,6 +34,8 @@ add_library(omni
             omni-python-t2w.h
             omni-worker-coordinator.cpp
             omni-worker-coordinator.h
+            omni-slo-metrics.cpp
+            omni-slo-metrics.h
             audition.cpp
             audition.h
             vision.cpp

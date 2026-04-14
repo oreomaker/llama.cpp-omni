@@ -151,6 +151,67 @@ static void duplex_timing_note_t2w(struct omni_context * ctx_omni,
     }
 }
 
+// SLO timestamp recording functions
+
+void duplex_timing_note_chunk_start(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.chunk_start_time            = std::chrono::high_resolution_clock::now();
+    timing.chunk_start_recorded        = true;
+}
+
+void duplex_timing_note_llm_dispatch(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto it = ctx_omni->duplex_chunk_timings.find(chunk_idx);
+    if (it == ctx_omni->duplex_chunk_timings.end() || !it->second.chunk_start_recorded) {
+        return;
+    }
+    const double elapsed = timing_elapsed_ms(it->second.chunk_start_time,
+                                              std::chrono::high_resolution_clock::now());
+    it->second.llm_dispatch_timestamps_ms.push_back(elapsed);
+}
+
+void duplex_timing_note_tts_dispatch(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto it = ctx_omni->duplex_chunk_timings.find(chunk_idx);
+    if (it == ctx_omni->duplex_chunk_timings.end() || !it->second.chunk_start_recorded) {
+        return;
+    }
+    const double elapsed = timing_elapsed_ms(it->second.chunk_start_time,
+                                              std::chrono::high_resolution_clock::now());
+    it->second.tts_dispatch_timestamps_ms.push_back(elapsed);
+}
+
+void duplex_timing_note_wav_output(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto it = ctx_omni->duplex_chunk_timings.find(chunk_idx);
+    if (it == ctx_omni->duplex_chunk_timings.end() || !it->second.chunk_start_recorded) {
+        return;
+    }
+    const double elapsed = timing_elapsed_ms(it->second.chunk_start_time,
+                                              std::chrono::high_resolution_clock::now());
+    it->second.wav_timestamps_ms.push_back(elapsed);
+
+    // TTFA: first WAV timestamp for this chunk
+    if (it->second.ttfa_ms < 0.0) {
+        it->second.ttfa_ms = elapsed;
+    }
+    // E2E: always update to latest (last WAV will be the final value)
+    it->second.e2e_latency_ms = elapsed;
+}
+
 //
 // omni mtmd embed
 //
@@ -2127,6 +2188,7 @@ bool stream_prefill(struct omni_context * ctx_omni,
                     int                   max_slice_nums) {
     if (ctx_omni->duplex_mode) {
         duplex_timing_set_active_chunk(ctx_omni, index);
+        duplex_timing_note_chunk_start(ctx_omni, index);
     }
 
     const OmniPrefillSetup     setup   = omni_turn_coordinator_prepare_prefill(ctx_omni, index);

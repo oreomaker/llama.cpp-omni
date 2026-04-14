@@ -327,6 +327,10 @@ void omni_t2w_run_backend(struct omni_context * ctx_omni, const OmniT2WBackendHo
                 t2w_window_count++;
                 if (audio_duration > 0.0) {
                     omni_t2w_log_wav_result(ctx_omni, hooks, state, inference_time_ms, audio_duration);
+                    // SLO: record WAV output timestamp for cadence analysis
+                    if (hooks.note_duplex_timing) {
+                        duplex_timing_note_wav_output(ctx_omni, batch.duplex_chunk_idx);
+                    }
                     state.wav_idx++;
                 }
             } else {
