@@ -2,7 +2,6 @@
 
 #include "audition.h"
 #include "common/common.h"
-#include "common/sampling.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -29,7 +28,6 @@
 #include "stb/stb_image.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -37,7 +35,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -787,6 +784,8 @@ std::vector<float> projector_forward(projector_model & model, const float * inpu
 
 // Load TTS weights from GGUF file
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
+    OmniTTSAuxWeights & tts_aux = ctx_omni->tts_aux;
+
     // Initialize GGUF context
     struct ggml_context *   ctx_meta = NULL;
     struct gguf_init_params params   = {
@@ -833,9 +832,9 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             }
 
             // Allocate memory and copy data
-            size_t emb_code_size      = dim0 * dim1 * sizeof(float);
-            ctx_omni->emb_code_weight = (float *) malloc(emb_code_size);
-            if (!ctx_omni->emb_code_weight) {
+            size_t emb_code_size    = dim0 * dim1 * sizeof(float);
+            tts_aux.emb_code_weight = (float *) malloc(emb_code_size);
+            if (!tts_aux.emb_code_weight) {
                 LOG_ERR("TTS: Failed to allocate memory for emb_code.0.weight\n");
                 ggml_free(ctx_meta);
                 gguf_free(ctx_gguf);
@@ -848,29 +847,29 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
 
             if (emb_code_type == GGML_TYPE_F32) {
                 // F32: direct copy
-                memcpy(ctx_omni->emb_code_weight, emb_code_tensor->data, emb_code_size);
+                memcpy(tts_aux.emb_code_weight, emb_code_tensor->data, emb_code_size);
             } else if (emb_code_type == GGML_TYPE_F16) {
                 // F16: convert to F32
                 const ggml_fp16_t * src_f16 = (const ggml_fp16_t *) emb_code_tensor->data;
                 for (int64_t i = 0; i < emb_code_elements; ++i) {
-                    ctx_omni->emb_code_weight[i] = ggml_fp16_to_fp32(src_f16[i]);
+                    tts_aux.emb_code_weight[i] = ggml_fp16_to_fp32(src_f16[i]);
                 }
             } else {
                 LOG_ERR("TTS: emb_code.0.weight has unsupported type: %d\n", emb_code_type);
-                free(ctx_omni->emb_code_weight);
-                ctx_omni->emb_code_weight = nullptr;
+                free(tts_aux.emb_code_weight);
+                tts_aux.emb_code_weight = nullptr;
                 ggml_free(ctx_meta);
                 gguf_free(ctx_gguf);
                 return false;
             }
 
-            ctx_omni->emb_code_vocab_size           = num_audio_tokens;  // 6562
-            ctx_omni->emb_code_hidden_size          = hidden_size;       // 768
+            tts_aux.emb_code_vocab_size           = num_audio_tokens;  // 6562
+            tts_aux.emb_code_hidden_size          = hidden_size;       // 768
             // NOTE: GGUF data is stored in row-major order, matching NumPy/PyTorch
             // Even when metadata shape is [768, 6562], the actual data layout is (6562, 768) row-major
             // So we should access as: weight[token_idx * hidden_size + j]
             // This means: emb_code_stored_as_transposed should be FALSE
-            ctx_omni->emb_code_stored_as_transposed = false;  // Data is always (vocab_size, hidden_size) in memory
+            tts_aux.emb_code_stored_as_transposed = false;  // Data is always (vocab_size, hidden_size) in memory
         } else {
             LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", emb_code_name);
             ggml_free(ctx_meta);
@@ -932,9 +931,9 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             }
 
             // Allocate memory for the weight
-            size_t emb_text_size      = vocab_size * hidden_size * sizeof(float);
-            ctx_omni->emb_text_weight = (float *) malloc(emb_text_size);
-            if (!ctx_omni->emb_text_weight) {
+            size_t emb_text_size    = vocab_size * hidden_size * sizeof(float);
+            tts_aux.emb_text_weight = (float *) malloc(emb_text_size);
+            if (!tts_aux.emb_text_weight) {
                 LOG_ERR("TTS: Failed to allocate memory for emb_text.weight\n");
                 ggml_free(ctx_meta);
                 gguf_free(ctx_gguf);
@@ -947,24 +946,24 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
 
             if (emb_text_type == GGML_TYPE_F32) {
                 // F32: direct copy
-                memcpy(ctx_omni->emb_text_weight, emb_text_tensor->data, emb_text_size);
+                memcpy(tts_aux.emb_text_weight, emb_text_tensor->data, emb_text_size);
             } else if (emb_text_type == GGML_TYPE_F16) {
                 // F16: convert to F32
                 const ggml_fp16_t * src_f16 = (const ggml_fp16_t *) emb_text_tensor->data;
                 for (int64_t i = 0; i < emb_text_elements; ++i) {
-                    ctx_omni->emb_text_weight[i] = ggml_fp16_to_fp32(src_f16[i]);
+                    tts_aux.emb_text_weight[i] = ggml_fp16_to_fp32(src_f16[i]);
                 }
             } else {
                 LOG_ERR("TTS: emb_text.weight has unsupported type: %d\n", emb_text_type);
-                free(ctx_omni->emb_text_weight);
-                ctx_omni->emb_text_weight = nullptr;
+                free(tts_aux.emb_text_weight);
+                tts_aux.emb_text_weight = nullptr;
                 ggml_free(ctx_meta);
                 gguf_free(ctx_gguf);
                 return false;
             }
 
-            ctx_omni->emb_text_vocab_size  = vocab_size;   // 152064
-            ctx_omni->emb_text_hidden_size = hidden_size;  // 768
+            tts_aux.emb_text_vocab_size  = vocab_size;   // 152064
+            tts_aux.emb_text_hidden_size = hidden_size;  // 768
         } else {
             LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", emb_text_name);
             ggml_free(ctx_meta);
@@ -982,10 +981,9 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
     const char * projector_names[] = { "projector_semantic.linear1.weight", "projector_semantic.linear1.bias",
                                        "projector_semantic.linear2.weight", "projector_semantic.linear2.bias" };
 
-    float ** projector_ptrs[] = { &ctx_omni->projector_semantic_linear1_weight,
-                                  &ctx_omni->projector_semantic_linear1_bias,
-                                  &ctx_omni->projector_semantic_linear2_weight,
-                                  &ctx_omni->projector_semantic_linear2_bias };
+    float ** projector_ptrs[] = { &tts_aux.projector_semantic_linear1_weight, &tts_aux.projector_semantic_linear1_bias,
+                                  &tts_aux.projector_semantic_linear2_weight,
+                                  &tts_aux.projector_semantic_linear2_bias };
 
     // PyTorch nn.Linear(in_features, out_features) weight shape is (out_features, in_features)
     // GGUF may store as (out_features, in_features) or (in_features, out_features)
@@ -1156,8 +1154,8 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
     }
 
     // Set projector dimensions
-    ctx_omni->projector_semantic_input_dim  = 4096;
-    ctx_omni->projector_semantic_output_dim = 768;
+    tts_aux.projector_semantic_input_dim  = 4096;
+    tts_aux.projector_semantic_output_dim = 768;
 
     // Load head_code.weight: (hidden_size=768, num_audio_tokens=6562)
     // Note: num_vq=1, so we only load head_code.0.weight
@@ -1177,14 +1175,14 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
             int64_t expected_num_audio_tokens = 6562;
 
             // Allocate memory for weight: (hidden_size, num_audio_tokens) = [768, 6562]
-            size_t head_code_size      = expected_hidden_size * expected_num_audio_tokens * sizeof(float);
-            ctx_omni->head_code_weight = (float *) malloc(head_code_size);
-            if (!ctx_omni->head_code_weight) {
+            size_t head_code_size    = expected_hidden_size * expected_num_audio_tokens * sizeof(float);
+            tts_aux.head_code_weight = (float *) malloc(head_code_size);
+            if (!tts_aux.head_code_weight) {
                 LOG_ERR("TTS: Failed to allocate memory for head_code.0.weight\n");
                 // Clean up already loaded weights
-                if (ctx_omni->emb_text_weight) {
-                    free(ctx_omni->emb_text_weight);
-                    ctx_omni->emb_text_weight = nullptr;
+                if (tts_aux.emb_text_weight) {
+                    free(tts_aux.emb_text_weight);
+                    tts_aux.emb_text_weight = nullptr;
                 }
                 for (int j = 0; j < 4; j++) {
                     if (*projector_ptrs[j]) {
@@ -1226,11 +1224,11 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                         dim0, dim1, expected_hidden_size, expected_num_audio_tokens, expected_num_audio_tokens,
                         expected_hidden_size);
                 // Clean up
-                free(ctx_omni->head_code_weight);
-                ctx_omni->head_code_weight = nullptr;
-                if (ctx_omni->emb_text_weight) {
-                    free(ctx_omni->emb_text_weight);
-                    ctx_omni->emb_text_weight = nullptr;
+                free(tts_aux.head_code_weight);
+                tts_aux.head_code_weight = nullptr;
+                if (tts_aux.emb_text_weight) {
+                    free(tts_aux.emb_text_weight);
+                    tts_aux.emb_text_weight = nullptr;
                 }
                 for (int j = 0; j < 4; j++) {
                     if (*projector_ptrs[j]) {
@@ -1257,7 +1255,7 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                 for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
                     for (int64_t j = 0; j < expected_hidden_size; ++j) {
                         // src: [j * 6562 + i], dst: [i * 768 + j]
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] =
+                        tts_aux.head_code_weight[i * expected_hidden_size + j] =
                             src_data[j * expected_num_audio_tokens + i];
                     }
                 }
@@ -1266,36 +1264,36 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
                 const ggml_fp16_t * src_f16 = (const ggml_fp16_t *) src_data;
                 for (int64_t i = 0; i < expected_num_audio_tokens; ++i) {
                     for (int64_t j = 0; j < expected_hidden_size; ++j) {
-                        ctx_omni->head_code_weight[i * expected_hidden_size + j] =
+                        tts_aux.head_code_weight[i * expected_hidden_size + j] =
                             ggml_fp16_to_fp32(src_f16[j * expected_num_audio_tokens + i]);
                     }
                 }
             } else {
                 LOG_ERR("TTS: head_code.0.weight has unsupported type: %d\n", tensor_type);
-                free(ctx_omni->head_code_weight);
-                ctx_omni->head_code_weight = nullptr;
+                free(tts_aux.head_code_weight);
+                tts_aux.head_code_weight = nullptr;
                 ggml_free(ctx_meta);
                 gguf_free(ctx_gguf);
                 return false;
             }
 
-            ctx_omni->head_code_hidden_size      = expected_hidden_size;
-            ctx_omni->head_code_num_audio_tokens = expected_num_audio_tokens;
+            tts_aux.head_code_hidden_size      = expected_hidden_size;
+            tts_aux.head_code_num_audio_tokens = expected_num_audio_tokens;
 
             // 🔍 调试：验证加载的数据
             // Python weight[0, 0:5] = [0.01385498, -0.01647949, 0.0111084, -0.01367188, -0.01141357]
             // C++ head_code_weight[0..4] 应该和 Python 一致
             print_with_timestamp("TTS: head_code loaded, verifying first few values:\n");
-            print_with_timestamp("  head_code_weight[0] = %.8f (expect ~0.01385498)\n", ctx_omni->head_code_weight[0]);
-            print_with_timestamp("  head_code_weight[1] = %.8f (expect ~-0.01647949)\n", ctx_omni->head_code_weight[1]);
+            print_with_timestamp("  head_code_weight[0] = %.8f (expect ~0.01385498)\n", tts_aux.head_code_weight[0]);
+            print_with_timestamp("  head_code_weight[1] = %.8f (expect ~-0.01647949)\n", tts_aux.head_code_weight[1]);
             print_with_timestamp("  head_code_weight[768] = %.8f (this is weight[1, 0], expect ~0.04150391)\n",
-                                 ctx_omni->head_code_weight[768]);
+                                 tts_aux.head_code_weight[768]);
         } else {
             LOG_ERR("TTS: Failed to get tensor %s from GGUF context\n", head_code_name);
             // Clean up
-            if (ctx_omni->emb_text_weight) {
-                free(ctx_omni->emb_text_weight);
-                ctx_omni->emb_text_weight = nullptr;
+            if (tts_aux.emb_text_weight) {
+                free(tts_aux.emb_text_weight);
+                tts_aux.emb_text_weight = nullptr;
             }
             for (int j = 0; j < 4; j++) {
                 if (*projector_ptrs[j]) {
@@ -1310,9 +1308,9 @@ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts
     } else {
         LOG_ERR("TTS: Tensor %s not found in GGUF file\n", head_code_name);
         // Clean up
-        if (ctx_omni->emb_text_weight) {
-            free(ctx_omni->emb_text_weight);
-            ctx_omni->emb_text_weight = nullptr;
+        if (tts_aux.emb_text_weight) {
+            free(tts_aux.emb_text_weight);
+            tts_aux.emb_text_weight = nullptr;
         }
         for (int j = 0; j < 4; j++) {
             if (*projector_ptrs[j]) {
@@ -1766,8 +1764,8 @@ static void eval_prefix(struct omni_context * ctx_omni, common_params * params) 
 static void eval_prefix_with_hidden(struct omni_context * ctx_omni, common_params * params, float *& hidden_states) {
     std::string prefix = "<|im_start|>user\n";
     std::cout << "prefix : " << prefix << '\n';
-    omni_llm_stage_eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch,
-                                           &ctx_omni->session.n_past, false, hidden_states);
+    omni_llm_stage_eval_string_with_hidden(ctx_omni, params, prefix.c_str(), params->n_batch, &ctx_omni->session.n_past,
+                                           false, hidden_states);
 }
 
 namespace {
@@ -1817,7 +1815,8 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
     }
 
     print_with_timestamp("stream_prefill: n_past = %d\n voice_clone_prompt = %s\n assistant_prompt = %s\n",
-                         ctx_omni->session.n_past, prompts.voice_clone_prompt.c_str(), prompts.assistant_prompt.c_str());
+                         ctx_omni->session.n_past, prompts.voice_clone_prompt.c_str(),
+                         prompts.assistant_prompt.c_str());
 
     const std::string bootstrap_ref_audio = omni_get_bootstrap_ref_audio_path(ctx_omni, aud_fname);
     if (!ctx_omni->duplex_mode || bootstrap_ref_audio != aud_fname) {
@@ -1841,8 +1840,8 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
         print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
     }
 
-    omni_llm_stage_eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(),
-                               ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
+    omni_llm_stage_eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(), ctx_omni->params->n_batch,
+                               &ctx_omni->session.n_past, false);
 
     ctx_omni->session.prompt.system_prompt_initialized = true;
     ctx_omni->session.prompt.n_keep                    = ctx_omni->session.n_past;
@@ -2170,7 +2169,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         return false;
     }
 
-    const OmniLlmStageDecodeRequest request = { std::move(debug_dir), round_idx };
+    const OmniLlmStageDecodeRequest request    = { std::move(debug_dir), round_idx };
     const OmniWorkerThreadFns       worker_fns = {
         omni_llm_stage_worker_loop,
         omni_tts_worker_loop_simplex,
@@ -2198,8 +2197,9 @@ bool stop_speek(struct omni_context * ctx_omni) {
 
 bool clean_kvcache(struct omni_context * ctx_omni) {
     if (ctx_omni->clean_kvcache) {
-        print_with_timestamp("🧹 clean_kvcache: 清理 KV cache, 删除范围=[%d, %d), n_keep=%d\n", ctx_omni->session.prompt.n_keep,
-                             ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep);
+        print_with_timestamp("🧹 clean_kvcache: 清理 KV cache, 删除范围=[%d, %d), n_keep=%d\n",
+                             ctx_omni->session.prompt.n_keep, ctx_omni->session.n_past,
+                             ctx_omni->session.prompt.n_keep);
 
         // 获取 memory 对象并清理 KV cache
         llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
@@ -2216,7 +2216,7 @@ bool clean_kvcache(struct omni_context * ctx_omni) {
         }
 
         // 重置 n_past 到 n_keep
-        int old_n_past   = ctx_omni->session.n_past;
+        int old_n_past           = ctx_omni->session.n_past;
         ctx_omni->session.n_past = ctx_omni->session.prompt.n_keep;
         print_with_timestamp("🧹 clean_kvcache: n_past 从 %d 重置到 %d\n", old_n_past, ctx_omni->session.n_past);
 

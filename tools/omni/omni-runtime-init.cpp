@@ -188,7 +188,7 @@ bool omni_init_tts_runtime(struct omni_context *  ctx_omni,
 
     std::string projector_path = tts_bin_dir + "/MiniCPM-o-4_5-projector-F16.gguf";
     print_with_timestamp("Projector: loading from %s\n", projector_path.c_str());
-    if (projector_init(ctx_omni->projector, projector_path, true)) {
+    if (projector_init(ctx_omni->tts_projector.projector, projector_path, true)) {
         print_with_timestamp("Projector: loaded successfully\n");
     } else {
         print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
@@ -463,6 +463,53 @@ void omni_shutdown_worker_threads(struct omni_context * ctx_omni) {
 
 // ── Release helpers ───────────────────────────────────────────────────────
 
+static void omni_release_tts_aux_weights(OmniTTSAuxWeights & tts_aux) {
+    if (tts_aux.emb_code_weight) {
+        free(tts_aux.emb_code_weight);
+        tts_aux.emb_code_weight = nullptr;
+    }
+    if (tts_aux.emb_text_weight) {
+        free(tts_aux.emb_text_weight);
+        tts_aux.emb_text_weight = nullptr;
+    }
+    if (tts_aux.projector_semantic_linear1_weight) {
+        free(tts_aux.projector_semantic_linear1_weight);
+        tts_aux.projector_semantic_linear1_weight = nullptr;
+    }
+    if (tts_aux.projector_semantic_linear1_bias) {
+        free(tts_aux.projector_semantic_linear1_bias);
+        tts_aux.projector_semantic_linear1_bias = nullptr;
+    }
+    if (tts_aux.projector_semantic_linear2_weight) {
+        free(tts_aux.projector_semantic_linear2_weight);
+        tts_aux.projector_semantic_linear2_weight = nullptr;
+    }
+    if (tts_aux.projector_semantic_linear2_bias) {
+        free(tts_aux.projector_semantic_linear2_bias);
+        tts_aux.projector_semantic_linear2_bias = nullptr;
+    }
+    if (tts_aux.head_code_weight) {
+        free(tts_aux.head_code_weight);
+        tts_aux.head_code_weight = nullptr;
+    }
+
+    tts_aux.emb_code_vocab_size           = 0;
+    tts_aux.emb_code_hidden_size          = 0;
+    tts_aux.emb_code_stored_as_transposed = false;
+    tts_aux.emb_text_vocab_size           = 0;
+    tts_aux.emb_text_hidden_size          = 0;
+    tts_aux.projector_semantic_input_dim  = 0;
+    tts_aux.projector_semantic_output_dim = 0;
+    tts_aux.head_code_hidden_size         = 0;
+    tts_aux.head_code_num_audio_tokens    = 0;
+}
+
+static void omni_release_tts_projector_runtime(OmniTTSProjectorRuntime & tts_projector) {
+    if (tts_projector.projector.initialized) {
+        projector_free(tts_projector.projector);
+    }
+}
+
 void omni_release_audio_vision_runtime(struct omni_context * ctx_omni) {
     delete ctx_omni->ctx_vision;
     ctx_omni->ctx_vision = nullptr;
@@ -477,35 +524,7 @@ void omni_release_tts_runtime(struct omni_context * ctx_omni) {
     ctx_omni->model_tts = nullptr;
     common_sampler_free(ctx_omni->ctx_tts_sampler);
     ctx_omni->ctx_tts_sampler = nullptr;
-
-    if (ctx_omni->emb_code_weight) {
-        free(ctx_omni->emb_code_weight);
-        ctx_omni->emb_code_weight = nullptr;
-    }
-    if (ctx_omni->emb_text_weight) {
-        free(ctx_omni->emb_text_weight);
-        ctx_omni->emb_text_weight = nullptr;
-    }
-    if (ctx_omni->projector_semantic_linear1_weight) {
-        free(ctx_omni->projector_semantic_linear1_weight);
-        ctx_omni->projector_semantic_linear1_weight = nullptr;
-    }
-    if (ctx_omni->projector_semantic_linear1_bias) {
-        free(ctx_omni->projector_semantic_linear1_bias);
-        ctx_omni->projector_semantic_linear1_bias = nullptr;
-    }
-    if (ctx_omni->projector_semantic_linear2_weight) {
-        free(ctx_omni->projector_semantic_linear2_weight);
-        ctx_omni->projector_semantic_linear2_weight = nullptr;
-    }
-    if (ctx_omni->projector_semantic_linear2_bias) {
-        free(ctx_omni->projector_semantic_linear2_bias);
-        ctx_omni->projector_semantic_linear2_bias = nullptr;
-    }
-    if (ctx_omni->head_code_weight) {
-        free(ctx_omni->head_code_weight);
-        ctx_omni->head_code_weight = nullptr;
-    }
+    omni_release_tts_aux_weights(ctx_omni->tts_aux);
 
     if (ctx_omni->token2wav_session) {
         ctx_omni->token2wav_session.reset();
@@ -517,9 +536,7 @@ void omni_release_tts_runtime(struct omni_context * ctx_omni) {
         omni_stop_python_t2w_service(ctx_omni);
     }
 
-    if (ctx_omni->projector.initialized) {
-        projector_free(ctx_omni->projector);
-    }
+    omni_release_tts_projector_runtime(ctx_omni->tts_projector);
 }
 
 void omni_release_llm_runtime(struct omni_context * ctx_omni) {

@@ -18,13 +18,10 @@
  *     -ngl <n>              GPU 层数 (默认 99)
  */
 
-#include "arg.h"
+#include "common.h"
 #include "ggml.h"
 #include "llama.h"
-#include "log.h"
-#include "omni-impl.h"
 #include "omni.h"
-#include "sampling.h"
 
 #include <chrono>
 #include <cstdio>
@@ -519,11 +516,11 @@ int main(int argc, char ** argv) {
     printf("  Mode: DUPLEX\n");
 
     // 关键: duplex_mode=true
-    auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
-                              /*duplex_mode=*/true,
-                              /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
-                              /*base_output_dir=*/output_dir);
+    auto * ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
+                                /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                                /*duplex_mode=*/true,
+                                /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
+                                /*base_output_dir=*/output_dir);
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");
         return 1;

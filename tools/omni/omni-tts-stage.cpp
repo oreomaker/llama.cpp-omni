@@ -338,22 +338,24 @@ int omni_tts_nucleus_sampling_with_min_keep(const float *  logits,
 }
 
 bool omni_tts_emb_text(struct omni_context * ctx_omni, llama_token token_id, float * embedding_out, int tts_n_embd) {
-    if (!ctx_omni->emb_text_weight) {
+    OmniTTSAuxWeights & tts_aux = ctx_omni->tts_aux;
+
+    if (!tts_aux.emb_text_weight) {
         LOG_ERR("TTS: emb_text_weight not loaded\n");
         return false;
     }
 
-    if (token_id < 0 || token_id >= ctx_omni->emb_text_vocab_size) {
-        LOG_ERR("TTS: token_id %d out of range [0, %d)\n", token_id, ctx_omni->emb_text_vocab_size);
+    if (token_id < 0 || token_id >= tts_aux.emb_text_vocab_size) {
+        LOG_ERR("TTS: token_id %d out of range [0, %d)\n", token_id, tts_aux.emb_text_vocab_size);
         return false;
     }
 
-    if (tts_n_embd != ctx_omni->emb_text_hidden_size) {
-        LOG_ERR("TTS: tts_n_embd (%d) != emb_text_hidden_size (%d)\n", tts_n_embd, ctx_omni->emb_text_hidden_size);
+    if (tts_n_embd != tts_aux.emb_text_hidden_size) {
+        LOG_ERR("TTS: tts_n_embd (%d) != emb_text_hidden_size (%d)\n", tts_n_embd, tts_aux.emb_text_hidden_size);
         return false;
     }
 
-    const float * src = ctx_omni->emb_text_weight + token_id * tts_n_embd;
+    const float * src = tts_aux.emb_text_weight + token_id * tts_n_embd;
     memcpy(embedding_out, src, tts_n_embd * sizeof(float));
     return true;
 }
@@ -364,18 +366,22 @@ bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
                                  int                   llm_n_embd,
                                  float *               projected_hidden_states,
                                  int                   tts_n_embd) {
-    if (ctx_omni->projector.initialized) {
-        if (llm_n_embd != ctx_omni->projector.hparams.in_dim) {
-            LOG_ERR("TTS: llm_n_embd (%d) != projector in_dim (%d)\n", llm_n_embd, ctx_omni->projector.hparams.in_dim);
+    OmniTTSAuxWeights &       tts_aux       = ctx_omni->tts_aux;
+    OmniTTSProjectorRuntime & tts_projector = ctx_omni->tts_projector;
+
+    if (tts_projector.projector.initialized) {
+        if (llm_n_embd != tts_projector.projector.hparams.in_dim) {
+            LOG_ERR("TTS: llm_n_embd (%d) != projector in_dim (%d)\n", llm_n_embd,
+                    tts_projector.projector.hparams.in_dim);
             return false;
         }
-        if (tts_n_embd != ctx_omni->projector.hparams.out_dim) {
+        if (tts_n_embd != tts_projector.projector.hparams.out_dim) {
             LOG_ERR("TTS: tts_n_embd (%d) != projector out_dim (%d)\n", tts_n_embd,
-                    ctx_omni->projector.hparams.out_dim);
+                    tts_projector.projector.hparams.out_dim);
             return false;
         }
 
-        std::vector<float> result = projector_forward(ctx_omni->projector, llm_hidden_states, n_tokens);
+        std::vector<float> result = projector_forward(tts_projector.projector, llm_hidden_states, n_tokens);
         if (result.empty()) {
             LOG_ERR("TTS: projector_forward failed\n");
             return false;
@@ -385,26 +391,26 @@ bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
         return true;
     }
 
-    if (!ctx_omni->projector_semantic_linear1_weight || !ctx_omni->projector_semantic_linear1_bias ||
-        !ctx_omni->projector_semantic_linear2_weight || !ctx_omni->projector_semantic_linear2_bias) {
+    if (!tts_aux.projector_semantic_linear1_weight || !tts_aux.projector_semantic_linear1_bias ||
+        !tts_aux.projector_semantic_linear2_weight || !tts_aux.projector_semantic_linear2_bias) {
         LOG_ERR("TTS: projector_semantic weights not loaded (both ggml and legacy)\n");
         return false;
     }
 
-    if (llm_n_embd != ctx_omni->projector_semantic_input_dim) {
+    if (llm_n_embd != tts_aux.projector_semantic_input_dim) {
         LOG_ERR("TTS: llm_n_embd (%d) != projector_semantic_input_dim (%d)\n", llm_n_embd,
-                ctx_omni->projector_semantic_input_dim);
+                tts_aux.projector_semantic_input_dim);
         return false;
     }
 
-    if (tts_n_embd != ctx_omni->projector_semantic_output_dim) {
+    if (tts_n_embd != tts_aux.projector_semantic_output_dim) {
         LOG_ERR("TTS: tts_n_embd (%d) != projector_semantic_output_dim (%d)\n", tts_n_embd,
-                ctx_omni->projector_semantic_output_dim);
+                tts_aux.projector_semantic_output_dim);
         return false;
     }
 
-    const int input_dim  = ctx_omni->projector_semantic_input_dim;
-    const int output_dim = ctx_omni->projector_semantic_output_dim;
+    const int input_dim  = tts_aux.projector_semantic_input_dim;
+    const int output_dim = tts_aux.projector_semantic_output_dim;
 
     for (int t = 0; t < n_tokens; ++t) {
         const float *      hidden = llm_hidden_states + t * input_dim;
@@ -412,9 +418,9 @@ bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
         std::vector<float> temp(output_dim);
 
         for (int j = 0; j < output_dim; ++j) {
-            float sum = ctx_omni->projector_semantic_linear1_bias[j];
+            float sum = tts_aux.projector_semantic_linear1_bias[j];
             for (int i = 0; i < input_dim; ++i) {
-                sum += hidden[i] * ctx_omni->projector_semantic_linear1_weight[i * output_dim + j];
+                sum += hidden[i] * tts_aux.projector_semantic_linear1_weight[i * output_dim + j];
             }
             temp[j] = sum;
         }
@@ -424,9 +430,9 @@ bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
         }
 
         for (int j = 0; j < output_dim; ++j) {
-            float sum = ctx_omni->projector_semantic_linear2_bias[j];
+            float sum = tts_aux.projector_semantic_linear2_bias[j];
             for (int i = 0; i < output_dim; ++i) {
-                sum += temp[i] * ctx_omni->projector_semantic_linear2_weight[i * output_dim + j];
+                sum += temp[i] * tts_aux.projector_semantic_linear2_weight[i * output_dim + j];
             }
             output[j] = sum;
         }
@@ -593,8 +599,10 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
                                         const char *                     missing_weight_log,
                                         OmniTtsPreparedChunk &           prepared_chunk,
                                         OmniTtsComputationDebugData *    debug_data) {
+    OmniTTSAuxWeights & tts_aux = ctx_omni->tts_aux;
+
     prepared_chunk.tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
-    if (!ctx_omni->emb_text_weight || !ctx_omni->projector_semantic_linear1_weight) {
+    if (!tts_aux.emb_text_weight || !tts_aux.projector_semantic_linear1_weight) {
         print_with_timestamp("%s\n", missing_weight_log);
         return true;
     }
@@ -898,19 +906,20 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
         return 0;
     }
 
-    if (ctx_omni->head_code_weight == nullptr) {
+    if (ctx_omni->tts_aux.head_code_weight == nullptr) {
         LOG_ERR("TTS simplex: head_code weight not loaded\n");
         return 0;
     }
 
-    if (ctx_omni->head_code_hidden_size != 768 || ctx_omni->head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
+    if (ctx_omni->tts_aux.head_code_hidden_size != 768 ||
+        ctx_omni->tts_aux.head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
         LOG_ERR("TTS simplex: head_code dimensions mismatch\n");
         return 0;
     }
 
     std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
-    const float *      head_code_w = ctx_omni->head_code_weight;
-    const int          hidden_size = ctx_omni->head_code_hidden_size;
+    const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
+    const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
     for (int i = 0; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
         const float * row = head_code_w + i * hidden_size;
         float         sum = 0.0f;
@@ -995,14 +1004,14 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
         return id;
     }
 
-    if (ctx_omni->emb_code_weight != nullptr && selected_relative_idx >= 0 &&
-        selected_relative_idx < ctx_omni->emb_code_vocab_size) {
-        const float * emb_code_w           = ctx_omni->emb_code_weight;
-        const int     emb_code_hidden_size = ctx_omni->emb_code_hidden_size;
-        const int     emb_code_vocab_size  = ctx_omni->emb_code_vocab_size;
+    if (ctx_omni->tts_aux.emb_code_weight != nullptr && selected_relative_idx >= 0 &&
+        selected_relative_idx < ctx_omni->tts_aux.emb_code_vocab_size) {
+        const float * emb_code_w           = ctx_omni->tts_aux.emb_code_weight;
+        const int     emb_code_hidden_size = ctx_omni->tts_aux.emb_code_hidden_size;
+        const int     emb_code_vocab_size  = ctx_omni->tts_aux.emb_code_vocab_size;
 
         std::vector<float> audio_token_embedding(emb_code_hidden_size);
-        if (ctx_omni->emb_code_stored_as_transposed) {
+        if (ctx_omni->tts_aux.emb_code_stored_as_transposed) {
             for (int j = 0; j < emb_code_hidden_size; ++j) {
                 audio_token_embedding[j] = emb_code_w[j * emb_code_vocab_size + selected_relative_idx];
             }
@@ -1091,20 +1100,21 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         omni_tts_save_hidden_states_to_file(logits_debug_dir, hidden_state, hidden_size, token_index_in_chunk);
     }
 
-    if (ctx_omni->head_code_weight == nullptr) {
+    if (ctx_omni->tts_aux.head_code_weight == nullptr) {
         LOG_ERR("TTS: head_code weight not loaded\n");
         return 0;
     }
 
-    if (ctx_omni->head_code_hidden_size != 768 || ctx_omni->head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
+    if (ctx_omni->tts_aux.head_code_hidden_size != 768 ||
+        ctx_omni->tts_aux.head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
         LOG_ERR("TTS: head_code dimensions mismatch: expected (768, 6562), got (%d, %d)\n",
-                ctx_omni->head_code_hidden_size, ctx_omni->head_code_num_audio_tokens);
+                ctx_omni->tts_aux.head_code_hidden_size, ctx_omni->tts_aux.head_code_num_audio_tokens);
         return 0;
     }
 
     std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
-    const float *      head_code_w = ctx_omni->head_code_weight;
-    const int          hidden_size = ctx_omni->head_code_hidden_size;
+    const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
+    const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
     for (int i = 0; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
         const float * row = head_code_w + i * hidden_size;
         float         sum = 0.0f;
@@ -1210,14 +1220,14 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         return id;
     }
 
-    if (ctx_omni->emb_code_weight != nullptr && selected_relative_idx >= 0 &&
-        selected_relative_idx < ctx_omni->emb_code_vocab_size) {
-        const float * emb_code_w           = ctx_omni->emb_code_weight;
-        const int     emb_code_hidden_size = ctx_omni->emb_code_hidden_size;
-        const int     emb_code_vocab_size  = ctx_omni->emb_code_vocab_size;
+    if (ctx_omni->tts_aux.emb_code_weight != nullptr && selected_relative_idx >= 0 &&
+        selected_relative_idx < ctx_omni->tts_aux.emb_code_vocab_size) {
+        const float * emb_code_w           = ctx_omni->tts_aux.emb_code_weight;
+        const int     emb_code_hidden_size = ctx_omni->tts_aux.emb_code_hidden_size;
+        const int     emb_code_vocab_size  = ctx_omni->tts_aux.emb_code_vocab_size;
 
         std::vector<float> audio_token_embedding(emb_code_hidden_size);
-        if (ctx_omni->emb_code_stored_as_transposed) {
+        if (ctx_omni->tts_aux.emb_code_stored_as_transposed) {
             for (int j = 0; j < emb_code_hidden_size; ++j) {
                 audio_token_embedding[j] = emb_code_w[j * emb_code_vocab_size + selected_relative_idx];
             }
@@ -1372,7 +1382,7 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
         return false;
     }
 
-    if (!ctx_omni->head_code_weight || !ctx_omni->emb_code_weight) {
+    if (!ctx_omni->tts_aux.head_code_weight || !ctx_omni->tts_aux.emb_code_weight) {
         LOG_ERR("TTS Simplex: TTS weights not loaded\n");
         return false;
     }
@@ -1712,7 +1722,7 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
         return finish_tts_stage(false);
     }
 
-    if (!ctx_omni->head_code_weight || !ctx_omni->emb_code_weight) {
+    if (!ctx_omni->tts_aux.head_code_weight || !ctx_omni->tts_aux.emb_code_weight) {
         LOG_ERR("TTS Local: TTS weights not loaded (head_code or emb_code)\n");
         return finish_tts_stage(false);
     }

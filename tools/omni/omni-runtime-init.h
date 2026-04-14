@@ -19,7 +19,7 @@ bool omni_init_llm_runtime(struct omni_context * ctx_omni,
                             struct llama_model *   existing_model,
                             struct llama_context * existing_ctx);
 
-// Load TTS model + context + sampler + weights + projector.
+// Load TTS model + context + sampler + aux weights + projector runtime.
 // Only call when use_tts is true and params->tts_model is non-empty.
 bool omni_init_tts_runtime(struct omni_context *  ctx_omni,
                             struct common_params * params,
@@ -46,7 +46,7 @@ void omni_shutdown_worker_threads(struct omni_context * ctx_omni);
 // Free vision context (delete) and audition context.
 void omni_release_audio_vision_runtime(struct omni_context * ctx_omni);
 
-// Free TTS model/context/sampler/weights/projector/token2wav session.
+// Free TTS model/context/sampler/aux weights/projector runtime/token2wav session.
 // Only call when use_tts is true.
 void omni_release_tts_runtime(struct omni_context * ctx_omni);
 

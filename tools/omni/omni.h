@@ -97,6 +97,34 @@ struct projector_model {
     bool                       initialized = false;
 };
 
+struct OmniTTSAuxWeights {
+    // Auxiliary tensors extracted from the TTS GGUF for omni's custom TTS path.
+    float * emb_code_weight               = nullptr;
+    int     emb_code_vocab_size           = 0;
+    int     emb_code_hidden_size          = 0;
+    bool    emb_code_stored_as_transposed = false;
+
+    float * emb_text_weight      = nullptr;
+    int     emb_text_vocab_size  = 0;
+    int     emb_text_hidden_size = 0;
+
+    float * projector_semantic_linear1_weight = nullptr;
+    float * projector_semantic_linear1_bias   = nullptr;
+    float * projector_semantic_linear2_weight = nullptr;
+    float * projector_semantic_linear2_bias   = nullptr;
+    int     projector_semantic_input_dim      = 0;
+    int     projector_semantic_output_dim     = 0;
+
+    float * head_code_weight           = nullptr;
+    int     head_code_hidden_size      = 0;
+    int     head_code_num_audio_tokens = 0;
+};
+
+struct OmniTTSProjectorRuntime {
+    // Preferred ggml projector runtime; aux weights keep the legacy fallback tensors.
+    struct projector_model projector;
+};
+
 struct omni_duplex_chunk_timing {
     double vit_embedding_ms       = -1.0;
     double audio_embedding_ms     = -1.0;
@@ -209,35 +237,8 @@ struct omni_context {
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;
 
-    // TTS weights loaded from GGUF file
-    // emb_code: (num_audio_tokens=6562, hidden_size=768) - for converting audio token IDs to embeddings
-    float * emb_code_weight               = nullptr;
-    int     emb_code_vocab_size           = 0;      // num_audio_tokens = 6562
-    int     emb_code_hidden_size          = 0;      // hidden_size = 768
-    bool    emb_code_stored_as_transposed = false;  // true if stored as [hidden_size, num_audio_tokens] = [768, 6562]
-
-    // emb_text: (vocab_size=152064, hidden_size=768)
-    float * emb_text_weight      = nullptr;
-    int     emb_text_vocab_size  = 0;
-    int     emb_text_hidden_size = 0;
-
-    // projector_semantic: two-layer MLP (4096 -> 768 -> 768)
-    // Legacy float* weights (kept for backward compatibility)
-    float * projector_semantic_linear1_weight = nullptr;  // (4096, 768)
-    float * projector_semantic_linear1_bias   = nullptr;  // (768,)
-    float * projector_semantic_linear2_weight = nullptr;  // (768, 768)
-    float * projector_semantic_linear2_bias   = nullptr;  // (768,)
-    int     projector_semantic_input_dim      = 0;        // 4096
-    int     projector_semantic_output_dim     = 0;        // 768
-
-    // New ggml-based projector model (精度验证版本)
-    struct projector_model projector;
-
-    // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
-    // Note: num_vq=1, so we only need one head_code layer
-    float * head_code_weight           = nullptr;  // (768, 6562) - stored as (hidden_size, num_audio_tokens)
-    int     head_code_hidden_size      = 0;        // 768
-    int     head_code_num_audio_tokens = 0;        // 6562
+    OmniTTSAuxWeights       tts_aux;
+    OmniTTSProjectorRuntime tts_projector;
 
     // TTS condition embeddings (for first audio token re-forward)
     // Used to store the condition embeddings so we can re-forward them for the first audio token
