@@ -5,8 +5,6 @@
 #include <mutex>
 
 struct OmniWorkerState {
-    std::condition_variable decode_cv;
-
     std::mutex              speek_mtx;
     std::condition_variable speek_cv;
 

@@ -1865,6 +1865,11 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
             t2w_thread_func,
         };
         omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
+
+        if (ctx_omni->duplex_mode && ctx_omni->llm_thread_info != nullptr) {
+            ctx_omni->llm_thread_info->decode_requested.store(true);
+            ctx_omni->llm_thread_info->cv.notify_one();
+        }
     }
 
     return true;
@@ -2168,12 +2173,27 @@ static bool omni_can_decode(struct omni_context * ctx_omni) {
     return true;
 }
 
+static bool omni_pipeline_wait_decode_result(struct omni_context * ctx_omni) {
+    std::unique_lock<std::mutex> lock(ctx_omni->pipeline_result_mtx);
+    ctx_omni->pipeline_result_cv.wait(lock, [&] {
+        return !ctx_omni->pipeline_result_queue.empty() || !ctx_omni->workers.llm_thread_running;
+    });
+
+    if (ctx_omni->pipeline_result_queue.empty()) {
+        return false;
+    }
+
+    const PipelineDecodeResult result = ctx_omni->pipeline_result_queue.front();
+    ctx_omni->pipeline_result_queue.pop();
+    ctx_omni->turn.ended_with_listen.store(result.ended_with_listen);
+    return result.decode_ok;
+}
+
 bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
     if (!omni_can_decode(ctx_omni)) {
         return false;
     }
 
-    const OmniLlmStageDecodeRequest request    = { std::move(debug_dir), round_idx };
     const OmniWorkerThreadFns       worker_fns = {
         omni_llm_stage_worker_loop,
         omni_tts_worker_loop_simplex,
@@ -2181,7 +2201,28 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         t2w_thread_func,
     };
 
-    omni_turn_coordinator_prepare_decode(ctx_omni, request.round_idx, worker_fns);
+    if (ctx_omni->async) {
+        {
+            // The worker reads request metadata right before it starts decode.
+            std::lock_guard<std::mutex> lock(ctx_omni->pipeline_request_mtx);
+            ctx_omni->pipeline_debug_dir = std::move(debug_dir);
+            ctx_omni->pipeline_round_idx = round_idx;
+        }
+
+        omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
+
+        if (!ctx_omni->duplex_mode && ctx_omni->llm_thread_info != nullptr) {
+            // Simplex async needs an explicit "prefill is complete, decode now" signal.
+            ctx_omni->llm_thread_info->decode_requested.store(true);
+            ctx_omni->llm_thread_info->cv.notify_one();
+        }
+
+        return omni_pipeline_wait_decode_result(ctx_omni);
+    }
+
+    const OmniLlmStageDecodeRequest request = { std::move(debug_dir), round_idx };
+
+    omni_turn_coordinator_prepare_decode(ctx_omni, request.round_idx);
 
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");

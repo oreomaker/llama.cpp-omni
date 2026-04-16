@@ -50,13 +50,19 @@ struct omni_embeds {
     int                             end_flag = false;
 };
 
+struct PipelineDecodeResult {
+    // Worker-to-caller completion payload for one async decode cycle.
+    bool ended_with_listen = false;
+    bool decode_ok         = false;
+};
+
 struct LLMThreadInfo {
     int                                   MAX_QUEUE_SIZE;
     std::queue<omni_embeds *>             queue;
     std::mutex                            mtx;
     std::condition_variable               cv;
-    uint64_t                              prefill_flush_requested_seq = 0;
-    uint64_t                              prefill_flush_completed_seq = 0;
+    // Simplex sets this explicitly; duplex auto-promotes queued prefill to decode.
+    std::atomic<bool>                     decode_requested{ false };
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;
 
@@ -233,6 +239,15 @@ struct omni_context {
     std::mutex              text_mtx;
     std::condition_variable text_cv;
     std::deque<std::string> text_queue;
+
+    // Async caller stores the next decode request here before waking the LLM worker.
+    std::mutex                       pipeline_request_mtx;
+    std::string                      pipeline_debug_dir = "";
+    int                              pipeline_round_idx = -1;
+    // Async worker posts one result per completed decode cycle.
+    std::mutex                       pipeline_result_mtx;
+    std::condition_variable          pipeline_result_cv;
+    std::queue<PipelineDecodeResult> pipeline_result_queue;
 
     // llama inference mutex - 保护 ctx_llama 的推理操作
     std::mutex llama_mtx;

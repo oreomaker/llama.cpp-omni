@@ -54,8 +54,6 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                   struct common_params *     params,
                                   const struct omni_embeds & embeds);
 void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni);
-void omni_llm_stage_request_prefill_flush(struct omni_context * ctx_omni);
-void omni_llm_stage_wait_for_prefill_flush(struct omni_context * ctx_omni);
 void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params);
 void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni);
 bool omni_llm_stage_decode_run(struct omni_context *                ctx_omni,

@@ -25,9 +25,7 @@ struct OmniTurnCloseResult {
 };
 
 OmniPrefillSetup    omni_turn_coordinator_prepare_prefill(struct omni_context * ctx_omni, int index);
-void                omni_turn_coordinator_prepare_decode(struct omni_context *       ctx_omni,
-                                                         int                         round_idx,
-                                                         const OmniWorkerThreadFns & worker_fns);
+void                omni_turn_coordinator_prepare_decode(struct omni_context * ctx_omni, int round_idx);
 OmniTurnCloseResult omni_turn_coordinator_close(struct omni_context * ctx_omni,
                                                 OmniTurnCloseKind     kind,
                                                 const char *          reason = nullptr);

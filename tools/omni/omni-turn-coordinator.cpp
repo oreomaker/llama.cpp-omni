@@ -81,11 +81,12 @@ OmniPrefillSetup omni_turn_coordinator_prepare_prefill(struct omni_context * ctx
 }
 
 void omni_turn_coordinator_prepare_decode(struct omni_context *       ctx_omni,
-                                          int                         round_idx,
-                                          const OmniWorkerThreadFns & worker_fns) {
+                                          int                         round_idx) {
     if (ctx_omni == nullptr) {
         return;
     }
+
+    GGML_ASSERT(!ctx_omni->async);
 
     if (round_idx >= 0 && !ctx_omni->duplex_mode && ctx_omni->session.current_round.round_idx != round_idx) {
         print_with_timestamp("📍 [轮次同步] 调用方指定 round_idx=%d，当前 simplex_round_idx=%d，强制同步\n", round_idx,
@@ -116,13 +117,6 @@ void omni_turn_coordinator_prepare_decode(struct omni_context *       ctx_omni,
         ctx_omni->text_queue.clear();
         ctx_omni->gate.text_done = false;
         ctx_omni->gate.text_streaming = true;
-    }
-
-    if (ctx_omni->async) {
-        omni_ensure_decode_workers_started(ctx_omni, worker_fns);
-        omni_request_prefill(ctx_omni);
-        print_with_timestamp("wait prefill done\n");
-        omni_wait_for_prefill_completion(ctx_omni);
     }
 
     if (ctx_omni->use_tts) {

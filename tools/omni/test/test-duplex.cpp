@@ -29,7 +29,9 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -229,66 +231,105 @@ static void duplex_test_case(struct omni_context * ctx_omni,
     // async 模式：TTS 线程需要 async=true 才能正常工作
     // 已修复 stream_decode 中 need_speek 重复设置导致的 prefill_done 竞态条件
 
-    auto   total_t0         = std::chrono::high_resolution_clock::now();
-    int    speak_count      = 0;
-    int    listen_count     = 0;
-    double total_prefill_s  = 0;
-    double total_decode_s   = 0;
-    int    chunks_completed = 0;
+    struct PrefillRecord {
+        bool   has_image  = false;
+        double prefill_ms = -1.0;
+        bool   ready      = false;
+    };
 
-    for (int il = 0; il < cnt; ++il) {
-        if (g_is_interrupted) {
-            printf("\n[中断] 用户中断测试\n");
-            break;
+    auto                       total_t0 = std::chrono::high_resolution_clock::now();
+    std::mutex                 prefill_records_mtx;
+    std::vector<PrefillRecord> prefill_records(cnt);
+    std::atomic<int>           submitted_count{ 0 };
+    std::atomic<bool>          producer_done{ false };
+
+    // Producer simulates chunk arrival and overlaps encode with the worker-side decode pipeline.
+    std::thread producer([&] {
+        for (int il = 0; il < cnt; ++il) {
+            if (g_is_interrupted) {
+                printf("\n[中断] 用户中断测试\n");
+                break;
+            }
+
+            char idx_str[16];
+            snprintf(idx_str, sizeof(idx_str), "%04d", il);
+            std::string aud_fname = data_path_prefix + idx_str + ".wav";
+
+            std::string img_fname;
+            std::string img_candidate = data_path_prefix + idx_str + ".jpg";
+            if (file_exists(img_candidate)) {
+                img_fname = img_candidate;
+            }
+
+            if (!file_exists(aud_fname)) {
+                fprintf(stderr, "[错误] 音频文件不存在: %s\n", aud_fname.c_str());
+                break;
+            }
+
+            printf("\n--- Chunk %d/%d ---\n", il + 1, cnt);
+            if (!img_fname.empty()) {
+                printf("  音频+图片: %s\n", aud_fname.c_str());
+            } else {
+                printf("  音频: %s\n", aud_fname.c_str());
+            }
+
+            auto   t0         = std::chrono::high_resolution_clock::now();
+            bool   prefill_ok = stream_prefill(ctx_omni, aud_fname, img_fname, il);
+            auto   t1         = std::chrono::high_resolution_clock::now();
+            double prefill_dt = std::chrono::duration<double>(t1 - t0).count();
+
+            if (!prefill_ok) {
+                fprintf(stderr, "[错误] Chunk %d prefill 失败\n", il);
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(prefill_records_mtx);
+                prefill_records[il].has_image  = !img_fname.empty();
+                prefill_records[il].prefill_ms = prefill_dt * 1000.0;
+                prefill_records[il].ready      = true;
+            }
+            submitted_count.store(il + 1);
+
+            printf("  encode+submit: %.3f s\n", prefill_dt);
+
+            const double remaining_ms = 1000.0 - prefill_dt * 1000.0;
+            if (remaining_ms > 0.0 && il < cnt - 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(remaining_ms)));
+            }
         }
 
-        char idx_str[16];
-        snprintf(idx_str, sizeof(idx_str), "%04d", il);
-        std::string aud_fname = data_path_prefix + idx_str + ".wav";
+        producer_done.store(true);
+    });
 
-        std::string img_fname;
-        std::string img_candidate = data_path_prefix + idx_str + ".jpg";
-        if (file_exists(img_candidate)) {
-            img_fname = img_candidate;
+    int results_collected = 0;
+    while (results_collected < cnt) {
+        // Do not wait on stream_decode() until at least one chunk has been submitted.
+        while (results_collected >= submitted_count.load()) {
+            if (producer_done.load()) {
+                goto consumer_done;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-        if (!file_exists(aud_fname)) {
-            fprintf(stderr, "[错误] 音频文件不存在: %s\n", aud_fname.c_str());
-            break;
-        }
-
-        printf("\n--- Chunk %d/%d ---\n", il + 1, cnt);
-        if (!img_fname.empty()) {
-            printf("  音频+图片: %s\n", aud_fname.c_str());
-        } else {
-            printf("  音频: %s\n", aud_fname.c_str());
-        }
-
-        // Step 1: Prefill
-        auto   t0         = std::chrono::high_resolution_clock::now();
-        bool   prefill_ok = stream_prefill(ctx_omni, aud_fname, img_fname, il);
-        auto   t1         = std::chrono::high_resolution_clock::now();
-        double prefill_dt = std::chrono::duration<double>(t1 - t0).count();
-
-        if (!prefill_ok) {
-            fprintf(stderr, "[错误] Chunk %d prefill 失败\n", il);
-            break;
-        }
-
-        // Step 2: Decode
         auto   t2        = std::chrono::high_resolution_clock::now();
         bool   decode_ok = stream_decode(ctx_omni, "./");
         auto   t3        = std::chrono::high_resolution_clock::now();
         double decode_dt = std::chrono::duration<double>(t3 - t2).count();
 
         if (!decode_ok) {
-            fprintf(stderr, "[错误] Chunk %d decode 失败\n", il);
+            fprintf(stderr, "[错误] Chunk %d decode 失败\n", results_collected);
             break;
         }
 
-        bool ended_listen = ctx_omni->turn.ended_with_listen.load();
+        const int     chunk_idx    = results_collected;
+        const bool    ended_listen = ctx_omni->turn.ended_with_listen.load();
+        PrefillRecord record;
+        {
+            std::lock_guard<std::mutex> lock(prefill_records_mtx);
+            record = prefill_records[chunk_idx];
+        }
 
-        // stream_decode 返回后从 text_queue 读取生成的文本
         std::string generated_text;
         {
             std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
@@ -302,28 +343,19 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             }
         }
 
-        if (ended_listen) {
-            listen_count++;
-        } else {
-            speak_count++;
-        }
-
         ChunkTimingReport report;
-        report.chunk_idx         = il;
-        report.has_image         = !img_fname.empty();
+        report.chunk_idx         = chunk_idx;
+        report.has_image         = record.has_image;
         report.ended_with_listen = ended_listen;
         report.generated_text    = generated_text;
-        report.stream_prefill_ms = prefill_dt * 1000.0;
+        report.stream_prefill_ms = record.prefill_ms;
         report.stream_decode_ms  = decode_dt * 1000.0;
         refresh_chunk_timing_report(ctx_omni, report);
         chunk_reports.push_back(report);
+        results_collected++;
 
-        total_prefill_s += prefill_dt;
-        total_decode_s += decode_dt;
-        chunks_completed++;
-
-        printf("  prefill: %.3f s | decode: %.3f s | total: %.3f s | n_past: %d\n", prefill_dt, decode_dt,
-               prefill_dt + decode_dt, ctx_omni->session.n_past);
+        printf("  decode wait: %.3f s | total chunk latency: %.3f s | n_past: %d\n", decode_dt,
+               record.prefill_ms >= 0.0 ? decode_dt + record.prefill_ms / 1000.0 : decode_dt, ctx_omni->session.n_past);
         if (ended_listen) {
             printf("  决策: <|listen|>\n");
         } else {
@@ -342,8 +374,29 @@ static void duplex_test_case(struct omni_context * ctx_omni,
         printf("\n");
     }
 
-    auto   total_t1 = std::chrono::high_resolution_clock::now();
-    double total_dt = std::chrono::duration<double>(total_t1 - total_t0).count();
+consumer_done:
+    producer.join();
+
+    auto   total_t1        = std::chrono::high_resolution_clock::now();
+    double total_dt        = std::chrono::duration<double>(total_t1 - total_t0).count();
+    int    speak_count     = 0;
+    int    listen_count    = 0;
+    double total_prefill_s = 0.0;
+    double total_decode_s  = 0.0;
+    for (const auto & report : chunk_reports) {
+        if (report.ended_with_listen) {
+            listen_count++;
+        } else {
+            speak_count++;
+        }
+        if (report.stream_prefill_ms >= 0.0) {
+            total_prefill_s += report.stream_prefill_ms / 1000.0;
+        }
+        if (report.stream_decode_ms >= 0.0) {
+            total_decode_s += report.stream_decode_ms / 1000.0;
+        }
+    }
+    const int chunks_completed = static_cast<int>(chunk_reports.size());
 
     printf("\n========================================\n");
     printf("  双工测试完成\n");
@@ -517,7 +570,7 @@ int main(int argc, char ** argv) {
 
     // 关键: duplex_mode=true
     auto * ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                                /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                                /*tts_gpu_layers=*/-1, /*token2wav_device=*/"gpu",
                                 /*duplex_mode=*/true,
                                 /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
                                 /*base_output_dir=*/output_dir);

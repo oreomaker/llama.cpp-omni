@@ -68,23 +68,6 @@ void omni_ensure_prefill_workers_started(struct omni_context * ctx_omni, const O
     omni_start_t2w_worker_if_needed(ctx_omni, worker_fns, "");
 }
 
-void omni_ensure_decode_workers_started(struct omni_context * ctx_omni, const OmniWorkerThreadFns & worker_fns) {
-    if (ctx_omni == nullptr || !ctx_omni->async) {
-        return;
-    }
-
-    omni_start_tts_worker_if_needed(ctx_omni, worker_fns, "stream_decode: ");
-    omni_start_t2w_worker_if_needed(ctx_omni, worker_fns, "stream_decode: ");
-}
-
-void omni_request_prefill(struct omni_context * ctx_omni) {
-    omni_llm_stage_request_prefill_flush(ctx_omni);
-}
-
-void omni_wait_for_prefill_completion(struct omni_context * ctx_omni) {
-    omni_llm_stage_wait_for_prefill_flush(ctx_omni);
-}
-
 void omni_request_worker_shutdown(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr) {
         return;
@@ -104,5 +87,5 @@ void omni_request_worker_shutdown(struct omni_context * ctx_omni) {
         ctx_omni->t2w_thread_info->cv.notify_all();
     }
     ctx_omni->workers.speek_cv.notify_all();
-    ctx_omni->workers.decode_cv.notify_all();
+    ctx_omni->pipeline_result_cv.notify_all();
 }
