@@ -134,7 +134,9 @@ int omni_llm_stage_estimate_speculative_decode_tail(const struct omni_context * 
         remaining_decode_budget > 0 ? (remaining_decode_budget + kLegacyDecodeChunkStepSize - 1) /
                                           kLegacyDecodeChunkStepSize :
                                       1;
-    const int estimated_closure_tokens = ctx_omni->duplex_mode ? remaining_legacy_chunks + 2 : 0;
+    // Duplex decode appends one </unit> per remaining legacy chunk, plus one final <|chunk_eos|>
+    // on the chunk-limit path. The previous +2 estimate over-counted by one and prevented promote.
+    const int estimated_closure_tokens = ctx_omni->duplex_mode ? remaining_legacy_chunks + 1 : 0;
     return remaining_decode_budget + estimated_closure_tokens;
 }
 
