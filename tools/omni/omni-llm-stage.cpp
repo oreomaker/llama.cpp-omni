@@ -12,6 +12,7 @@
 #include "omni.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -28,6 +29,40 @@ struct LlmDecodeRuntime {
     bool llm_finish              = false;
     bool llm_first_token_logged  = false;
 };
+
+double omni_llm_stage_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
+                                        const std::chrono::high_resolution_clock::time_point & end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void omni_llm_stage_note_prefill_timing(struct omni_context * ctx_omni, int chunk_idx, double ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.llm_prefill_ms              = timing.llm_prefill_ms < 0.0 ? ms : timing.llm_prefill_ms + ms;
+}
+
+void omni_llm_stage_note_decode_timing(struct omni_context * ctx_omni, int chunk_idx, double ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.llm_decode_ms               = timing.llm_decode_ms < 0.0 ? ms : timing.llm_decode_ms + ms;
+}
+
+int omni_llm_stage_active_duplex_chunk_idx(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    return ctx_omni->active_duplex_chunk_idx;
+}
 
 std::vector<omni_embeds *> omni_llm_stage_drain_prefill_queue(struct LLMThreadInfo * llm_thread_info) {
     std::vector<omni_embeds *> llm_embeds;
@@ -68,6 +103,16 @@ void omni_llm_stage_post_pipeline_result(struct omni_context * ctx_omni,
         ctx_omni->pipeline_result_queue.push({ ended_with_listen, decode_ok });
     }
     ctx_omni->pipeline_result_cv.notify_one();
+}
+
+void omni_llm_stage_set_active_duplex_chunk_idx(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    ctx_omni->active_duplex_chunk_idx = chunk_idx;
+    ctx_omni->duplex_chunk_timings[chunk_idx];
 }
 
 void omni_llm_stage_prepare_worker_decode(struct omni_context *             ctx_omni,
@@ -117,8 +162,12 @@ bool omni_llm_stage_worker_decode_once(struct omni_context * ctx_omni, struct co
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");
 
+    const int  chunk_idx     = omni_llm_stage_active_duplex_chunk_idx(ctx_omni);
+    const auto decode_start  = std::chrono::high_resolution_clock::now();
     OmniLlmStageDecodeResult decode_result;
     const bool               decode_ok = omni_llm_stage_decode_run(ctx_omni, request, &decode_result);
+    omni_llm_stage_note_decode_timing(
+        ctx_omni, chunk_idx, omni_llm_stage_timing_elapsed_ms(decode_start, std::chrono::high_resolution_clock::now()));
     if (decode_ok) {
         omni_turn_coordinator_close(ctx_omni,
                                     decode_result.interrupted ? OmniTurnCloseKind::abort : OmniTurnCloseKind::finish);
@@ -355,15 +404,6 @@ void omni_llm_stage_publish_decode_response(struct omni_context * ctx_omni, cons
     std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
     ctx_omni->text_queue.push_back(response);
     ctx_omni->text_cv.notify_all();
-}
-
-int omni_llm_stage_active_duplex_chunk_idx(struct omni_context * ctx_omni) {
-    if (ctx_omni == nullptr) {
-        return -1;
-    }
-
-    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
-    return ctx_omni->active_duplex_chunk_idx;
 }
 
 void omni_llm_stage_dispatch_decode_chunk_to_tts(struct omni_context *                 ctx_omni,
@@ -644,8 +684,20 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
             // Keep each duplex chunk as a closed prefill->decode pair to avoid cross-chunk unit interleaving.
             for (; embeds_idx < llm_embeds.size(); ++embeds_idx) {
                 auto * embeds = llm_embeds[embeds_idx];
+                if (embeds->encode_failed) {
+                    print_with_timestamp("LLM thread: skip chunk %d because encode stage failed\n", embeds->index);
+                    delete embeds;
+                    omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
+                    continue;
+                }
+
+                omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, embeds->index);
+                const auto prefill_start = std::chrono::high_resolution_clock::now();
                 omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
                 omni_llm_stage_finalize_prefill(ctx_omni);
+                omni_llm_stage_note_prefill_timing(
+                    ctx_omni, embeds->index,
+                    omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
                 delete embeds;
 
                 print_with_timestamp("LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",

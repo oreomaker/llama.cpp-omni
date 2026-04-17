@@ -12,6 +12,8 @@ add_library(omni
             omni-log.h
             omni-runtime-init.cpp
             omni-runtime-init.h
+            omni-encode-stage.cpp
+            omni-encode-stage.h
             omni-llm-stage.cpp
             omni-llm-stage.h
             omni-session-state.cpp

@@ -7,6 +7,7 @@
 #include "gguf.h"
 #include "llama.h"
 #include "omni-impl.h"
+#include "omni-encode-stage.h"
 #include "omni-llm-stage.h"
 #include "omni-log.h"
 #include "omni-output.h"
@@ -121,6 +122,24 @@ static void duplex_timing_note_audio(struct omni_context * ctx_omni, int chunk_i
     std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
     auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
     timing.audio_embedding_ms          = timing.audio_embedding_ms < 0.0 ? ms : timing.audio_embedding_ms + ms;
+}
+
+static void duplex_timing_note_llm_prefill(struct omni_context * ctx_omni, int chunk_idx, double ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.llm_prefill_ms              = timing.llm_prefill_ms < 0.0 ? ms : timing.llm_prefill_ms + ms;
+}
+
+static void duplex_timing_note_llm_decode(struct omni_context * ctx_omni, int chunk_idx, double ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.llm_decode_ms               = timing.llm_decode_ms < 0.0 ? ms : timing.llm_decode_ms + ms;
 }
 
 static void duplex_timing_note_tts(struct omni_context * ctx_omni, int chunk_idx, double ms, int audio_token_count) {
@@ -463,10 +482,10 @@ struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_
 
 // 🔧 [高清模式] 创建带 chunks 的 vision embed（用于 V2.6 slice schema）
 // 返回的 vector: [0] = overview, [1..n] = slices
-static bool omni_image_embed_make_chunks_with_filename(struct vision_ctx *               ctx_vision,
-                                                       int                               n_threads,
-                                                       const std::string &               image_path,
-                                                       std::vector<std::vector<float>> & vision_chunks) {
+bool omni_image_embed_make_chunks_with_filename(struct vision_ctx *               ctx_vision,
+                                                int                               n_threads,
+                                                const std::string &               image_path,
+                                                std::vector<std::vector<float>> & vision_chunks) {
     unsigned char * image_bytes;
     long            image_bytes_length;
     auto            loaded = load_file_to_bytes(image_path.c_str(), &image_bytes, &image_bytes_length);
@@ -1827,8 +1846,15 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
         print_with_timestamp("system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
     }
 
+    const bool measure_llm_prefill = ctx_omni->duplex_mode && index >= 0;
+    double     llm_prefill_ms      = 0.0;
+
+    auto llm_stage_start = std::chrono::high_resolution_clock::now();
     omni_llm_stage_eval_string(ctx_omni, ctx_omni->params, prompts.voice_clone_prompt.c_str(),
                                ctx_omni->params->n_batch, &ctx_omni->session.n_past, false);
+    if (measure_llm_prefill) {
+        llm_prefill_ms += timing_elapsed_ms(llm_stage_start, std::chrono::high_resolution_clock::now());
+    }
 
     auto   ref_audio_embed_start = std::chrono::high_resolution_clock::now();
     auto * ref_audio_embeds      = omni_audio_embed_make_with_filename(
@@ -1837,28 +1863,44 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
                              timing_elapsed_ms(ref_audio_embed_start, std::chrono::high_resolution_clock::now()));
     if (ref_audio_embeds != nullptr && ref_audio_embeds->n_pos > 0) {
         print_with_timestamp("system prompt ref_audio embedding: n_pos=%d\n", ref_audio_embeds->n_pos);
+        llm_stage_start = std::chrono::high_resolution_clock::now();
         prefill_with_emb(ctx_omni, ctx_omni->params, ref_audio_embeds->embed, ref_audio_embeds->n_pos,
                          ctx_omni->params->n_batch, &ctx_omni->session.n_past);
+        if (measure_llm_prefill) {
+            llm_prefill_ms += timing_elapsed_ms(llm_stage_start, std::chrono::high_resolution_clock::now());
+        }
         omni_embed_free(ref_audio_embeds);
     } else {
         print_with_timestamp("WARNING: failed to load system prompt ref_audio: %s\n", bootstrap_ref_audio.c_str());
     }
 
+    llm_stage_start = std::chrono::high_resolution_clock::now();
     omni_llm_stage_eval_string(ctx_omni, ctx_omni->params, prompts.assistant_prompt.c_str(), ctx_omni->params->n_batch,
                                &ctx_omni->session.n_past, false);
+    if (measure_llm_prefill) {
+        llm_prefill_ms += timing_elapsed_ms(llm_stage_start, std::chrono::high_resolution_clock::now());
+    }
 
     ctx_omni->session.prompt.system_prompt_initialized = true;
     ctx_omni->session.prompt.n_keep                    = ctx_omni->session.n_past;
     print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n",
                          ctx_omni->session.prompt.n_keep);
+    llm_stage_start = std::chrono::high_resolution_clock::now();
     eval_prefix(ctx_omni, ctx_omni->params);
+    if (measure_llm_prefill) {
+        llm_prefill_ms += timing_elapsed_ms(llm_stage_start, std::chrono::high_resolution_clock::now());
+    }
 
     print_with_timestamp("stream_prefill(index=0): system prompt 初始化完成，ref_audio 已在其中 prefill\n");
     sliding_window_register_system_prompt(ctx_omni);
     print_with_timestamp("n_past = %d\n", ctx_omni->session.n_past);
+    if (measure_llm_prefill) {
+        duplex_timing_note_llm_prefill(ctx_omni, index, llm_prefill_ms);
+    }
 
     if (setup.should_start_workers) {
         const OmniWorkerThreadFns worker_fns = {
+            omni_encode_worker_loop,
             omni_llm_stage_worker_loop,
             omni_tts_worker_loop_simplex,
             omni_tts_worker_loop_duplex,
@@ -1872,73 +1914,6 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
         }
     }
 
-    return true;
-}
-
-// Step C: encode image/audio input into a single prefill payload.
-static bool omni_encode_prefill_input(struct omni_context * ctx_omni,
-                                      const std::string &   aud_fname,
-                                      const std::string &   img_fname,
-                                      int                   index,
-                                      int                   max_slice_nums,
-                                      struct omni_embeds &  encoded) {
-    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-    encoded.index         = index;
-
-    if (!img_fname.empty()) {
-        if (max_slice_nums >= 1 && ctx_omni->ctx_vision != nullptr) {
-            vision_set_max_slice_nums(ctx_omni->ctx_vision, max_slice_nums);
-            LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
-        }
-
-        auto       vit_embed_start = std::chrono::high_resolution_clock::now();
-        const bool image_embed_ok  = omni_image_embed_make_chunks_with_filename(
-            ctx_omni->ctx_vision, ctx_omni->params->cpuparams.n_threads, img_fname, encoded.vision_embed);
-        duplex_timing_note_vit(ctx_omni, index,
-                               timing_elapsed_ms(vit_embed_start, std::chrono::high_resolution_clock::now()));
-        if (!image_embed_ok) {
-            LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
-            return false;
-        }
-        LOG_INF("%s: vision_embed has %d chunks\n", __func__, (int) encoded.vision_embed.size());
-    }
-
-    if (!aud_fname.empty()) {
-        print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
-        auto   audio_embed_start = std::chrono::high_resolution_clock::now();
-        auto * audio_embeds =
-            omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
-        duplex_timing_note_audio(ctx_omni, index,
-                                 timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now()));
-        if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
-            print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index,
-                                 audio_embeds->n_pos);
-            encoded.audio_embed.resize(audio_embeds->n_pos * hidden_size);
-            std::memcpy(encoded.audio_embed.data(), audio_embeds->embed, encoded.audio_embed.size() * sizeof(float));
-            omni_embed_free(audio_embeds);
-        } else {
-            LOG_WRN("%s: audio encoding failed, skipping audio for this frame: %s\n", __func__, aud_fname.c_str());
-        }
-    }
-
-    return true;
-}
-
-// Step D: submit the encoded payload to the shared LLM stage.
-static bool omni_submit_llm_prefill(struct omni_context * ctx_omni, std::unique_ptr<struct omni_embeds> encoded) {
-    if (!ctx_omni->async) {
-        omni_llm_stage_prefill_apply(ctx_omni, ctx_omni->params, *encoded);
-        omni_llm_stage_finalize_prefill(ctx_omni);
-        return true;
-    }
-
-    std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-    ctx_omni->llm_thread_info->cv.wait(lock, [&] {
-        return ctx_omni->llm_thread_info->queue.size() < static_cast<size_t>(ctx_omni->llm_thread_info->MAX_QUEUE_SIZE);
-    });
-    ctx_omni->llm_thread_info->queue.push(encoded.release());
-    lock.unlock();
-    ctx_omni->llm_thread_info->cv.notify_all();
     return true;
 }
 
@@ -2130,24 +2105,72 @@ bool stream_prefill(struct omni_context * ctx_omni,
                     const std::string &   img_fname,
                     int                   index,
                     int                   max_slice_nums) {
-    if (ctx_omni->duplex_mode) {
-        duplex_timing_set_active_chunk(ctx_omni, index);
-    }
-
     const OmniPrefillSetup     setup   = omni_turn_coordinator_prepare_prefill(ctx_omni, index);
     const OmniBootstrapPrompts prompts = omni_select_bootstrap_prompts(ctx_omni);
+
+    if (ctx_omni->duplex_mode && setup.need_bootstrap) {
+        duplex_timing_set_active_chunk(ctx_omni, index);
+    }
 
     if (!omni_run_session_bootstrap_if_needed(ctx_omni, setup, prompts, aud_fname, index)) {
         return false;
     }
 
     if (!setup.need_bootstrap) {
+        const OmniWorkerThreadFns worker_fns = {
+            omni_encode_worker_loop,
+            omni_llm_stage_worker_loop,
+            omni_tts_worker_loop_simplex,
+            omni_tts_worker_loop_duplex,
+            t2w_thread_func,
+        };
+
+        if (ctx_omni->async && ctx_omni->duplex_mode) {
+            omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
+
+            if (ctx_omni->encode_thread_info != nullptr) {
+                OmniEncodeRequest request = { aud_fname, img_fname, index, max_slice_nums };
+                std::unique_lock<std::mutex> lock(ctx_omni->encode_thread_info->mtx);
+                ctx_omni->encode_thread_info->cv.wait(lock, [&] {
+                    return ctx_omni->encode_thread_info->queue.size() <
+                               static_cast<size_t>(ctx_omni->encode_thread_info->MAX_QUEUE_SIZE) ||
+                           !ctx_omni->workers.encode_thread_running;
+                });
+                if (!ctx_omni->workers.encode_thread_running) {
+                    return false;
+                }
+
+                ctx_omni->encode_thread_info->queue.push(std::move(request));
+                lock.unlock();
+                ctx_omni->encode_thread_info->cv.notify_one();
+                print_with_timestamp("\n\nc++ finish stream_prefill(index=%d). n_past=%d, n_keep=%d, n_ctx=%d\n\n",
+                                     index, ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep,
+                                     ctx_omni->params->n_ctx);
+                return true;
+            }
+        }
+
+        if (ctx_omni->duplex_mode) {
+            duplex_timing_set_active_chunk(ctx_omni, index);
+        }
+
         auto encoded = std::make_unique<struct omni_embeds>();
         if (!omni_encode_prefill_input(ctx_omni, aud_fname, img_fname, index, max_slice_nums, *encoded)) {
             return false;
         }
+        const bool measure_inline_prefill = ctx_omni->duplex_mode && !ctx_omni->async;
+        auto       inline_prefill_start   = std::chrono::high_resolution_clock::time_point {};
+        if (measure_inline_prefill) {
+            inline_prefill_start = std::chrono::high_resolution_clock::now();
+        }
+
         if (!omni_submit_llm_prefill(ctx_omni, std::move(encoded))) {
             return false;
+        }
+        if (measure_inline_prefill) {
+            duplex_timing_note_llm_prefill(
+                ctx_omni, index,
+                timing_elapsed_ms(inline_prefill_start, std::chrono::high_resolution_clock::now()));
         }
     }
 
@@ -2195,6 +2218,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     }
 
     const OmniWorkerThreadFns       worker_fns = {
+        omni_encode_worker_loop,
         omni_llm_stage_worker_loop,
         omni_tts_worker_loop_simplex,
         omni_tts_worker_loop_duplex,
@@ -2227,8 +2251,17 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
     LOG_INF("<assistant>");
 
+    const bool measure_sync_decode = ctx_omni->duplex_mode && duplex_timing_get_active_chunk(ctx_omni) >= 0;
+    auto       sync_decode_start   = std::chrono::high_resolution_clock::time_point {};
+    if (measure_sync_decode) {
+        sync_decode_start = std::chrono::high_resolution_clock::now();
+    }
     if (!omni_llm_stage_decode_run(ctx_omni, request)) {
         return false;
+    }
+    if (measure_sync_decode) {
+        duplex_timing_note_llm_decode(ctx_omni, duplex_timing_get_active_chunk(ctx_omni),
+                                      timing_elapsed_ms(sync_decode_start, std::chrono::high_resolution_clock::now()));
     }
 
     omni_turn_coordinator_close(ctx_omni, OmniTurnCloseKind::finish);

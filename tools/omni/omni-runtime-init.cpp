@@ -434,6 +434,17 @@ void omni_init_token2wav_runtime(struct omni_context * ctx_omni,
 void omni_shutdown_worker_threads(struct omni_context * ctx_omni) {
     omni_request_worker_shutdown(ctx_omni);
 
+    ctx_omni->workers.encode_thread_running = false;
+    if (ctx_omni->encode_thread.joinable()) {
+        if (ctx_omni->encode_thread_info) {
+            ctx_omni->encode_thread_info->cv.notify_all();
+        }
+        if (ctx_omni->llm_thread_info) {
+            ctx_omni->llm_thread_info->cv.notify_all();
+        }
+        ctx_omni->encode_thread.join();
+    }
+
     ctx_omni->workers.llm_thread_running = false;
     if (ctx_omni->llm_thread.joinable()) {
         if (ctx_omni->llm_thread_info) {
@@ -553,6 +564,9 @@ void omni_release_llm_runtime(struct omni_context * ctx_omni) {
 void omni_release_thread_info(struct omni_context * ctx_omni) {
     delete ctx_omni->audio_input_manager;
     ctx_omni->audio_input_manager = nullptr;
+
+    delete ctx_omni->encode_thread_info;
+    ctx_omni->encode_thread_info = nullptr;
 
     delete ctx_omni->llm_thread_info;
     ctx_omni->llm_thread_info = nullptr;

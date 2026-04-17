@@ -23,6 +23,7 @@
 #include "llama.h"
 #include "omni.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -105,8 +106,8 @@ struct ChunkTimingReport {
     std::string generated_text;
     double      vit_embedding_ms   = -1.0;
     double      audio_embedding_ms = -1.0;
-    double      stream_prefill_ms  = -1.0;
-    double      stream_decode_ms   = -1.0;
+    double      llm_prefill_ms     = -1.0;
+    double      llm_decode_ms      = -1.0;
     double      tts_audio_token_ms = -1.0;
     double      token2wav_ms       = -1.0;
     bool        tts_done           = false;
@@ -149,6 +150,8 @@ static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTim
     }
     report.vit_embedding_ms   = timing.vit_embedding_ms;
     report.audio_embedding_ms = timing.audio_embedding_ms;
+    report.llm_prefill_ms     = timing.llm_prefill_ms;
+    report.llm_decode_ms      = timing.llm_decode_ms;
     report.tts_audio_token_ms = timing.tts_audio_token_ms;
     report.token2wav_ms       = timing.token2wav_ms;
     report.tts_done           = timing.tts_done;
@@ -174,13 +177,41 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
         return;
     }
 
+    const auto llm_total_picker = [](const ChunkTimingReport & r) {
+        double total = 0.0;
+        if (r.llm_prefill_ms >= 0.0) {
+            total += r.llm_prefill_ms;
+        }
+        if (r.llm_decode_ms >= 0.0) {
+            total += r.llm_decode_ms;
+        }
+        return total;
+    };
+
+    const auto stage12_picker = [](const ChunkTimingReport & r) {
+        double total = 0.0;
+        if (r.vit_embedding_ms >= 0.0) {
+            total += r.vit_embedding_ms;
+        }
+        if (r.audio_embedding_ms >= 0.0) {
+            total += r.audio_embedding_ms;
+        }
+        if (r.llm_prefill_ms >= 0.0) {
+            total += r.llm_prefill_ms;
+        }
+        if (r.llm_decode_ms >= 0.0) {
+            total += r.llm_decode_ms;
+        }
+        return total;
+    };
+
     printf("\n========================================\n");
     printf("  Chunk Stage Timing Summary\n");
     printf("========================================\n");
     for (const auto & report : reports) {
-        printf("  chunk %04d | vit: %s | audio: %s | prefill: %s | decode: %s", report.chunk_idx,
+        printf("  chunk %04d | vit: %s | audio: %s | llm_prefill: %s | llm_decode: %s", report.chunk_idx,
                format_stage_ms(report.vit_embedding_ms).c_str(), format_stage_ms(report.audio_embedding_ms).c_str(),
-               format_stage_ms(report.stream_prefill_ms).c_str(), format_stage_ms(report.stream_decode_ms).c_str());
+               format_stage_ms(report.llm_prefill_ms).c_str(), format_stage_ms(report.llm_decode_ms).c_str());
         if (use_tts) {
             printf(" | tts(audio token): %s | token2wav: %s",
                    format_stage_ms(report.tts_audio_token_ms, report.tts_done).c_str(),
@@ -194,16 +225,18 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
     }
 
     printf("----------------------------------------\n");
-    printf("  avg vit: %s | avg audio: %s | avg prefill: %s | avg decode: %s",
-           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.vit_embedding_ms; }))
-               .c_str(),
-           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.audio_embedding_ms; }))
-               .c_str(),
-           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.stream_prefill_ms; }))
-               .c_str(),
-           format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) {
-               return r.stream_decode_ms;
-           })).c_str());
+    printf(
+        "  avg vit: %s | avg audio: %s | avg llm_prefill: %s | avg llm_decode: %s | avg llm_total: %s | avg stage1+2: "
+        "%s",
+        format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.vit_embedding_ms; }))
+            .c_str(),
+        format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.audio_embedding_ms; }))
+            .c_str(),
+        format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_prefill_ms; }))
+            .c_str(),
+        format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_decode_ms; })).c_str(),
+        format_stage_ms(average_stage_ms(reports, llm_total_picker)).c_str(),
+        format_stage_ms(average_stage_ms(reports, stage12_picker)).c_str());
     if (use_tts) {
         printf(
             " | avg tts(audio token): %s | avg token2wav: %s",
@@ -231,17 +264,17 @@ static void duplex_test_case(struct omni_context * ctx_omni,
     // async 模式：TTS 线程需要 async=true 才能正常工作
     // 已修复 stream_decode 中 need_speek 重复设置导致的 prefill_done 竞态条件
 
-    struct PrefillRecord {
-        bool   has_image  = false;
-        double prefill_ms = -1.0;
-        bool   ready      = false;
+    struct SubmitRecord {
+        bool   has_image = false;
+        double submit_ms = -1.0;
+        bool   ready     = false;
     };
 
-    auto                       total_t0 = std::chrono::high_resolution_clock::now();
-    std::mutex                 prefill_records_mtx;
-    std::vector<PrefillRecord> prefill_records(cnt);
-    std::atomic<int>           submitted_count{ 0 };
-    std::atomic<bool>          producer_done{ false };
+    auto                      total_t0 = std::chrono::high_resolution_clock::now();
+    std::mutex                submit_records_mtx;
+    std::vector<SubmitRecord> submit_records(cnt);
+    std::atomic<int>          submitted_count{ 0 };
+    std::atomic<bool>         producer_done{ false };
 
     // Producer simulates chunk arrival and overlaps encode with the worker-side decode pipeline.
     std::thread producer([&] {
@@ -273,27 +306,27 @@ static void duplex_test_case(struct omni_context * ctx_omni,
                 printf("  音频: %s\n", aud_fname.c_str());
             }
 
-            auto   t0         = std::chrono::high_resolution_clock::now();
-            bool   prefill_ok = stream_prefill(ctx_omni, aud_fname, img_fname, il);
-            auto   t1         = std::chrono::high_resolution_clock::now();
-            double prefill_dt = std::chrono::duration<double>(t1 - t0).count();
+            auto   t0        = std::chrono::high_resolution_clock::now();
+            bool   submit_ok = stream_prefill(ctx_omni, aud_fname, img_fname, il);
+            auto   t1        = std::chrono::high_resolution_clock::now();
+            double submit_dt = std::chrono::duration<double>(t1 - t0).count();
 
-            if (!prefill_ok) {
-                fprintf(stderr, "[错误] Chunk %d prefill 失败\n", il);
+            if (!submit_ok) {
+                fprintf(stderr, "[错误] Chunk %d submit 失败\n", il);
                 break;
             }
 
             {
-                std::lock_guard<std::mutex> lock(prefill_records_mtx);
-                prefill_records[il].has_image  = !img_fname.empty();
-                prefill_records[il].prefill_ms = prefill_dt * 1000.0;
-                prefill_records[il].ready      = true;
+                std::lock_guard<std::mutex> lock(submit_records_mtx);
+                submit_records[il].has_image = !img_fname.empty();
+                submit_records[il].submit_ms = submit_dt * 1000.0;
+                submit_records[il].ready     = true;
             }
             submitted_count.store(il + 1);
 
-            printf("  encode+submit: %.3f s\n", prefill_dt);
+            printf("  submit: %.3f s\n", submit_dt);
 
-            const double remaining_ms = 1000.0 - prefill_dt * 1000.0;
+            const double remaining_ms = 1000.0 - submit_dt * 1000.0;
             if (remaining_ms > 0.0 && il < cnt - 1) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(remaining_ms)));
             }
@@ -322,12 +355,12 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             break;
         }
 
-        const int     chunk_idx    = results_collected;
-        const bool    ended_listen = ctx_omni->turn.ended_with_listen.load();
-        PrefillRecord record;
+        const int    chunk_idx    = results_collected;
+        const bool   ended_listen = ctx_omni->turn.ended_with_listen.load();
+        SubmitRecord record;
         {
-            std::lock_guard<std::mutex> lock(prefill_records_mtx);
-            record = prefill_records[chunk_idx];
+            std::lock_guard<std::mutex> lock(submit_records_mtx);
+            record = submit_records[chunk_idx];
         }
 
         std::string generated_text;
@@ -348,14 +381,14 @@ static void duplex_test_case(struct omni_context * ctx_omni,
         report.has_image         = record.has_image;
         report.ended_with_listen = ended_listen;
         report.generated_text    = generated_text;
-        report.stream_prefill_ms = record.prefill_ms;
-        report.stream_decode_ms  = decode_dt * 1000.0;
         refresh_chunk_timing_report(ctx_omni, report);
         chunk_reports.push_back(report);
         results_collected++;
 
-        printf("  decode wait: %.3f s | total chunk latency: %.3f s | n_past: %d\n", decode_dt,
-               record.prefill_ms >= 0.0 ? decode_dt + record.prefill_ms / 1000.0 : decode_dt, ctx_omni->session.n_past);
+        const double stage12_ms = std::max(report.vit_embedding_ms, 0.0) + std::max(report.audio_embedding_ms, 0.0) +
+                                  std::max(report.llm_prefill_ms, 0.0) + std::max(report.llm_decode_ms, 0.0);
+        printf("  caller wait: %.3f s | model stage1+2 latency: %.3f s | submit: %.3f s | n_past: %d\n", decode_dt,
+               stage12_ms / 1000.0, record.submit_ms / 1000.0, ctx_omni->session.n_past);
         if (ended_listen) {
             printf("  决策: <|listen|>\n");
         } else {
@@ -364,8 +397,8 @@ static void duplex_test_case(struct omni_context * ctx_omni,
                                                        generated_text.c_str());
         }
         printf("  分阶段: vit=%s | audio=%s | prefill=%s | decode=%s", format_stage_ms(report.vit_embedding_ms).c_str(),
-               format_stage_ms(report.audio_embedding_ms).c_str(), format_stage_ms(report.stream_prefill_ms).c_str(),
-               format_stage_ms(report.stream_decode_ms).c_str());
+               format_stage_ms(report.audio_embedding_ms).c_str(), format_stage_ms(report.llm_prefill_ms).c_str(),
+               format_stage_ms(report.llm_decode_ms).c_str());
         if (ctx_omni->use_tts) {
             printf(" | tts(audio token)=%s | token2wav=%s",
                    format_stage_ms(report.tts_audio_token_ms, report.tts_done, true).c_str(),
@@ -383,18 +416,20 @@ consumer_done:
     int    listen_count    = 0;
     double total_prefill_s = 0.0;
     double total_decode_s  = 0.0;
+    double total_llm_s     = 0.0;
     for (const auto & report : chunk_reports) {
         if (report.ended_with_listen) {
             listen_count++;
         } else {
             speak_count++;
         }
-        if (report.stream_prefill_ms >= 0.0) {
-            total_prefill_s += report.stream_prefill_ms / 1000.0;
+        if (report.llm_prefill_ms >= 0.0) {
+            total_prefill_s += report.llm_prefill_ms / 1000.0;
         }
-        if (report.stream_decode_ms >= 0.0) {
-            total_decode_s += report.stream_decode_ms / 1000.0;
+        if (report.llm_decode_ms >= 0.0) {
+            total_decode_s += report.llm_decode_ms / 1000.0;
         }
+        total_llm_s += (std::max(report.llm_prefill_ms, 0.0) + std::max(report.llm_decode_ms, 0.0)) / 1000.0;
     }
     const int chunks_completed = static_cast<int>(chunk_reports.size());
 
@@ -403,8 +438,9 @@ consumer_done:
     printf("========================================\n");
     printf("  Chunks:      %d / %d\n", chunks_completed, cnt);
     printf("  总耗时:      %.3f s\n", total_dt);
-    printf("  avg prefill: %.1f ms\n", chunks_completed > 0 ? total_prefill_s / chunks_completed * 1000.0 : 0);
-    printf("  avg decode:  %.1f ms\n", chunks_completed > 0 ? total_decode_s / chunks_completed * 1000.0 : 0);
+    printf("  avg llm_prefill: %.1f ms\n", chunks_completed > 0 ? total_prefill_s / chunks_completed * 1000.0 : 0);
+    printf("  avg llm_decode:  %.1f ms\n", chunks_completed > 0 ? total_decode_s / chunks_completed * 1000.0 : 0);
+    printf("  avg llm_total:   %.1f ms\n", chunks_completed > 0 ? total_llm_s / chunks_completed * 1000.0 : 0);
     printf("  avg/chunk:   %.1f ms\n", chunks_completed > 0 ? total_dt / chunks_completed * 1000.0 : 0);
     printf("  speak: %d | listen: %d\n", speak_count, listen_count);
     printf("  最终 n_past: %d\n", ctx_omni->session.n_past);

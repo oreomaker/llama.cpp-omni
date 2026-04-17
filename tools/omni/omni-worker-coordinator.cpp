@@ -23,6 +23,22 @@ void omni_clear_tts_queue(struct omni_context * ctx_omni, const char * log_reaso
     }
 }
 
+static void omni_start_encode_worker_if_needed(struct omni_context *       ctx_omni,
+                                               const OmniWorkerThreadFns & worker_fns,
+                                               const char *                prefix) {
+    if (!ctx_omni->async || !ctx_omni->duplex_mode || ctx_omni->encode_thread.joinable() || worker_fns.encode == nullptr) {
+        return;
+    }
+
+    if (ctx_omni->encode_thread_info == nullptr) {
+        ctx_omni->encode_thread_info = new EncodeThreadInfo(4);
+    }
+
+    ctx_omni->workers.encode_thread_running = true;
+    ctx_omni->encode_thread                 = std::thread(worker_fns.encode, ctx_omni, ctx_omni->params);
+    print_with_timestamp("%screate encode thread%s\n", prefix, prefix[0] == '\0' ? " success" : "");
+}
+
 static void omni_start_tts_worker_if_needed(struct omni_context *       ctx_omni,
                                             const OmniWorkerThreadFns & worker_fns,
                                             const char *                prefix) {
@@ -57,7 +73,9 @@ void omni_ensure_prefill_workers_started(struct omni_context * ctx_omni, const O
         return;
     }
 
-    print_with_timestamp("create llm & tts thread\n");
+    print_with_timestamp("ensure async worker threads\n");
+    omni_start_encode_worker_if_needed(ctx_omni, worker_fns, "");
+
     if (!ctx_omni->llm_thread.joinable()) {
         ctx_omni->workers.llm_thread_running = true;
         ctx_omni->llm_thread                 = std::thread(worker_fns.llm, ctx_omni, ctx_omni->params);
@@ -73,10 +91,14 @@ void omni_request_worker_shutdown(struct omni_context * ctx_omni) {
         return;
     }
 
+    ctx_omni->workers.encode_thread_running = false;
     ctx_omni->workers.llm_thread_running = false;
     ctx_omni->workers.tts_thread_running = false;
     ctx_omni->workers.t2w_thread_running = false;
 
+    if (ctx_omni->encode_thread_info != nullptr) {
+        ctx_omni->encode_thread_info->cv.notify_all();
+    }
     if (ctx_omni->llm_thread_info != nullptr) {
         ctx_omni->llm_thread_info->cv.notify_all();
     }

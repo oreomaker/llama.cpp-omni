@@ -48,12 +48,29 @@ struct omni_embeds {
     std::vector<float>              audio_embed;
     int                             index    = 0;
     int                             end_flag = false;
+    bool                            encode_failed = false;
 };
 
 struct PipelineDecodeResult {
     // Worker-to-caller completion payload for one async decode cycle.
     bool ended_with_listen = false;
     bool decode_ok         = false;
+};
+
+struct OmniEncodeRequest {
+    std::string aud_fname;
+    std::string img_fname;
+    int         index          = 0;
+    int         max_slice_nums = -1;
+};
+
+struct EncodeThreadInfo {
+    int                           MAX_QUEUE_SIZE;
+    std::queue<OmniEncodeRequest> queue;
+    std::mutex                    mtx;
+    std::condition_variable       cv;
+
+    explicit EncodeThreadInfo(int maxQueueSize) : MAX_QUEUE_SIZE(maxQueueSize) {}
 };
 
 struct LLMThreadInfo {
@@ -134,6 +151,8 @@ struct OmniTTSProjectorRuntime {
 struct omni_duplex_chunk_timing {
     double vit_embedding_ms       = -1.0;
     double audio_embedding_ms     = -1.0;
+    double llm_prefill_ms         = -1.0;
+    double llm_decode_ms          = -1.0;
     double tts_audio_token_ms     = -1.0;
     double token2wav_ms           = -1.0;
     int    tts_audio_token_count  = 0;
@@ -178,9 +197,11 @@ struct omni_context {
     OmniSessionGate      gate;
 
     bool                   async = false;
+    std::thread            encode_thread;
     std::thread            llm_thread;
     std::thread            tts_thread;
     std::thread            t2w_thread;
+    struct EncodeThreadInfo * encode_thread_info = NULL;
     struct LLMThreadInfo * llm_thread_info = NULL;
     struct TTSThreadInfo * tts_thread_info = NULL;
     struct T2WThreadInfo * t2w_thread_info = NULL;
@@ -361,6 +382,10 @@ struct omni_embed * omni_image_embed_make_with_bytes(struct vision_ctx *   ctx_v
 struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_vision,
                                                         int                 n_threads,
                                                         const std::string & image_path);
+bool omni_image_embed_make_chunks_with_filename(struct vision_ctx *               ctx_vision,
+                                                int                               n_threads,
+                                                const std::string &               image_path,
+                                                std::vector<std::vector<float>> & vision_chunks);
 struct omni_embed * omni_audio_embed_make_with_bytes(struct audition_ctx * ctx_audition,
                                                      int                   n_threads,
                                                      audition_audio_f32 *  audio);

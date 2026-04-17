@@ -53,5 +53,5 @@ void omni_release_tts_runtime(struct omni_context * ctx_omni);
 // Free LLM context + model (when owns_model) and sampler.
 void omni_release_llm_runtime(struct omni_context * ctx_omni);
 
-// Free LLMThreadInfo, TTSThreadInfo, T2WThreadInfo and audio_input_manager.
+// Free EncodeThreadInfo, LLMThreadInfo, TTSThreadInfo, T2WThreadInfo and audio_input_manager.
 void omni_release_thread_info(struct omni_context * ctx_omni);

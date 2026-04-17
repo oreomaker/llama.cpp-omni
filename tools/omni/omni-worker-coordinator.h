@@ -6,6 +6,7 @@ struct omni_context;
 using OmniWorkerThreadFn = void (*)(struct omni_context *, struct common_params *);
 
 struct OmniWorkerThreadFns {
+    OmniWorkerThreadFn encode      = nullptr;
     OmniWorkerThreadFn llm         = nullptr;
     OmniWorkerThreadFn tts_simplex = nullptr;
     OmniWorkerThreadFn tts_duplex  = nullptr;
