@@ -63,6 +63,9 @@ struct OmniSessionState {
 struct OmniTurnState {
     bool current_turn_ended = true;
     std::atomic<bool> ended_with_listen{false};
+    bool decode_prefix_applied = false;
+    int  generated_decode_tokens = 0;
+    int  current_chunk_tokens = 0;
 };
 
 struct OmniSessionGate {

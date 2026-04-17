@@ -102,6 +102,9 @@ void omni_turn_coordinator_prepare_decode(struct omni_context *       ctx_omni,
                          ctx_omni->duplex_mode);
 
     ctx_omni->turn.current_turn_ended = false;
+    ctx_omni->turn.decode_prefix_applied = false;
+    ctx_omni->turn.generated_decode_tokens = 0;
+    ctx_omni->turn.current_chunk_tokens = 0;
     if (!ctx_omni->duplex_mode) {
         ctx_omni->gate.llm_generation_done.store(false);
     }

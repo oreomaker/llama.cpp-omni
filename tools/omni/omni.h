@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "omni-llm-stage.h"
 #include "omni-runtime-messages.h"
 #include "omni-session-state.h"
 #include "omni-worker-state.h"
@@ -214,6 +215,9 @@ struct omni_context {
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
     // 设置为 0 表示无限制
     int max_new_speak_tokens_per_chunk = 26;
+
+    OmniLlmSchedulePolicy llm_schedule_policy = OmniLlmSchedulePolicy::DECODE_FIRST;
+    int                   reschedule_interval_tokens = 4;
 
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认

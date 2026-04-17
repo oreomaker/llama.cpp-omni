@@ -465,6 +465,12 @@ static void show_usage(const char * prog_name) {
         "  -ngl <n>            GPU 层数 (默认: 99)\n"
         "  --no-tts            禁用 TTS\n"
         "  --omni              启用 omni 模式 (audio+vision, media_type=2)\n"
+        "  --seed <n>          设置采样 seed (默认: common 默认值)\n"
+        "  --greedy            使用确定性贪心解码 (temp=0, top_k=0, top_p=1)\n"
+        "  --schedule-policy <decode_first|preemptive|micro_batch>\n"
+        "                      LLM worker 调度策略 (默认: decode_first)\n"
+        "  --schedule-batch <n>\n"
+        "                      decode slice 调度粒度 (默认: 4)\n"
         "  --test <prefix> <n> 指定测试数据前缀和 chunk 数量\n"
         "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
         "  -h, --help          显示帮助\n\n"
@@ -472,6 +478,19 @@ static void show_usage(const char * prog_name) {
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \\\n"
         "     --omni --test tools/omni/assets/test_case/omni_test_case/omni_test_case_ 9\n",
         prog_name, prog_name);
+}
+
+static const char * schedule_policy_name(OmniLlmSchedulePolicy policy) {
+    switch (policy) {
+        case OmniLlmSchedulePolicy::DECODE_FIRST:
+            return "decode_first";
+        case OmniLlmSchedulePolicy::PREFILL_PREEMPTIVE:
+            return "preemptive";
+        case OmniLlmSchedulePolicy::MICRO_BATCH:
+            return "micro_batch";
+    }
+
+    return "unknown";
 }
 
 // ==================== Main ====================
@@ -492,7 +511,11 @@ int main(int argc, char ** argv) {
     bool        use_tts        = true;
     bool        run_test       = false;
     std::string test_prefix;
-    int         test_count = 0;
+    int         test_count      = 0;
+    OmniLlmSchedulePolicy schedule_policy = OmniLlmSchedulePolicy::DECODE_FIRST;
+    int                   schedule_batch  = 4;
+    uint32_t              sampling_seed   = LLAMA_DEFAULT_SEED;
+    bool                  greedy_decode   = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -519,6 +542,25 @@ int main(int argc, char ** argv) {
             use_tts = false;
         } else if (arg == "--omni") {
             media_type = 2;
+        } else if (arg == "--seed" && i + 1 < argc) {
+            sampling_seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--greedy") {
+            greedy_decode = true;
+        } else if (arg == "--schedule-policy" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            if (value == "decode_first") {
+                schedule_policy = OmniLlmSchedulePolicy::DECODE_FIRST;
+            } else if (value == "preemptive") {
+                schedule_policy = OmniLlmSchedulePolicy::PREFILL_PREEMPTIVE;
+            } else if (value == "micro_batch") {
+                schedule_policy = OmniLlmSchedulePolicy::MICRO_BATCH;
+            } else {
+                fprintf(stderr, "Unknown schedule policy: %s\n", value.c_str());
+                show_usage(argv[0]);
+                return 1;
+            }
+        } else if (arg == "--schedule-batch" && i + 1 < argc) {
+            schedule_batch = std::atoi(argv[++i]);
         } else if (arg == "-o" && i + 1 < argc) {
             output_dir = argv[++i];
         } else if (arg == "--test" && i + 2 < argc) {
@@ -535,6 +577,10 @@ int main(int argc, char ** argv) {
     if (llm_path.empty()) {
         fprintf(stderr, "Error: -m <llm_model_path> is required\n\n");
         show_usage(argv[0]);
+        return 1;
+    }
+    if (schedule_batch <= 0) {
+        fprintf(stderr, "Error: --schedule-batch must be > 0\n");
         return 1;
     }
 
@@ -590,6 +636,12 @@ int main(int argc, char ** argv) {
     params.tts_model    = paths.tts;
     params.n_ctx        = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
+    params.sampling.seed = sampling_seed;
+    if (greedy_decode) {
+        params.sampling.temp  = 0.0f;
+        params.sampling.top_k = 0;
+        params.sampling.top_p = 1.0f;
+    }
 
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
@@ -603,6 +655,10 @@ int main(int argc, char ** argv) {
     printf("  Output dir: %s\n", output_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
     printf("  Mode: DUPLEX\n");
+    printf("  Sampling seed: %u%s\n", sampling_seed, sampling_seed == LLAMA_DEFAULT_SEED ? " (default)" : "");
+    printf("  Greedy decode: %s\n", greedy_decode ? "yes" : "no");
+    printf("  Schedule policy: %s\n", schedule_policy_name(schedule_policy));
+    printf("  Schedule batch: %d\n", schedule_batch);
 
     // 关键: duplex_mode=true
     auto * ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
@@ -616,6 +672,8 @@ int main(int argc, char ** argv) {
     }
     ctx_omni->async          = true;
     ctx_omni->ref_audio_path = ref_audio_path;
+    ctx_omni->llm_schedule_policy = schedule_policy;
+    ctx_omni->reschedule_interval_tokens = schedule_batch;
 
     // 执行测试
     if (run_test) {

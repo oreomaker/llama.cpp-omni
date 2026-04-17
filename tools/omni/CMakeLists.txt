@@ -129,6 +129,18 @@ set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
+if (BUILD_TESTING)
+    set(TARGET_OMNI_UNIT_TEST test-omni-turn-coordinator)
+    add_executable(${TARGET_OMNI_UNIT_TEST} test/test-turn-coordinator.cpp)
+    target_link_libraries(${TARGET_OMNI_UNIT_TEST} PRIVATE common omni Threads::Threads)
+    target_compile_features(${TARGET_OMNI_UNIT_TEST} PRIVATE cxx_std_17)
+
+    add_test(
+        NAME ${TARGET_OMNI_UNIT_TEST}
+        COMMAND $<TARGET_FILE:${TARGET_OMNI_UNIT_TEST}>)
+    set_property(TEST ${TARGET_OMNI_UNIT_TEST} PROPERTY LABELS omni)
+endif()
+
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
