@@ -79,6 +79,82 @@ bool omni_llm_stage_has_pending_prefill(struct omni_context * ctx_omni) {
     return !ctx_omni->llm_thread_info->queue.empty();
 }
 
+omni_embeds * omni_llm_stage_peek_prefill_head(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+    return ctx_omni->llm_thread_info->queue.empty() ? nullptr : ctx_omni->llm_thread_info->queue.front();
+}
+
+omni_embeds * omni_llm_stage_pop_prefill_head(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
+        return nullptr;
+    }
+
+    omni_embeds * result = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+        if (!ctx_omni->llm_thread_info->queue.empty()) {
+            result = ctx_omni->llm_thread_info->queue.front();
+            ctx_omni->llm_thread_info->queue.pop();
+        }
+    }
+
+    if (result != nullptr) {
+        ctx_omni->llm_thread_info->cv.notify_all();
+    }
+    return result;
+}
+
+bool omni_llm_stage_micro_batch_supported(const struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->params == nullptr) {
+        return false;
+    }
+
+    return ctx_omni->params->kv_unified && llama_n_seq_max(ctx_omni->ctx_llama) >= 2;
+}
+
+int omni_llm_stage_estimate_speculative_decode_tail(const struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return 0;
+    }
+
+    const int max_tgt_len =
+        ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
+    int remaining_decode_budget = std::max(0, max_tgt_len - ctx_omni->turn.generated_decode_tokens);
+
+    if (ctx_omni->duplex_mode && ctx_omni->max_new_speak_tokens_per_chunk > 0) {
+        remaining_decode_budget =
+            std::max(0, ctx_omni->max_new_speak_tokens_per_chunk - ctx_omni->turn.current_chunk_tokens);
+    }
+
+    const int remaining_legacy_chunks =
+        remaining_decode_budget > 0 ? (remaining_decode_budget + kLegacyDecodeChunkStepSize - 1) /
+                                          kLegacyDecodeChunkStepSize :
+                                      1;
+    const int estimated_closure_tokens = ctx_omni->duplex_mode ? remaining_legacy_chunks + 2 : 0;
+    return remaining_decode_budget + estimated_closure_tokens;
+}
+
+void omni_llm_stage_reset_staged_state(struct omni_context * ctx_omni,
+                                       OmniLlmSchedulerState & state,
+                                       bool                   clear_staging_seq) {
+    if (clear_staging_seq && ctx_omni != nullptr && ctx_omni->ctx_llama != nullptr) {
+        if (llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama)) {
+            llama_memory_seq_rm(mem, state.staging_seq, 0, -1);
+        }
+    }
+
+    state.staged_ready     = false;
+    state.staged_chunk_idx = -1;
+    state.branch_n_past    = 0;
+    state.staged_begin_pos = 0;
+    state.staged_n_past    = 0;
+    state.spec_decode_tail = 0;
+}
+
 bool omni_llm_stage_close_decode_preemptively(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->params == nullptr) {
         return false;
@@ -495,14 +571,75 @@ void omni_llm_stage_finish_decode_text_stream(struct omni_context * ctx_omni) {
 }
 }  // namespace
 
-bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
-                                struct common_params *   params,
-                                std::vector<llama_token> tokens,
-                                int                      n_batch,
-                                int *                    n_past,
-                                bool                     get_emb) {
+static bool omni_llm_stage_eval_embeds_seq(struct omni_context *  ctx_omni,
+                                           struct common_params * params,
+                                           const float *          embed,
+                                           int                    n_pos,
+                                           int                    n_batch,
+                                           int *                  n_past,
+                                           llama_seq_id           seq_id) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || params == nullptr || n_past == nullptr) {
+        return false;
+    }
+
+    if (n_pos <= 0 || embed == nullptr) {
+        return true;
+    }
+
+    if (seq_id == 0) {
+        kv_cache_slide_window(ctx_omni, params, n_pos);
+    }
+
+    const int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    for (int i = 0; i < n_pos; i += n_batch) {
+        const int n_eval = std::min(n_pos - i, n_batch);
+        if (n_eval == 0) {
+            break;
+        }
+
+        llama_batch batch = llama_batch_init(n_eval, n_embd, 1);
+        std::memcpy(batch.embd, embed + i * n_embd, sizeof(float) * n_eval * n_embd);
+        for (int j = 0; j < n_eval; ++j) {
+            batch.pos[j]      = *n_past + j;
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = seq_id;
+            batch.logits[j]   = (j + 1 == n_eval);
+        }
+        batch.n_tokens = n_eval;
+
+        if (llama_decode(ctx_omni->ctx_llama, batch)) {
+            LOG_ERR("%s : failed to eval embeds. token %d/%d (batch size %d, seq_id %d, n_past %d)\n", __func__, i,
+                    n_pos, n_batch, seq_id, *n_past);
+            llama_batch_free(batch);
+            return false;
+        }
+
+        llama_batch_free(batch);
+        *n_past += n_eval;
+    }
+
+    return true;
+}
+
+bool omni_llm_stage_eval_tokens_seq(struct omni_context *    ctx_omni,
+                                    struct common_params *   params,
+                                    std::vector<llama_token> tokens,
+                                    int                      n_batch,
+                                    int *                    n_past,
+                                    llama_seq_id             seq_id,
+                                    bool                     get_emb) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || params == nullptr || n_past == nullptr) {
+        return false;
+    }
+
     const int n_tokens = (int) tokens.size();
-    kv_cache_slide_window(ctx_omni, params, n_tokens);
+    if (n_tokens == 0) {
+        return true;
+    }
+
+    if (seq_id == 0) {
+        kv_cache_slide_window(ctx_omni, params, n_tokens);
+    }
 
     for (int i = 0; i < n_tokens; i += n_batch) {
         const int n_eval = std::min(n_tokens - i, n_batch);
@@ -514,25 +651,22 @@ bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
             llama_set_embeddings(ctx_omni->ctx_llama, true);
         }
 
-        llama_batch            batch = llama_batch_get_one(tokens.data() + i, n_eval);
-        std::vector<llama_pos> pos_vec;
-        if (batch.pos == nullptr) {
-            pos_vec.resize(n_eval);
-            batch.pos = pos_vec.data();
-        }
+        llama_batch batch = llama_batch_init(n_eval, 0, 1);
         for (int j = 0; j < n_eval; ++j) {
-            batch.pos[j] = *n_past + j;
+            common_batch_add(batch, tokens[i + j], *n_past + j, { seq_id }, get_emb || (j + 1 == n_eval));
         }
 
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
-            LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, n_tokens, n_batch,
-                    *n_past);
+            LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, seq_id %d, n_past %d)\n", __func__, i, n_tokens,
+                    n_batch, seq_id, *n_past);
+            llama_batch_free(batch);
             if (get_emb) {
                 llama_set_embeddings(ctx_omni->ctx_llama, false);
             }
             return false;
         }
 
+        llama_batch_free(batch);
         if (get_emb) {
             llama_set_embeddings(ctx_omni->ctx_llama, false);
         }
@@ -542,6 +676,29 @@ bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
     return true;
 }
 
+bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
+                                struct common_params *   params,
+                                std::vector<llama_token> tokens,
+                                int                      n_batch,
+                                int *                    n_past,
+                                bool                     get_emb) {
+    return omni_llm_stage_eval_tokens_seq(ctx_omni, params, std::move(tokens), n_batch, n_past, /*seq_id=*/0,
+                                          get_emb);
+}
+
+bool omni_llm_stage_eval_string_seq(struct omni_context * ctx_omni,
+                                    struct common_params * params,
+                                    const char *           str,
+                                    int                    n_batch,
+                                    int *                  n_past,
+                                    llama_seq_id           seq_id,
+                                    bool                   add_bos,
+                                    bool                   get_emb) {
+    std::string              str_buf = str;
+    std::vector<llama_token> tokens  = common_tokenize(ctx_omni->ctx_llama, str_buf, add_bos, true);
+    return omni_llm_stage_eval_tokens_seq(ctx_omni, params, std::move(tokens), n_batch, n_past, seq_id, get_emb);
+}
+
 bool omni_llm_stage_eval_string(struct omni_context * ctx_omni,
                                 struct common_params * params,
                                 const char *           str,
@@ -549,9 +706,7 @@ bool omni_llm_stage_eval_string(struct omni_context * ctx_omni,
                                 int *                  n_past,
                                 bool                   add_bos,
                                 bool                   get_emb) {
-    std::string              str_buf = str;
-    std::vector<llama_token> tokens  = common_tokenize(ctx_omni->ctx_llama, str_buf, add_bos, true);
-    return omni_llm_stage_eval_tokens(ctx_omni, params, std::move(tokens), n_batch, n_past, get_emb);
+    return omni_llm_stage_eval_string_seq(ctx_omni, params, str, n_batch, n_past, /*seq_id=*/0, add_bos, get_emb);
 }
 
 bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
@@ -567,12 +722,19 @@ bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
                                                   hidden_states);
 }
 
-void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
-                                  struct common_params *     params,
-                                  const struct omni_embeds & embeds) {
-    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
+                                      struct common_params *     params,
+                                      const struct omni_embeds & embeds,
+                                      llama_seq_id               seq_id,
+                                      int *                      n_past) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || params == nullptr || n_past == nullptr) {
+        return false;
+    }
 
-    if (ctx_omni->session.sliding_window_config.mode != "off") {
+    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    const bool track_sliding_window = seq_id == 0 && ctx_omni->session.sliding_window_config.mode != "off";
+
+    if (track_sliding_window) {
         sliding_window_register_unit_start(ctx_omni);
     }
 
@@ -584,27 +746,42 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         const bool has_slices       = n_chunks > 1;
 
         if (ctx_omni->duplex_mode) {
-            omni_llm_stage_eval_string(ctx_omni, params, "<unit><image>", params->n_batch, &ctx_omni->session.n_past,
-                                       false);
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit><image>", params->n_batch, n_past, seq_id,
+                                                false)) {
+                goto fail;
+            }
         } else {
-            omni_llm_stage_eval_string(ctx_omni, params, "<image>", params->n_batch, &ctx_omni->session.n_past,
-                                       false);
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<image>", params->n_batch, n_past, seq_id, false)) {
+                goto fail;
+            }
         }
 
-        prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[0].data()), tokens_per_chunk,
-                         params->n_batch, &ctx_omni->session.n_past);
-        omni_llm_stage_eval_string(ctx_omni, params, "</image>", params->n_batch, &ctx_omni->session.n_past, false);
+        if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.vision_embed[0].data(), tokens_per_chunk,
+                                            params->n_batch, n_past, seq_id)) {
+            goto fail;
+        }
+        if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</image>", params->n_batch, n_past, seq_id, false)) {
+            goto fail;
+        }
 
         if (has_slices) {
             for (int i = 1; i < n_chunks; ++i) {
-                omni_llm_stage_eval_string(ctx_omni, params, "<slice>", params->n_batch, &ctx_omni->session.n_past,
-                                           false);
-                prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.vision_embed[i].data()), tokens_per_chunk,
-                                 params->n_batch, &ctx_omni->session.n_past);
-                omni_llm_stage_eval_string(ctx_omni, params, "</slice>", params->n_batch, &ctx_omni->session.n_past,
-                                           false);
+                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<slice>", params->n_batch, n_past, seq_id,
+                                                    false)) {
+                    goto fail;
+                }
+                if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.vision_embed[i].data(), tokens_per_chunk,
+                                                    params->n_batch, n_past, seq_id)) {
+                    goto fail;
+                }
+                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</slice>", params->n_batch, n_past, seq_id,
+                                                    false)) {
+                    goto fail;
+                }
             }
-            omni_llm_stage_eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->session.n_past, false);
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "\n", params->n_batch, n_past, seq_id, false)) {
+                goto fail;
+            }
         }
 
         print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
@@ -612,14 +789,20 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
 
         if (has_audio) {
             if (!ctx_omni->duplex_mode) {
-                omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
-                                           &ctx_omni->session.n_past, false);
+                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_start|>", params->n_batch, n_past,
+                                                    seq_id, false)) {
+                    goto fail;
+                }
             }
-            prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
-                             params->n_batch, &ctx_omni->session.n_past);
+            if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.audio_embed.data(), n_audio_tokens,
+                                                params->n_batch, n_past, seq_id)) {
+                goto fail;
+            }
             if (!ctx_omni->duplex_mode) {
-                omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch,
-                                           &ctx_omni->session.n_past, false);
+                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_end|>", params->n_batch, n_past,
+                                                    seq_id, false)) {
+                    goto fail;
+                }
             }
         }
     } else {
@@ -627,27 +810,50 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
 
         if (ctx_omni->duplex_mode) {
-            omni_llm_stage_eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->session.n_past, false);
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit>", params->n_batch, n_past, seq_id, false)) {
+                goto fail;
+            }
         } else {
-            omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
-                                       &ctx_omni->session.n_past, false);
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_start|>", params->n_batch, n_past, seq_id,
+                                                false)) {
+                goto fail;
+            }
         }
 
         if (n_audio_tokens > 0) {
-            prefill_with_emb(ctx_omni, params, const_cast<float *>(embeds.audio_embed.data()), n_audio_tokens,
-                             params->n_batch, &ctx_omni->session.n_past);
+            if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.audio_embed.data(), n_audio_tokens,
+                                                params->n_batch, n_past, seq_id)) {
+                goto fail;
+            }
         }
 
         if (!ctx_omni->duplex_mode) {
-            omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch,
-                                       &ctx_omni->session.n_past, false);
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_end|>", params->n_batch, n_past, seq_id,
+                                                false)) {
+                goto fail;
+            }
         }
     }
 
-    if (ctx_omni->session.sliding_window_config.mode != "off") {
+    if (track_sliding_window) {
         const std::string input_type = embeds.vision_embed.empty() ? "audio" : "omni";
         sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
     }
+
+    return true;
+
+fail:
+    if (track_sliding_window) {
+        ctx_omni->session.pending_unit_id              = -1;
+        ctx_omni->session.pending_unit_start_cache_len = 0;
+    }
+    return false;
+}
+
+bool omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
+                                  struct common_params *     params,
+                                  const struct omni_embeds & embeds) {
+    return omni_llm_stage_prefill_apply_seq(ctx_omni, params, embeds, /*seq_id=*/0, &ctx_omni->session.n_past);
 }
 
 void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni) {
@@ -656,24 +862,170 @@ void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni) {
     }
 }
 
+static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    ctx_omni,
+                                                       struct common_params *   params,
+                                                       OmniLlmSchedulerState &  state,
+                                                       struct omni_embeds **    out_staged_prefill) {
+    if (out_staged_prefill == nullptr) {
+        return false;
+    }
+    *out_staged_prefill = nullptr;
+
+    if (!omni_llm_stage_micro_batch_supported(ctx_omni)) {
+        return false;
+    }
+
+    omni_embeds * pending = omni_llm_stage_peek_prefill_head(ctx_omni);
+    if (pending == nullptr || pending->encode_failed) {
+        return false;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    if (mem == nullptr) {
+        LOG_ERR("%s: failed to get llama memory for staging\n", __func__);
+        return false;
+    }
+
+    const auto prefill_start = std::chrono::high_resolution_clock::now();
+    state.branch_n_past      = ctx_omni->session.n_past;
+    state.spec_decode_tail   = std::max(0, omni_llm_stage_estimate_speculative_decode_tail(ctx_omni));
+    state.staged_begin_pos   = state.branch_n_past + state.spec_decode_tail;
+    state.staged_n_past      = state.staged_begin_pos;
+    state.staged_chunk_idx   = pending->index;
+
+    llama_memory_seq_rm(mem, state.staging_seq, 0, -1);
+    llama_memory_seq_cp(mem, state.active_seq, state.staging_seq, 0, state.branch_n_past);
+
+    if (!omni_llm_stage_prefill_apply_seq(ctx_omni, params, *pending, state.staging_seq, &state.staged_n_past)) {
+        LOG_WRN("%s: speculative staging failed for chunk %d, fallback to serial prefill\n", __func__, pending->index);
+        omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
+        return false;
+    }
+
+    omni_embeds * popped = omni_llm_stage_pop_prefill_head(ctx_omni);
+    if (popped == nullptr || popped != pending) {
+        LOG_ERR("%s: speculative staging desynced with prefill queue head\n", __func__);
+        if (popped != nullptr && popped != pending) {
+            delete popped;
+        }
+        omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
+        return false;
+    }
+
+    *out_staged_prefill = popped;
+    state.staged_ready  = true;
+    omni_llm_stage_note_prefill_timing(
+        ctx_omni, pending->index,
+        omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
+    print_with_timestamp(
+        "LLM scheduler: staged chunk %d on seq=%d (branch=%d, staged_begin=%d, staged_n_past=%d, spec_tail=%d)\n",
+        pending->index, state.staging_seq, state.branch_n_past, state.staged_begin_pos, state.staged_n_past,
+        state.spec_decode_tail);
+    return true;
+}
+
+static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLlmSchedulerState & state) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || !state.staged_ready) {
+        return false;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    if (mem == nullptr) {
+        LOG_ERR("%s: failed to get llama memory for promote\n", __func__);
+        return false;
+    }
+
+    if (state.staged_n_past < state.staged_begin_pos || state.branch_n_past < 0) {
+        LOG_ERR("%s: invalid staged state (branch=%d, begin=%d, n_past=%d)\n", __func__, state.branch_n_past,
+                state.staged_begin_pos, state.staged_n_past);
+        return false;
+    }
+
+    const int actual_decode_tail = ctx_omni->session.n_past - state.branch_n_past;
+    const int delta              = actual_decode_tail - state.spec_decode_tail;
+
+    if (delta != 0) {
+        llama_memory_seq_add(mem, state.staging_seq, state.staged_begin_pos, state.staged_n_past, delta);
+    }
+
+    if (!llama_memory_seq_rm(mem, state.active_seq, 0, -1)) {
+        LOG_ERR("%s: failed to clear active sequence %d before promote\n", __func__, state.active_seq);
+        return false;
+    }
+
+    llama_memory_seq_cp(mem, state.staging_seq, state.active_seq, 0, -1);
+    if (!llama_memory_seq_rm(mem, state.staging_seq, 0, -1)) {
+        LOG_WRN("%s: failed to clear staging sequence %d after promote, continuing with promoted active seq\n",
+                __func__, state.staging_seq);
+    }
+
+    ctx_omni->session.n_past = state.staged_n_past + delta;
+    print_with_timestamp(
+        "LLM scheduler: promoted staged chunk %d (actual_tail=%d, spec_tail=%d, delta=%d, n_past=%d)\n",
+        state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta, ctx_omni->session.n_past);
+    omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/false);
+    return true;
+}
+
+static bool omni_llm_stage_apply_serial_prefill_fallback(struct omni_context *     ctx_omni,
+                                                         struct common_params *    params,
+                                                         const struct omni_embeds * staged_prefill) {
+    if (ctx_omni == nullptr || params == nullptr || staged_prefill == nullptr) {
+        return false;
+    }
+
+    const auto prefill_start = std::chrono::high_resolution_clock::now();
+    const bool ok            = omni_llm_stage_prefill_apply(ctx_omni, params, *staged_prefill);
+    if (ok) {
+        omni_llm_stage_finalize_prefill(ctx_omni);
+        omni_llm_stage_note_prefill_timing(
+            ctx_omni, staged_prefill->index,
+            omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
+    }
+    return ok;
+}
+
 void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params) {
     if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
         return;
     }
 
     print_with_timestamp("LLM thread started\n");
-    OmniLlmSchedulerState                   scheduler;
-    OmniLlmStageDecodeRequest              active_request;
+    OmniLlmSchedulerState                        scheduler;
+    OmniLlmStageDecodeRequest                   active_request;
     std::chrono::high_resolution_clock::time_point decode_start;
-    bool                                   policy_fallback_logged = false;
+    bool                                        policy_fallback_logged = false;
+    omni_embeds *                               staged_prefill         = nullptr;
 
     while (ctx_omni->workers.llm_thread_running) {
         if (!scheduler.decode_active) {
             std::vector<omni_embeds *> simplex_prefills;
             omni_embeds *              duplex_prefill  = nullptr;
             bool                       decode_requested = false;
+            bool                       serial_prefill_fallback = false;
 
-            {
+            if (ctx_omni->duplex_mode &&
+                ctx_omni->llm_schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH &&
+                scheduler.staged_ready) {
+                const int staged_chunk_idx = scheduler.staged_chunk_idx;
+                if (omni_llm_stage_promote_staged(ctx_omni, scheduler)) {
+                    delete staged_prefill;
+                    staged_prefill = nullptr;
+
+                    omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, staged_chunk_idx);
+                    scheduler.active_chunk_idx = staged_chunk_idx;
+                    decode_requested           = true;
+                } else {
+                    LOG_WRN("%s: promote failed for chunk %d, fallback to serial prefill\n", __func__,
+                            staged_chunk_idx);
+                    omni_llm_stage_reset_staged_state(ctx_omni, scheduler, /*clear_staging_seq=*/true);
+                    duplex_prefill          = staged_prefill;
+                    staged_prefill          = nullptr;
+                    serial_prefill_fallback = duplex_prefill != nullptr;
+                }
+            }
+
+            if (!decode_requested && duplex_prefill == nullptr) {
                 std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
                 auto *                       llm_thread_info = ctx_omni->llm_thread_info;
                 llm_thread_info->cv.wait(lock, [&] {
@@ -699,6 +1051,14 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
             ctx_omni->llm_thread_info->cv.notify_all();
 
             if (ctx_omni->duplex_mode) {
+                if (ctx_omni->llm_schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH &&
+                    !omni_llm_stage_micro_batch_supported(ctx_omni) && !policy_fallback_logged) {
+                    print_with_timestamp(
+                        "LLM scheduler: MICRO_BATCH requires kv_unified=true and n_seq_max>=2, fallback to "
+                        "DECODE_FIRST for this context\n");
+                    policy_fallback_logged = true;
+                }
+
                 if (duplex_prefill != nullptr) {
                     if (duplex_prefill->encode_failed) {
                         print_with_timestamp("LLM thread: skip chunk %d because encode stage failed\n",
@@ -711,12 +1071,28 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                     omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, duplex_prefill->index);
                     scheduler.active_chunk_idx = duplex_prefill->index;
 
-                    const auto prefill_start = std::chrono::high_resolution_clock::now();
-                    omni_llm_stage_prefill_apply(ctx_omni, params, *duplex_prefill);
-                    omni_llm_stage_finalize_prefill(ctx_omni);
-                    omni_llm_stage_note_prefill_timing(
-                        ctx_omni, duplex_prefill->index,
-                        omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
+                    bool prefill_ok = false;
+                    if (serial_prefill_fallback) {
+                        prefill_ok = omni_llm_stage_apply_serial_prefill_fallback(ctx_omni, params, duplex_prefill);
+                    } else {
+                        const auto prefill_start = std::chrono::high_resolution_clock::now();
+                        prefill_ok              = omni_llm_stage_prefill_apply(ctx_omni, params, *duplex_prefill);
+                        if (prefill_ok) {
+                            omni_llm_stage_finalize_prefill(ctx_omni);
+                            omni_llm_stage_note_prefill_timing(
+                                ctx_omni, duplex_prefill->index,
+                                omni_llm_stage_timing_elapsed_ms(prefill_start,
+                                                                 std::chrono::high_resolution_clock::now()));
+                        }
+                    }
+
+                    if (!prefill_ok) {
+                        LOG_ERR("%s: failed to apply duplex prefill for chunk %d\n", __func__, duplex_prefill->index);
+                        delete duplex_prefill;
+                        omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
+                        continue;
+                    }
+
                     delete duplex_prefill;
 
                     print_with_timestamp(
@@ -728,6 +1104,7 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                     scheduler.active_chunk_idx = omni_llm_stage_active_duplex_chunk_idx(ctx_omni);
                 }
             } else {
+                bool simplex_prefill_failed = false;
                 if (!simplex_prefills.empty()) {
                     print_with_timestamp("LLM thread: start prefill, n_past=%d, n_keep=%d, n_ctx=%d\n",
                                          ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep, params->n_ctx);
@@ -735,19 +1112,34 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                                          ctx_omni->session.n_past);
                 }
 
-                for (auto * embeds : simplex_prefills) {
+                for (auto *& embeds : simplex_prefills) {
                     if (embeds->encode_failed) {
                         print_with_timestamp("LLM thread: skip simplex prefill because encode stage failed\n");
                         delete embeds;
+                        embeds = nullptr;
                         omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
                         continue;
                     }
 
-                    omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
+                    if (!omni_llm_stage_prefill_apply(ctx_omni, params, *embeds)) {
+                        delete embeds;
+                        embeds = nullptr;
+                        omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
+                        for (auto * pending_embeds : simplex_prefills) {
+                            if (pending_embeds != nullptr) {
+                                delete pending_embeds;
+                            }
+                        }
+                        simplex_prefills.clear();
+                        simplex_prefill_failed = true;
+                        decode_requested = false;
+                        break;
+                    }
                     delete embeds;
+                    embeds = nullptr;
                 }
 
-                if (!simplex_prefills.empty()) {
+                if (!simplex_prefill_failed && !simplex_prefills.empty()) {
                     print_with_timestamp(
                         "LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",
                         ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep,
@@ -760,13 +1152,6 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                 continue;
             }
 
-            if (ctx_omni->llm_schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH && !policy_fallback_logged) {
-                print_with_timestamp(
-                    "LLM scheduler: policy %d not implemented yet, fallback to DECODE_FIRST\n",
-                    static_cast<int>(ctx_omni->llm_schedule_policy));
-                policy_fallback_logged = true;
-            }
-
             active_request = omni_llm_stage_get_pipeline_request(ctx_omni);
             omni_llm_stage_prepare_worker_decode(ctx_omni, active_request);
 
@@ -775,6 +1160,15 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
 
             decode_start            = std::chrono::high_resolution_clock::now();
             scheduler.decode_active = true;
+        }
+
+        if (ctx_omni->duplex_mode &&
+            ctx_omni->llm_schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH &&
+            !scheduler.staged_ready &&
+            staged_prefill == nullptr &&
+            omni_llm_stage_has_pending_prefill(ctx_omni) &&
+            omni_llm_stage_micro_batch_supported(ctx_omni)) {
+            omni_llm_stage_stage_prefill_speculatively(ctx_omni, params, scheduler, &staged_prefill);
         }
 
         OmniLlmDecodeSliceResult slice;
@@ -811,12 +1205,24 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
         const OmniTurnCloseKind close_kind = slice.preempted ? OmniTurnCloseKind::preempt :
                                              slice.interrupted ? OmniTurnCloseKind::abort :
                                                                  OmniTurnCloseKind::finish;
+
+        if ((slice.interrupted || slice.preempted) && staged_prefill != nullptr) {
+            omni_llm_stage_reset_staged_state(ctx_omni, scheduler, /*clear_staging_seq=*/true);
+            delete staged_prefill;
+            staged_prefill = nullptr;
+        }
+
         omni_turn_coordinator_close(ctx_omni, close_kind, slice.preempted ? "pending-prefill" : nullptr);
         omni_llm_stage_post_pipeline_result(ctx_omni, !slice.interrupted || slice.preempted,
                                             slice.ended_with_listen);
 
         scheduler.decode_active    = false;
         scheduler.active_chunk_idx = -1;
+    }
+
+    if (staged_prefill != nullptr) {
+        omni_llm_stage_reset_staged_state(ctx_omni, scheduler, /*clear_staging_seq=*/true);
+        delete staged_prefill;
     }
 
     print_with_timestamp("LLM thread stopped\n");

@@ -71,6 +71,13 @@ bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
                                 int                      n_batch,
                                 int *                    n_past,
                                 bool                     get_emb = false);
+bool omni_llm_stage_eval_tokens_seq(struct omni_context *    ctx_omni,
+                                    struct common_params *   params,
+                                    std::vector<llama_token> tokens,
+                                    int                      n_batch,
+                                    int *                    n_past,
+                                    llama_seq_id             seq_id,
+                                    bool                     get_emb = false);
 bool omni_llm_stage_eval_string(struct omni_context * ctx_omni,
                                 struct common_params * params,
                                 const char *           str,
@@ -78,6 +85,14 @@ bool omni_llm_stage_eval_string(struct omni_context * ctx_omni,
                                 int *                  n_past,
                                 bool                   add_bos,
                                 bool                   get_emb = false);
+bool omni_llm_stage_eval_string_seq(struct omni_context * ctx_omni,
+                                    struct common_params * params,
+                                    const char *           str,
+                                    int                    n_batch,
+                                    int *                  n_past,
+                                    llama_seq_id           seq_id,
+                                    bool                   add_bos,
+                                    bool                   get_emb = false);
 bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
                                             struct common_params * params,
                                             const char *           str,
@@ -86,9 +101,14 @@ bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
                                             bool                   add_bos,
                                             float *&               hidden_states);
 
-void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
+bool omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                   struct common_params *     params,
                                   const struct omni_embeds & embeds);
+bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
+                                      struct common_params *     params,
+                                      const struct omni_embeds & embeds,
+                                      llama_seq_id               seq_id,
+                                      int *                      n_past);
 void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni);
 void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params);
 void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni);

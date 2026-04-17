@@ -110,7 +110,9 @@ bool omni_submit_llm_prefill(struct omni_context * ctx_omni, std::unique_ptr<str
     }
 
     if (!ctx_omni->async) {
-        omni_llm_stage_prefill_apply(ctx_omni, ctx_omni->params, *encoded);
+        if (!omni_llm_stage_prefill_apply(ctx_omni, ctx_omni->params, *encoded)) {
+            return false;
+        }
         omni_llm_stage_finalize_prefill(ctx_omni);
         return true;
     }

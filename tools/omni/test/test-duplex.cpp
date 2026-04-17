@@ -642,6 +642,10 @@ int main(int argc, char ** argv) {
         params.sampling.top_k = 0;
         params.sampling.top_p = 1.0f;
     }
+    if (schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH) {
+        params.n_parallel = std::max(params.n_parallel, 2);
+        params.kv_unified = true;
+    }
 
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
