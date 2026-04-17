@@ -889,7 +889,10 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
     const auto prefill_start = std::chrono::high_resolution_clock::now();
     state.branch_n_past      = ctx_omni->session.n_past;
     state.spec_decode_tail   = std::max(0, omni_llm_stage_estimate_speculative_decode_tail(ctx_omni));
-    state.staged_begin_pos   = state.branch_n_past + state.spec_decode_tail;
+    // llama.cpp requires each sequence to be fed with consecutive positions. We therefore stage
+    // the speculative prefill right after the committed prefix, and only shift it forward after
+    // the active decode tail length becomes known.
+    state.staged_begin_pos   = state.branch_n_past;
     state.staged_n_past      = state.staged_begin_pos;
     state.staged_chunk_idx   = pending->index;
 
@@ -918,7 +921,7 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
         ctx_omni, pending->index,
         omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
     print_with_timestamp(
-        "LLM scheduler: staged chunk %d on seq=%d (branch=%d, staged_begin=%d, staged_n_past=%d, spec_tail=%d)\n",
+        "LLM scheduler: staged chunk %d on seq=%d (branch=%d, staged_begin=%d, staged_n_past=%d, predicted_tail=%d)\n",
         pending->index, state.staging_seq, state.branch_n_past, state.staged_begin_pos, state.staged_n_past,
         state.spec_decode_tail);
     return true;
@@ -942,7 +945,7 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
     }
 
     const int actual_decode_tail = ctx_omni->session.n_past - state.branch_n_past;
-    const int delta              = actual_decode_tail - state.spec_decode_tail;
+    const int delta              = actual_decode_tail;
 
     if (delta != 0) {
         llama_memory_seq_add(mem, state.staging_seq, state.staged_begin_pos, state.staged_n_past, delta);
@@ -961,7 +964,7 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
 
     ctx_omni->session.n_past = state.staged_n_past + delta;
     print_with_timestamp(
-        "LLM scheduler: promoted staged chunk %d (actual_tail=%d, spec_tail=%d, delta=%d, n_past=%d)\n",
+        "LLM scheduler: promoted staged chunk %d (actual_tail=%d, predicted_tail=%d, shift=%d, n_past=%d)\n",
         state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta, ctx_omni->session.n_past);
     omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/false);
     return true;

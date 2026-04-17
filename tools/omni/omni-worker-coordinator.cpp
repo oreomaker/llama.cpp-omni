@@ -74,6 +74,11 @@ void omni_ensure_prefill_workers_started(struct omni_context * ctx_omni, const O
     }
 
     print_with_timestamp("ensure async worker threads\n");
+    const bool had_encode = ctx_omni->encode_thread.joinable();
+    const bool had_llm    = ctx_omni->llm_thread.joinable();
+    const bool had_tts    = ctx_omni->tts_thread.joinable();
+    const bool had_t2w    = ctx_omni->t2w_thread.joinable();
+
     omni_start_encode_worker_if_needed(ctx_omni, worker_fns, "");
 
     if (!ctx_omni->llm_thread.joinable()) {
@@ -84,6 +89,11 @@ void omni_ensure_prefill_workers_started(struct omni_context * ctx_omni, const O
 
     omni_start_tts_worker_if_needed(ctx_omni, worker_fns, "");
     omni_start_t2w_worker_if_needed(ctx_omni, worker_fns, "");
+
+    if (had_encode && had_llm && (!ctx_omni->use_tts || had_tts) &&
+        (ctx_omni->t2w_thread_info == nullptr || had_t2w)) {
+        print_with_timestamp("async worker threads already running\n");
+    }
 }
 
 void omni_request_worker_shutdown(struct omni_context * ctx_omni) {
