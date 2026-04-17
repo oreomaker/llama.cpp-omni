@@ -138,6 +138,25 @@ int omni_llm_stage_estimate_speculative_decode_tail(const struct omni_context * 
     return remaining_decode_budget + estimated_closure_tokens;
 }
 
+bool omni_llm_stage_capture_frontier_logits(struct omni_context * ctx_omni, std::vector<float> & out_logits) {
+    out_logits.clear();
+
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr) {
+        return false;
+    }
+
+    const float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    if (logits == nullptr) {
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+    const int           n_vocab = llama_vocab_n_tokens(vocab);
+
+    out_logits.assign(logits, logits + n_vocab);
+    return true;
+}
+
 void omni_llm_stage_reset_staged_state(struct omni_context * ctx_omni,
                                        OmniLlmSchedulerState & state,
                                        bool                   clear_staging_seq) {
@@ -147,12 +166,18 @@ void omni_llm_stage_reset_staged_state(struct omni_context * ctx_omni,
         }
     }
 
+    if (state.staged_sampler != nullptr) {
+        common_sampler_free(state.staged_sampler);
+        state.staged_sampler = nullptr;
+    }
+
     state.staged_ready     = false;
     state.staged_chunk_idx = -1;
     state.branch_n_past    = 0;
     state.staged_begin_pos = 0;
     state.staged_n_past    = 0;
     state.spec_decode_tail = 0;
+    state.staged_frontier_logits.clear();
 }
 
 bool omni_llm_stage_close_decode_preemptively(struct omni_context * ctx_omni) {
@@ -347,15 +372,12 @@ bool omni_llm_stage_eval_id_with_hidden(struct omni_context * ctx_omni,
     return omni_llm_stage_eval_tokens_with_hidden(ctx_omni, params, std::move(tokens), 1, n_past, hidden_states);
 }
 
-const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler * smpl,
-                                                         struct omni_context *   ctx_omni,
-                                                         struct common_params *  params,
-                                                         int *                   n_past,
-                                                         float *&                hidden_states,
-                                                         llama_token &           token_id) {
-    float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+void omni_llm_stage_apply_decode_logit_biases(struct omni_context * ctx_omni, float * logits) {
+    if (ctx_omni == nullptr || logits == nullptr) {
+        return;
+    }
 
-    if (ctx_omni->duplex_mode && logits != nullptr) {
+    if (ctx_omni->duplex_mode) {
         if (ctx_omni->special_token_listen >= 0) {
             const float listen_bias = (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;
             logits[ctx_omni->special_token_listen] += listen_bias;
@@ -365,8 +387,7 @@ const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler *
         }
     }
 
-    if (!ctx_omni->duplex_mode && ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0 &&
-        logits != nullptr) {
+    if (!ctx_omni->duplex_mode && ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
         const float eos_logit = logits[ctx_omni->special_token_tts_eos];
         if (eos_logit > 0) {
             logits[ctx_omni->special_token_tts_eos] = eos_logit / ctx_omni->length_penalty;
@@ -374,8 +395,47 @@ const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler *
             logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->length_penalty;
         }
     }
+}
+
+const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler * smpl,
+                                                         struct omni_context *   ctx_omni,
+                                                         struct common_params *  params,
+                                                         int *                   n_past,
+                                                         float *&                hidden_states,
+                                                         llama_token &           token_id) {
+    float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    omni_llm_stage_apply_decode_logit_biases(ctx_omni, logits);
 
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    token_id             = id;
+    common_sampler_accept(smpl, id, true);
+
+    static std::string ret;
+    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
+        ret = "</s>";
+    } else {
+        ret = common_token_to_piece(ctx_omni->ctx_llama, id);
+    }
+
+    omni_llm_stage_eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
+    return ret.c_str();
+}
+
+const char * omni_llm_stage_sample_with_hidden_and_token_from_logits(struct common_sampler *      smpl,
+                                                                     struct omni_context *        ctx_omni,
+                                                                     struct common_params *       params,
+                                                                     const std::vector<float> &   frontier_logits,
+                                                                     int *                        n_past,
+                                                                     float *&                     hidden_states,
+                                                                     llama_token &                token_id) {
+    if (frontier_logits.empty()) {
+        return nullptr;
+    }
+
+    std::vector<float> logits = frontier_logits;
+    omni_llm_stage_apply_decode_logit_biases(ctx_omni, logits.data());
+
+    const llama_token id = common_sampler_sample_from_logits(smpl, ctx_omni->ctx_llama, logits.data());
     token_id             = id;
     common_sampler_accept(smpl, id, true);
 
@@ -889,12 +949,16 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
     const auto prefill_start = std::chrono::high_resolution_clock::now();
     state.branch_n_past      = ctx_omni->session.n_past;
     state.spec_decode_tail   = std::max(0, omni_llm_stage_estimate_speculative_decode_tail(ctx_omni));
-    // llama.cpp requires each sequence to be fed with consecutive positions. We therefore stage
-    // the speculative prefill right after the committed prefix, and only shift it forward after
-    // the active decode tail length becomes known.
-    state.staged_begin_pos   = state.branch_n_past;
+    state.staged_begin_pos   = state.branch_n_past + state.spec_decode_tail;
     state.staged_n_past      = state.staged_begin_pos;
     state.staged_chunk_idx   = pending->index;
+    state.staged_frontier_logits.clear();
+
+    if (!omni_llm_stage_capture_frontier_logits(ctx_omni, state.pending_frontier_logits)) {
+        LOG_WRN("%s: failed to snapshot active frontier logits before staging chunk %d, fallback to serial prefill\n",
+                __func__, pending->index);
+        return false;
+    }
 
     llama_memory_seq_rm(mem, state.staging_seq, 0, -1);
     llama_memory_seq_cp(mem, state.active_seq, state.staging_seq, 0, state.branch_n_past);
@@ -903,6 +967,21 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
         LOG_WRN("%s: speculative staging failed for chunk %d, fallback to serial prefill\n", __func__, pending->index);
         omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
         return false;
+    }
+
+    if (!omni_llm_stage_capture_frontier_logits(ctx_omni, state.staged_frontier_logits)) {
+        LOG_WRN("%s: failed to snapshot staged frontier logits for chunk %d, fallback to serial prefill\n", __func__,
+                pending->index);
+        omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
+        return false;
+    }
+
+    if (state.staged_sampler != nullptr) {
+        common_sampler_free(state.staged_sampler);
+        state.staged_sampler = nullptr;
+    }
+    if (ctx_omni->ctx_sampler != nullptr) {
+        state.staged_sampler = common_sampler_clone(ctx_omni->ctx_sampler);
     }
 
     omni_embeds * popped = omni_llm_stage_pop_prefill_head(ctx_omni);
@@ -945,10 +1024,12 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
     }
 
     const int actual_decode_tail = ctx_omni->session.n_past - state.branch_n_past;
-    const int delta              = actual_decode_tail;
+    const int delta              = actual_decode_tail - state.spec_decode_tail;
 
     if (delta != 0) {
-        llama_memory_seq_add(mem, state.staging_seq, state.staged_begin_pos, state.staged_n_past, delta);
+        LOG_WRN("%s: speculative tail mismatch for chunk %d (actual=%d, predicted=%d, delta=%d), fallback to serial prefill\n",
+                __func__, state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta);
+        return false;
     }
 
     if (!llama_memory_seq_rm(mem, state.active_seq, 0, -1)) {
@@ -962,7 +1043,17 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
                 __func__, state.staging_seq);
     }
 
-    ctx_omni->session.n_past = state.staged_n_past + delta;
+    if (state.staged_sampler != nullptr) {
+        common_sampler * old_sampler = ctx_omni->ctx_sampler;
+        ctx_omni->ctx_sampler        = state.staged_sampler;
+        state.staged_sampler         = nullptr;
+        if (old_sampler != nullptr) {
+            common_sampler_free(old_sampler);
+        }
+    }
+
+    state.pending_frontier_logits = std::move(state.staged_frontier_logits);
+    ctx_omni->session.n_past      = state.staged_n_past;
     print_with_timestamp(
         "LLM scheduler: promoted staged chunk %d (actual_tail=%d, predicted_tail=%d, shift=%d, n_past=%d)\n",
         state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta, ctx_omni->session.n_past);
@@ -1006,6 +1097,7 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
             omni_embeds *              duplex_prefill  = nullptr;
             bool                       decode_requested = false;
             bool                       serial_prefill_fallback = false;
+            bool                       decode_from_promote = false;
 
             if (ctx_omni->duplex_mode &&
                 ctx_omni->llm_schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH &&
@@ -1018,6 +1110,7 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                     omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, staged_chunk_idx);
                     scheduler.active_chunk_idx = staged_chunk_idx;
                     decode_requested           = true;
+                    decode_from_promote        = true;
                 } else {
                     LOG_WRN("%s: promote failed for chunk %d, fallback to serial prefill\n", __func__,
                             staged_chunk_idx);
@@ -1155,6 +1248,10 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                 continue;
             }
 
+            if (!decode_from_promote) {
+                scheduler.pending_frontier_logits.clear();
+            }
+
             active_request = omni_llm_stage_get_pipeline_request(ctx_omni);
             omni_llm_stage_prepare_worker_decode(ctx_omni, active_request);
 
@@ -1175,9 +1272,11 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
         }
 
         OmniLlmDecodeSliceResult slice;
-        if (!omni_llm_stage_decode_slice(ctx_omni, active_request, ctx_omni->reschedule_interval_tokens, &slice)) {
+        if (!omni_llm_stage_decode_slice(ctx_omni, active_request, ctx_omni->reschedule_interval_tokens, &slice,
+                                         &scheduler)) {
             omni_llm_stage_finish_decode_text_stream(ctx_omni);
             omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
+            scheduler.pending_frontier_logits.clear();
             break;
         }
 
@@ -1221,12 +1320,14 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
 
         scheduler.decode_active    = false;
         scheduler.active_chunk_idx = -1;
+        scheduler.pending_frontier_logits.clear();
     }
 
     if (staged_prefill != nullptr) {
         omni_llm_stage_reset_staged_state(ctx_omni, scheduler, /*clear_staging_seq=*/true);
         delete staged_prefill;
     }
+    scheduler.pending_frontier_logits.clear();
 
     print_with_timestamp("LLM thread stopped\n");
 }
@@ -1265,7 +1366,8 @@ void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni) {
 bool omni_llm_stage_decode_slice(struct omni_context *             ctx_omni,
                                  const OmniLlmStageDecodeRequest & request,
                                  int                               max_tokens,
-                                 OmniLlmDecodeSliceResult *        out_result) {
+                                 OmniLlmDecodeSliceResult *        out_result,
+                                 OmniLlmSchedulerState *           scheduler) {
     if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->params == nullptr) {
         return false;
     }
@@ -1317,11 +1419,24 @@ bool omni_llm_stage_decode_slice(struct omni_context *             ctx_omni,
             const char * tmp           = nullptr;
             float *      hidden_states = nullptr;
             llama_token  sampled_token = 0;
+            const bool   use_frontier_snapshot =
+                scheduler != nullptr && !scheduler->pending_frontier_logits.empty();
 
             {
                 std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-                tmp = omni_llm_stage_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler,
-                                                                ctx_omni->session.n_past, hidden_states, sampled_token);
+                if (use_frontier_snapshot) {
+                    tmp = omni_llm_stage_sample_with_hidden_and_token_from_logits(
+                        ctx_omni->ctx_sampler, ctx_omni, ctx_omni->params, scheduler->pending_frontier_logits,
+                        &ctx_omni->session.n_past, hidden_states, sampled_token);
+                } else {
+                    tmp = omni_llm_stage_loop_with_hidden_and_token(
+                        ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler, ctx_omni->session.n_past, hidden_states,
+                        sampled_token);
+                }
+            }
+
+            if (use_frontier_snapshot) {
+                scheduler->pending_frontier_logits.clear();
             }
 
             total_tokens_generated++;

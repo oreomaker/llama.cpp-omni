@@ -114,9 +114,7 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const auto * logits = llama_get_logits_ith(ctx, idx);
-
+    void set_logits_data(struct llama_context * ctx, const float * logits) {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -129,6 +127,11 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    void set_logits(struct llama_context * ctx, int idx) {
+        const auto * logits = llama_get_logits_ith(ctx, idx);
+        set_logits_data(ctx, logits);
     }
 };
 
@@ -313,6 +316,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     llama_sampler_reset(gsmpl->grmr);
 
     llama_sampler_reset(gsmpl->chain);
+    gsmpl->prev.clear();
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
@@ -375,6 +379,52 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
+
+    llama_sampler_apply(grmr,  &cur_p);
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during re-sampling - check your sampling configuration");
+
+    return cur_p.data[cur_p.selected].id;
+}
+
+llama_token common_sampler_sample_from_logits(struct common_sampler * gsmpl,
+                                              struct llama_context *  ctx,
+                                              const float *           logits,
+                                              bool                    grammar_first) {
+    gsmpl->set_logits_data(ctx, logits);
+
+    auto & grmr  = gsmpl->grmr;
+    auto & chain = gsmpl->chain;
+    auto & cur_p = gsmpl->cur_p; // initialized by set_logits_data
+
+    if (grammar_first) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    const llama_token id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first) {
+        return id;
+    }
+
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
+        if (is_valid) {
+            return id;
+        }
+    }
+
+    gsmpl->set_logits_data(ctx, logits);
 
     llama_sampler_apply(grmr,  &cur_p);
     llama_sampler_apply(chain, &cur_p);

@@ -6,6 +6,7 @@
 #include <vector>
 
 struct common_params;
+struct common_sampler;
 struct omni_embeds;
 struct omni_context;
 
@@ -63,6 +64,9 @@ struct OmniLlmSchedulerState {
     int  staged_begin_pos        = 0;
     int  staged_n_past           = 0;
     int  spec_decode_tail        = 0;
+    struct common_sampler * staged_sampler = nullptr;
+    std::vector<float> pending_frontier_logits;
+    std::vector<float> staged_frontier_logits;
 };
 
 bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
@@ -115,7 +119,8 @@ void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni);
 bool omni_llm_stage_decode_slice(struct omni_context *             ctx_omni,
                                  const OmniLlmStageDecodeRequest & request,
                                  int                               max_tokens,
-                                 OmniLlmDecodeSliceResult *        out_result);
+                                 OmniLlmDecodeSliceResult *        out_result,
+                                 OmniLlmSchedulerState *           scheduler = nullptr);
 bool omni_llm_stage_decode_run(struct omni_context *                ctx_omni,
                                const OmniLlmStageDecodeRequest &    request,
                                OmniLlmStageDecodeResult *           out_result = nullptr);

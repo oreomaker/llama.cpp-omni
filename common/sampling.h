@@ -59,6 +59,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+llama_token common_sampler_sample_from_logits(struct common_sampler * gsmpl,
+                                              struct llama_context *  ctx,
+                                              const float *           logits,
+                                              bool                    grammar_first = false);
 
 // generalized version of common_sampler_sample
 //
