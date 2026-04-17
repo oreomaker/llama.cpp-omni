@@ -956,9 +956,14 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
     state.staged_chunk_idx   = pending->index;
     state.staged_frontier_logits.clear();
 
+    print_with_timestamp(
+        "LLM scheduler: stage attempt for chunk %d on seq=%d (branch=%d, predicted_tail=%d, staged_begin=%d)\n",
+        pending->index, state.staging_seq, state.branch_n_past, state.spec_decode_tail, state.staged_begin_pos);
+
     if (!omni_llm_stage_capture_frontier_logits(ctx_omni, state.pending_frontier_logits)) {
-        LOG_WRN("%s: failed to snapshot active frontier logits before staging chunk %d, fallback to serial prefill\n",
-                __func__, pending->index);
+        print_with_timestamp(
+            "LLM scheduler: failed to snapshot active frontier logits before staging chunk %d, fallback to serial prefill\n",
+            pending->index);
         return false;
     }
 
@@ -966,14 +971,16 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
     llama_memory_seq_cp(mem, state.active_seq, state.staging_seq, 0, state.branch_n_past);
 
     if (!omni_llm_stage_prefill_apply_seq(ctx_omni, params, *pending, state.staging_seq, &state.staged_n_past)) {
-        LOG_WRN("%s: speculative staging failed for chunk %d, fallback to serial prefill\n", __func__, pending->index);
+        print_with_timestamp("LLM scheduler: speculative staging failed for chunk %d, fallback to serial prefill\n",
+                             pending->index);
         omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
         return false;
     }
 
     if (!omni_llm_stage_capture_frontier_logits(ctx_omni, state.staged_frontier_logits)) {
-        LOG_WRN("%s: failed to snapshot staged frontier logits for chunk %d, fallback to serial prefill\n", __func__,
-                pending->index);
+        print_with_timestamp(
+            "LLM scheduler: failed to snapshot staged frontier logits for chunk %d, fallback to serial prefill\n",
+            pending->index);
         omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
         return false;
     }
@@ -1029,8 +1036,9 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
     const int delta              = actual_decode_tail - state.spec_decode_tail;
 
     if (delta != 0) {
-        LOG_WRN("%s: speculative tail mismatch for chunk %d (actual=%d, predicted=%d, delta=%d), fallback to serial prefill\n",
-                __func__, state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta);
+        print_with_timestamp(
+            "LLM scheduler: speculative tail mismatch for chunk %d (actual=%d, predicted=%d, delta=%d), fallback to serial prefill\n",
+            state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta);
         return false;
     }
 
@@ -1091,9 +1099,22 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
     OmniLlmStageDecodeRequest                   active_request;
     std::chrono::high_resolution_clock::time_point decode_start;
     bool                                        policy_fallback_logged = false;
+    bool                                        micro_batch_runtime_logged = false;
     omni_embeds *                               staged_prefill         = nullptr;
 
     while (ctx_omni->workers.llm_thread_running) {
+        if (!micro_batch_runtime_logged && ctx_omni->duplex_mode &&
+            ctx_omni->llm_schedule_policy == OmniLlmSchedulePolicy::MICRO_BATCH && ctx_omni->ctx_llama != nullptr &&
+            ctx_omni->params != nullptr) {
+            llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+            print_with_timestamp(
+                "LLM scheduler: MICRO_BATCH runtime kv_unified=%d, n_seq_max=%u, can_shift=%d, reschedule=%d, max_chunk=%d\n",
+                ctx_omni->params->kv_unified, llama_n_seq_max(ctx_omni->ctx_llama),
+                mem != nullptr ? llama_memory_can_shift(mem) : 0, ctx_omni->reschedule_interval_tokens,
+                ctx_omni->max_new_speak_tokens_per_chunk);
+            micro_batch_runtime_logged = true;
+        }
+
         if (!scheduler.decode_active) {
             std::vector<omni_embeds *> simplex_prefills;
             omni_embeds *              duplex_prefill  = nullptr;
@@ -1114,8 +1135,8 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
                     decode_requested           = true;
                     decode_from_promote        = true;
                 } else {
-                    LOG_WRN("%s: promote failed for chunk %d, fallback to serial prefill\n", __func__,
-                            staged_chunk_idx);
+                    print_with_timestamp("LLM scheduler: promote failed for chunk %d, fallback to serial prefill\n",
+                                         staged_chunk_idx);
                     omni_llm_stage_reset_staged_state(ctx_omni, scheduler, /*clear_staging_seq=*/true);
                     duplex_prefill          = staged_prefill;
                     staged_prefill          = nullptr;
