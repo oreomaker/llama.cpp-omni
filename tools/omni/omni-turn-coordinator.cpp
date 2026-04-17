@@ -9,7 +9,16 @@
 #include <chrono>
 
 static const char * omni_turn_close_kind_name(OmniTurnCloseKind kind) {
-    return kind == OmniTurnCloseKind::abort ? "abort" : "finish";
+    switch (kind) {
+        case OmniTurnCloseKind::finish:
+            return "finish";
+        case OmniTurnCloseKind::preempt:
+            return "preempt";
+        case OmniTurnCloseKind::abort:
+            return "abort";
+    }
+
+    return "unknown";
 }
 
 static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(struct omni_context * ctx_omni,
@@ -21,7 +30,12 @@ static OmniTurnCloseResult omni_turn_coordinator_close_simplex_turn(struct omni_
 
     result.completed_round = omni_session_round_meta(ctx_omni);
     result.active_round    = result.completed_round;
-    result.interrupted     = kind == OmniTurnCloseKind::abort;
+    result.interrupted     = kind != OmniTurnCloseKind::finish;
+
+    if (kind == OmniTurnCloseKind::preempt) {
+        result.turn_closed = false;
+        return result;
+    }
 
     if (ctx_omni->duplex_mode || ctx_omni->turn.current_turn_ended) {
         result.turn_closed = ctx_omni->turn.current_turn_ended;
@@ -158,10 +172,12 @@ OmniTurnCloseResult omni_turn_coordinator_close(struct omni_context * ctx_omni,
     } else {
         result.completed_round = omni_session_round_meta(ctx_omni);
         result.active_round    = result.completed_round;
-        result.interrupted     = kind == OmniTurnCloseKind::abort;
+        result.interrupted     = kind != OmniTurnCloseKind::finish;
         if (kind == OmniTurnCloseKind::abort) {
             result.turn_closed           = true;
             ctx_omni->turn.current_turn_ended = true;
+        } else if (kind == OmniTurnCloseKind::preempt) {
+            result.turn_closed = false;
         } else {
             result.turn_closed = ctx_omni->turn.current_turn_ended;
 

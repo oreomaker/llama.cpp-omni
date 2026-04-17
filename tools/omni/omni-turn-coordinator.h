@@ -13,6 +13,7 @@ struct OmniPrefillSetup {
 
 enum class OmniTurnCloseKind {
     finish,
+    preempt,
     abort,
 };
 

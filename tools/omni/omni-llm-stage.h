@@ -32,6 +32,7 @@ struct OmniLlmDecodeSliceResult {
     bool                     finished         = false;
     bool                     llm_finish       = false;
     bool                     interrupted      = false;
+    bool                     preempted        = false;
     bool                     ended_with_listen = false;
     int                      generated_tokens = 0;
     std::string              text;
@@ -43,6 +44,7 @@ struct OmniLlmDecodeSliceResult {
 struct OmniLlmStageDecodeResult {
     bool llm_finish              = false;
     bool interrupted             = false;
+    bool preempted               = false;
     bool ended_with_listen       = false;
     int  generated_decode_tokens = 0;
 };

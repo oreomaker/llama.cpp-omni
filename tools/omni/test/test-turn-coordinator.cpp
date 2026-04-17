@@ -110,6 +110,32 @@ void test_close_duplex_abort_marks_break_and_closes_turn() {
     assert(fixture.ctx.gate.speech_ready == true);
 }
 
+void test_close_duplex_preempt_keeps_turn_open() {
+    OmniTestFixture fixture;
+
+    fixture.ctx.duplex_mode = true;
+    fixture.ctx.turn.current_turn_ended = false;
+    fixture.ctx.turn.ended_with_listen.store(true);
+    fixture.ctx.gate.break_event.store(false);
+    fixture.ctx.gate.llm_generation_done.store(true);
+    fixture.ctx.gate.speech_ready = false;
+    omni_session_set_round_index(&fixture.ctx, 9);
+
+    const OmniTurnCloseResult result =
+        omni_turn_coordinator_close(&fixture.ctx, OmniTurnCloseKind::preempt, "unit-test");
+
+    assert(result.interrupted == true);
+    assert(result.turn_closed == false);
+    assert(result.completed_round.round_idx == 9);
+    assert(result.active_round.round_idx == 9);
+    assert(fixture.ctx.turn.current_turn_ended == false);
+    assert(fixture.ctx.turn.ended_with_listen.load() == true);
+    assert(fixture.ctx.gate.break_event.load() == false);
+    assert(fixture.ctx.gate.llm_generation_done.load() == true);
+    assert(fixture.ctx.gate.speech_ready == false);
+    assert(fixture.ctx.session.current_round.round_idx == 9);
+}
+
 void test_session_round_meta_helpers_keep_wav_base_in_sync() {
     OmniTestFixture fixture;
 
@@ -129,6 +155,7 @@ int main() {
     test_prepare_decode_syncs_simplex_round_index();
     test_close_duplex_finish_advances_round();
     test_close_duplex_abort_marks_break_and_closes_turn();
+    test_close_duplex_preempt_keeps_turn_open();
     test_session_round_meta_helpers_keep_wav_base_in_sync();
 
     std::printf("test-turn-coordinator: all tests passed\n");
