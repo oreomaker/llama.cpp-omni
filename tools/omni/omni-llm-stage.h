@@ -50,6 +50,21 @@ struct OmniLlmStageDecodeResult {
     int  generated_decode_tokens = 0;
 };
 
+enum class OmniLlmFrontierReplayKind {
+    NONE,
+    TOKENS,
+    EMBEDS,
+};
+
+struct OmniLlmFrontierReplay {
+    OmniLlmFrontierReplayKind kind      = OmniLlmFrontierReplayKind::NONE;
+    int                       begin_pos = 0;
+    int                       n_tokens  = 0;
+    int                       n_embd    = 0;
+    std::vector<llama_token>  tokens;
+    std::vector<float>        embeds;
+};
+
 struct OmniLlmSchedulerState {
     llama_seq_id active_seq      = 0;
     llama_seq_id staging_seq     = 1;
@@ -67,6 +82,7 @@ struct OmniLlmSchedulerState {
     struct common_sampler * staged_sampler = nullptr;
     std::vector<float> pending_frontier_logits;
     std::vector<float> staged_frontier_logits;
+    OmniLlmFrontierReplay staged_frontier_replay;
 };
 
 bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
@@ -81,7 +97,8 @@ bool omni_llm_stage_eval_tokens_seq(struct omni_context *    ctx_omni,
                                     int                      n_batch,
                                     int *                    n_past,
                                     llama_seq_id             seq_id,
-                                    bool                     get_emb = false);
+                                    bool                     get_emb = false,
+                                    OmniLlmFrontierReplay *  replay = nullptr);
 bool omni_llm_stage_eval_string(struct omni_context * ctx_omni,
                                 struct common_params * params,
                                 const char *           str,
@@ -96,7 +113,8 @@ bool omni_llm_stage_eval_string_seq(struct omni_context * ctx_omni,
                                     int *                  n_past,
                                     llama_seq_id           seq_id,
                                     bool                   add_bos,
-                                    bool                   get_emb = false);
+                                    bool                   get_emb = false,
+                                    OmniLlmFrontierReplay * replay = nullptr);
 bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
                                             struct common_params * params,
                                             const char *           str,
@@ -112,7 +130,8 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
                                       struct common_params *     params,
                                       const struct omni_embeds & embeds,
                                       llama_seq_id               seq_id,
-                                      int *                      n_past);
+                                      int *                      n_past,
+                                      OmniLlmFrontierReplay *    replay = nullptr);
 void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni);
 void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params);
 void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni);

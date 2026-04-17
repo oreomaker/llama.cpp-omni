@@ -159,6 +159,48 @@ bool omni_llm_stage_capture_frontier_logits(struct omni_context * ctx_omni, std:
     return true;
 }
 
+void omni_llm_stage_clear_frontier_replay(OmniLlmFrontierReplay & replay) {
+    replay.kind      = OmniLlmFrontierReplayKind::NONE;
+    replay.begin_pos = 0;
+    replay.n_tokens  = 0;
+    replay.n_embd    = 0;
+    replay.tokens.clear();
+    replay.embeds.clear();
+}
+
+void omni_llm_stage_record_frontier_replay_tokens(OmniLlmFrontierReplay * replay,
+                                                  int                     begin_pos,
+                                                  const llama_token *     tokens,
+                                                  int                     n_tokens) {
+    if (replay == nullptr || tokens == nullptr || n_tokens <= 0) {
+        return;
+    }
+
+    replay->kind      = OmniLlmFrontierReplayKind::TOKENS;
+    replay->begin_pos = begin_pos;
+    replay->n_tokens  = n_tokens;
+    replay->n_embd    = 0;
+    replay->tokens.assign(tokens, tokens + n_tokens);
+    replay->embeds.clear();
+}
+
+void omni_llm_stage_record_frontier_replay_embeds(OmniLlmFrontierReplay * replay,
+                                                  int                     begin_pos,
+                                                  const float *           embeds,
+                                                  int                     n_tokens,
+                                                  int                     n_embd) {
+    if (replay == nullptr || embeds == nullptr || n_tokens <= 0 || n_embd <= 0) {
+        return;
+    }
+
+    replay->kind      = OmniLlmFrontierReplayKind::EMBEDS;
+    replay->begin_pos = begin_pos;
+    replay->n_tokens  = n_tokens;
+    replay->n_embd    = n_embd;
+    replay->tokens.clear();
+    replay->embeds.assign(embeds, embeds + (size_t) n_tokens * n_embd);
+}
+
 void omni_llm_stage_reset_staged_state(struct omni_context * ctx_omni,
                                        OmniLlmSchedulerState & state,
                                        bool                   clear_staging_seq) {
@@ -180,6 +222,7 @@ void omni_llm_stage_reset_staged_state(struct omni_context * ctx_omni,
     state.staged_n_past    = 0;
     state.spec_decode_tail = 0;
     state.staged_frontier_logits.clear();
+    omni_llm_stage_clear_frontier_replay(state.staged_frontier_replay);
 }
 
 bool omni_llm_stage_close_decode_preemptively(struct omni_context * ctx_omni) {
@@ -639,7 +682,8 @@ static bool omni_llm_stage_eval_embeds_seq(struct omni_context *  ctx_omni,
                                            int                    n_pos,
                                            int                    n_batch,
                                            int *                  n_past,
-                                           llama_seq_id           seq_id) {
+                                           llama_seq_id           seq_id,
+                                           OmniLlmFrontierReplay * replay) {
     if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || params == nullptr || n_past == nullptr) {
         return false;
     }
@@ -661,6 +705,7 @@ static bool omni_llm_stage_eval_embeds_seq(struct omni_context *  ctx_omni,
 
         llama_batch batch = llama_batch_init(n_eval, n_embd, 1);
         std::memcpy(batch.embd, embed + i * n_embd, sizeof(float) * n_eval * n_embd);
+        omni_llm_stage_record_frontier_replay_embeds(replay, *n_past, embed + i * n_embd, n_eval, n_embd);
         for (int j = 0; j < n_eval; ++j) {
             batch.pos[j]      = *n_past + j;
             batch.n_seq_id[j] = 1;
@@ -689,7 +734,8 @@ bool omni_llm_stage_eval_tokens_seq(struct omni_context *    ctx_omni,
                                     int                      n_batch,
                                     int *                    n_past,
                                     llama_seq_id             seq_id,
-                                    bool                     get_emb) {
+                                    bool                     get_emb,
+                                    OmniLlmFrontierReplay *  replay) {
     if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || params == nullptr || n_past == nullptr) {
         return false;
     }
@@ -714,6 +760,7 @@ bool omni_llm_stage_eval_tokens_seq(struct omni_context *    ctx_omni,
         }
 
         llama_batch batch = llama_batch_init(n_eval, 0, 1);
+        omni_llm_stage_record_frontier_replay_tokens(replay, *n_past, tokens.data() + i, n_eval);
         for (int j = 0; j < n_eval; ++j) {
             common_batch_add(batch, tokens[i + j], *n_past + j, { seq_id }, get_emb || (j + 1 == n_eval));
         }
@@ -755,10 +802,11 @@ bool omni_llm_stage_eval_string_seq(struct omni_context * ctx_omni,
                                     int *                  n_past,
                                     llama_seq_id           seq_id,
                                     bool                   add_bos,
-                                    bool                   get_emb) {
+                                    bool                   get_emb,
+                                    OmniLlmFrontierReplay * replay) {
     std::string              str_buf = str;
     std::vector<llama_token> tokens  = common_tokenize(ctx_omni->ctx_llama, str_buf, add_bos, true);
-    return omni_llm_stage_eval_tokens_seq(ctx_omni, params, std::move(tokens), n_batch, n_past, seq_id, get_emb);
+    return omni_llm_stage_eval_tokens_seq(ctx_omni, params, std::move(tokens), n_batch, n_past, seq_id, get_emb, replay);
 }
 
 bool omni_llm_stage_eval_string(struct omni_context * ctx_omni,
@@ -788,7 +836,8 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
                                       struct common_params *     params,
                                       const struct omni_embeds & embeds,
                                       llama_seq_id               seq_id,
-                                      int *                      n_past) {
+                                      int *                      n_past,
+                                      OmniLlmFrontierReplay *    replay) {
     if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || params == nullptr || n_past == nullptr) {
         return false;
     }
@@ -809,39 +858,42 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
 
         if (ctx_omni->duplex_mode) {
             if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit><image>", params->n_batch, n_past, seq_id,
-                                                false)) {
+                                                false, false, replay)) {
                 goto fail;
             }
         } else {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<image>", params->n_batch, n_past, seq_id, false)) {
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<image>", params->n_batch, n_past, seq_id, false,
+                                                false, replay)) {
                 goto fail;
             }
         }
 
         if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.vision_embed[0].data(), tokens_per_chunk,
-                                            params->n_batch, n_past, seq_id)) {
+                                            params->n_batch, n_past, seq_id, replay)) {
             goto fail;
         }
-        if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</image>", params->n_batch, n_past, seq_id, false)) {
+        if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</image>", params->n_batch, n_past, seq_id, false,
+                                            false, replay)) {
             goto fail;
         }
 
         if (has_slices) {
             for (int i = 1; i < n_chunks; ++i) {
                 if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<slice>", params->n_batch, n_past, seq_id,
-                                                    false)) {
+                                                    false, false, replay)) {
                     goto fail;
                 }
                 if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.vision_embed[i].data(), tokens_per_chunk,
-                                                    params->n_batch, n_past, seq_id)) {
+                                                    params->n_batch, n_past, seq_id, replay)) {
                     goto fail;
                 }
                 if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</slice>", params->n_batch, n_past, seq_id,
-                                                    false)) {
+                                                    false, false, replay)) {
                     goto fail;
                 }
             }
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "\n", params->n_batch, n_past, seq_id, false)) {
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "\n", params->n_batch, n_past, seq_id, false, false,
+                                                replay)) {
                 goto fail;
             }
         }
@@ -852,17 +904,17 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
         if (has_audio) {
             if (!ctx_omni->duplex_mode) {
                 if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_start|>", params->n_batch, n_past,
-                                                    seq_id, false)) {
+                                                    seq_id, false, false, replay)) {
                     goto fail;
                 }
             }
             if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.audio_embed.data(), n_audio_tokens,
-                                                params->n_batch, n_past, seq_id)) {
+                                                params->n_batch, n_past, seq_id, replay)) {
                 goto fail;
             }
             if (!ctx_omni->duplex_mode) {
                 if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_end|>", params->n_batch, n_past,
-                                                    seq_id, false)) {
+                                                    seq_id, false, false, replay)) {
                     goto fail;
                 }
             }
@@ -872,26 +924,27 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
         print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
 
         if (ctx_omni->duplex_mode) {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit>", params->n_batch, n_past, seq_id, false)) {
+            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit>", params->n_batch, n_past, seq_id, false,
+                                                false, replay)) {
                 goto fail;
             }
         } else {
             if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_start|>", params->n_batch, n_past, seq_id,
-                                                false)) {
+                                                false, false, replay)) {
                 goto fail;
             }
         }
 
         if (n_audio_tokens > 0) {
             if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.audio_embed.data(), n_audio_tokens,
-                                                params->n_batch, n_past, seq_id)) {
+                                                params->n_batch, n_past, seq_id, replay)) {
                 goto fail;
             }
         }
 
         if (!ctx_omni->duplex_mode) {
             if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_end|>", params->n_batch, n_past, seq_id,
-                                                false)) {
+                                                false, false, replay)) {
                 goto fail;
             }
         }
@@ -910,6 +963,85 @@ fail:
         ctx_omni->session.pending_unit_start_cache_len = 0;
     }
     return false;
+}
+
+static bool omni_llm_stage_refresh_shifted_staged_frontier(struct omni_context * ctx_omni,
+                                                           OmniLlmSchedulerState & state,
+                                                           int                     delta) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->params == nullptr) {
+        return false;
+    }
+
+    auto & replay = state.staged_frontier_replay;
+    if (replay.kind == OmniLlmFrontierReplayKind::NONE || replay.n_tokens <= 0) {
+        print_with_timestamp("LLM scheduler: missing staged frontier replay after seq shift, fallback to serial prefill\n");
+        return false;
+    }
+
+    if (replay.begin_pos + replay.n_tokens != state.staged_n_past) {
+        print_with_timestamp(
+            "LLM scheduler: invalid staged replay tail (begin=%d, n_tokens=%d, staged_n_past=%d), fallback to serial prefill\n",
+            replay.begin_pos, replay.n_tokens, state.staged_n_past);
+        return false;
+    }
+
+    llama_memory_t mem = llama_get_memory(ctx_omni->ctx_llama);
+    if (mem == nullptr) {
+        print_with_timestamp("LLM scheduler: missing llama memory during shifted frontier refresh, fallback to serial prefill\n");
+        return false;
+    }
+
+    const int shifted_begin = replay.begin_pos + delta;
+    if (shifted_begin < 0) {
+        print_with_timestamp("LLM scheduler: shifted replay begin became negative (%d), fallback to serial prefill\n",
+                             shifted_begin);
+        return false;
+    }
+
+    if (!llama_memory_seq_rm(mem, state.staging_seq, shifted_begin, -1)) {
+        print_with_timestamp("LLM scheduler: failed to clear shifted replay tail at pos=%d, fallback to serial prefill\n",
+                             shifted_begin);
+        return false;
+    }
+
+    int replay_n_past = shifted_begin;
+    bool ok           = false;
+    switch (replay.kind) {
+        case OmniLlmFrontierReplayKind::TOKENS:
+            ok = omni_llm_stage_eval_tokens_seq(ctx_omni, ctx_omni->params, replay.tokens, ctx_omni->params->n_batch,
+                                                &replay_n_past, state.staging_seq);
+            break;
+        case OmniLlmFrontierReplayKind::EMBEDS:
+            ok = omni_llm_stage_eval_embeds_seq(ctx_omni, ctx_omni->params, replay.embeds.data(), replay.n_tokens,
+                                                ctx_omni->params->n_batch, &replay_n_past, state.staging_seq, nullptr);
+            break;
+        case OmniLlmFrontierReplayKind::NONE:
+            break;
+    }
+
+    if (!ok) {
+        print_with_timestamp("LLM scheduler: failed to replay shifted staged frontier tail, fallback to serial prefill\n");
+        return false;
+    }
+
+    if (replay_n_past != state.staged_n_past + delta) {
+        print_with_timestamp(
+            "LLM scheduler: shifted frontier replay ended at unexpected n_past=%d (expected=%d), fallback to serial prefill\n",
+            replay_n_past, state.staged_n_past + delta);
+        return false;
+    }
+
+    replay.begin_pos = shifted_begin;
+
+    if (!omni_llm_stage_capture_frontier_logits(ctx_omni, state.staged_frontier_logits)) {
+        print_with_timestamp("LLM scheduler: failed to snapshot shifted staged frontier logits, fallback to serial prefill\n");
+        return false;
+    }
+
+    print_with_timestamp(
+        "LLM scheduler: refreshed shifted staged frontier for chunk %d (delta=%d, replay_begin=%d, replay_tokens=%d)\n",
+        state.staged_chunk_idx, delta, replay.begin_pos, replay.n_tokens);
+    return true;
 }
 
 bool omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
@@ -951,10 +1083,11 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
     const auto prefill_start = std::chrono::high_resolution_clock::now();
     state.branch_n_past      = ctx_omni->session.n_past;
     state.spec_decode_tail   = std::max(0, omni_llm_stage_estimate_speculative_decode_tail(ctx_omni));
-    state.staged_begin_pos   = state.branch_n_past + state.spec_decode_tail;
+    state.staged_begin_pos   = state.branch_n_past;
     state.staged_n_past      = state.staged_begin_pos;
     state.staged_chunk_idx   = pending->index;
     state.staged_frontier_logits.clear();
+    omni_llm_stage_clear_frontier_replay(state.staged_frontier_replay);
 
     print_with_timestamp(
         "LLM scheduler: stage attempt for chunk %d on seq=%d (branch=%d, predicted_tail=%d, staged_begin=%d)\n",
@@ -970,7 +1103,8 @@ static bool omni_llm_stage_stage_prefill_speculatively(struct omni_context *    
     llama_memory_seq_rm(mem, state.staging_seq, 0, -1);
     llama_memory_seq_cp(mem, state.active_seq, state.staging_seq, 0, state.branch_n_past);
 
-    if (!omni_llm_stage_prefill_apply_seq(ctx_omni, params, *pending, state.staging_seq, &state.staged_n_past)) {
+    if (!omni_llm_stage_prefill_apply_seq(ctx_omni, params, *pending, state.staging_seq, &state.staged_n_past,
+                                          &state.staged_frontier_replay)) {
         print_with_timestamp("LLM scheduler: speculative staging failed for chunk %d, fallback to serial prefill\n",
                              pending->index);
         omni_llm_stage_reset_staged_state(ctx_omni, state, /*clear_staging_seq=*/true);
@@ -1036,10 +1170,19 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
     const int delta              = actual_decode_tail - state.spec_decode_tail;
 
     if (delta != 0) {
-        print_with_timestamp(
-            "LLM scheduler: speculative tail mismatch for chunk %d (actual=%d, predicted=%d, delta=%d), fallback to serial prefill\n",
-            state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta);
-        return false;
+        print_with_timestamp("LLM scheduler: speculative tail mismatch for chunk %d (actual=%d, predicted=%d, delta=%d)\n",
+                             state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta);
+        if (!llama_memory_can_shift(mem)) {
+            print_with_timestamp(
+                "LLM scheduler: KV cache cannot shift for chunk %d, fallback to serial prefill\n",
+                state.staged_chunk_idx);
+            return false;
+        }
+
+        llama_memory_seq_add(mem, state.staging_seq, state.staged_begin_pos, state.staged_n_past, delta);
+        if (!omni_llm_stage_refresh_shifted_staged_frontier(ctx_omni, state, delta)) {
+            return false;
+        }
     }
 
     if (!llama_memory_seq_rm(mem, state.active_seq, 0, -1)) {
@@ -1063,7 +1206,7 @@ static bool omni_llm_stage_promote_staged(struct omni_context * ctx_omni, OmniLl
     }
 
     state.pending_frontier_logits = std::move(state.staged_frontier_logits);
-    ctx_omni->session.n_past      = state.staged_n_past;
+    ctx_omni->session.n_past      = state.staged_n_past + delta;
     print_with_timestamp(
         "LLM scheduler: promoted staged chunk %d (actual_tail=%d, predicted_tail=%d, shift=%d, n_past=%d)\n",
         state.staged_chunk_idx, actual_decode_tail, state.spec_decode_tail, delta, ctx_omni->session.n_past);
