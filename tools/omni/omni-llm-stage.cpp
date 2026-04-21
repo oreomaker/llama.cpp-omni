@@ -2,6 +2,7 @@
 
 #include "common/common.h"
 #include "common/sampling.h"
+#include "llama-model.h"
 #include "omni-impl.h"
 #include "omni-log.h"
 #include "omni-session-state.h"
@@ -21,6 +22,41 @@
 
 namespace {
 constexpr int kLegacyDecodeChunkStepSize = 10;
+
+// Extract token embeddings from the model's tok_embd weight matrix.
+// Handles both F32 and quantized (e.g. Q4_0, Q8_0) embedding tables.
+bool omni_get_token_embeddings(const llama_model *  model,
+                                      const llama_token *  tokens,
+                                      int                  n_tokens,
+                                      float *              out,
+                                      int                  n_embd) {
+    struct ggml_tensor * tok_embd = model->tok_embd;
+    if (!tok_embd || !tokens || !out || n_tokens <= 0 || n_embd <= 0) {
+        return false;
+    }
+
+    const enum ggml_type type     = tok_embd->type;
+    const size_t         row_size = ggml_row_size(type, n_embd);
+
+    if (type == GGML_TYPE_F32) {
+        for (int i = 0; i < n_tokens; ++i) {
+            ggml_backend_tensor_get(tok_embd, out + (size_t) i * n_embd,
+                                    (size_t) tokens[i] * row_size, row_size);
+        }
+    } else {
+        const auto * traits = ggml_get_type_traits(type);
+        if (!traits || !traits->to_float) {
+            return false;
+        }
+        std::vector<uint8_t> raw(row_size);
+        for (int i = 0; i < n_tokens; ++i) {
+            ggml_backend_tensor_get(tok_embd, raw.data(),
+                                    (size_t) tokens[i] * row_size, row_size);
+            traits->to_float(raw.data(), out + (size_t) i * n_embd, n_embd);
+        }
+    }
+    return true;
+}
 
 double omni_llm_stage_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
                                         const std::chrono::high_resolution_clock::time_point & end) {
@@ -842,12 +878,44 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
         return false;
     }
 
-    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    const llama_model * model       = llama_get_model(ctx_omni->ctx_llama);
+    const int           hidden_size = llama_model_n_embd(model);
     const bool track_sliding_window = seq_id == 0 && ctx_omni->session.sliding_window_config.mode != "off";
 
     if (track_sliding_window) {
         sliding_window_register_unit_start(ctx_omni);
     }
+
+    // --- Build a unified embedding buffer so everything is sent to llama_decode
+    //     in large contiguous batches instead of many tiny calls. ---
+
+    std::vector<float> unified;
+    bool               build_ok = true;
+
+    // Helper: tokenize a string, look up each token's embedding from tok_embd,
+    // and append the result to the unified buffer.
+    const char * fn_name = __func__;
+    auto append_string_embeds = [&](const char * str) -> bool {
+        std::vector<llama_token> tokens = common_tokenize(ctx_omni->ctx_llama, std::string(str), false, true);
+        if (tokens.empty()) {
+            return true;
+        }
+        const size_t offset = unified.size();
+        unified.resize(offset + (size_t) tokens.size() * hidden_size);
+        if (!omni_get_token_embeddings(model, tokens.data(), (int) tokens.size(),
+                                       unified.data() + offset, hidden_size)) {
+            LOG_ERR("%s : failed to extract token embeddings for \"%s\"\n", fn_name, str);
+            return false;
+        }
+        return true;
+    };
+
+    // Helper: append raw float embeddings (vision / audio) directly.
+    auto append_raw_embeds = [&](const float * data, int n_tokens) {
+        const size_t offset = unified.size();
+        unified.resize(offset + (size_t) n_tokens * hidden_size);
+        std::memcpy(unified.data() + offset, data, sizeof(float) * n_tokens * hidden_size);
+    };
 
     if (!embeds.vision_embed.empty()) {
         const int  n_chunks         = (int) embeds.vision_embed.size();
@@ -856,95 +924,66 @@ bool omni_llm_stage_prefill_apply_seq(struct omni_context *      ctx_omni,
         const bool has_audio        = n_audio_tokens > 0;
         const bool has_slices       = n_chunks > 1;
 
-        if (ctx_omni->duplex_mode) {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit><image>", params->n_batch, n_past, seq_id,
-                                                false, false, replay)) {
-                goto fail;
-            }
-        } else {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<image>", params->n_batch, n_past, seq_id, false,
-                                                false, replay)) {
-                goto fail;
-            }
-        }
+        // <unit><image> or <image>
+        build_ok = ctx_omni->duplex_mode ? append_string_embeds("<unit><image>")
+                                         : append_string_embeds("<image>");
+        if (!build_ok) { goto fail; }
 
-        if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.vision_embed[0].data(), tokens_per_chunk,
-                                            params->n_batch, n_past, seq_id, replay)) {
-            goto fail;
-        }
-        if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</image>", params->n_batch, n_past, seq_id, false,
-                                            false, replay)) {
-            goto fail;
-        }
+        // vision chunk 0
+        append_raw_embeds(embeds.vision_embed[0].data(), tokens_per_chunk);
 
+        // </image>
+        if (!append_string_embeds("</image>")) { goto fail; }
+
+        // slices 1..n
         if (has_slices) {
             for (int i = 1; i < n_chunks; ++i) {
-                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<slice>", params->n_batch, n_past, seq_id,
-                                                    false, false, replay)) {
-                    goto fail;
-                }
-                if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.vision_embed[i].data(), tokens_per_chunk,
-                                                    params->n_batch, n_past, seq_id, replay)) {
-                    goto fail;
-                }
-                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "</slice>", params->n_batch, n_past, seq_id,
-                                                    false, false, replay)) {
-                    goto fail;
-                }
+                if (!append_string_embeds("<slice>")) { goto fail; }
+                append_raw_embeds(embeds.vision_embed[i].data(), tokens_per_chunk);
+                if (!append_string_embeds("</slice>")) { goto fail; }
             }
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "\n", params->n_batch, n_past, seq_id, false, false,
-                                                replay)) {
-                goto fail;
-            }
+            if (!append_string_embeds("\n")) { goto fail; }
         }
 
         print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
                              tokens_per_chunk, n_audio_tokens, has_slices);
 
+        // audio
         if (has_audio) {
             if (!ctx_omni->duplex_mode) {
-                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_start|>", params->n_batch, n_past,
-                                                    seq_id, false, false, replay)) {
-                    goto fail;
-                }
+                if (!append_string_embeds("<|audio_start|>")) { goto fail; }
             }
-            if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.audio_embed.data(), n_audio_tokens,
-                                                params->n_batch, n_past, seq_id, replay)) {
-                goto fail;
-            }
+            append_raw_embeds(embeds.audio_embed.data(), n_audio_tokens);
             if (!ctx_omni->duplex_mode) {
-                if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_end|>", params->n_batch, n_past,
-                                                    seq_id, false, false, replay)) {
-                    goto fail;
-                }
+                if (!append_string_embeds("<|audio_end|>")) { goto fail; }
             }
         }
     } else {
         const int n_audio_tokens = embeds.audio_embed.size() / hidden_size;
         print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
 
-        if (ctx_omni->duplex_mode) {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<unit>", params->n_batch, n_past, seq_id, false,
-                                                false, replay)) {
-                goto fail;
-            }
-        } else {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_start|>", params->n_batch, n_past, seq_id,
-                                                false, false, replay)) {
-                goto fail;
-            }
-        }
+        // <unit> or <|audio_start|>
+        build_ok = ctx_omni->duplex_mode ? append_string_embeds("<unit>")
+                                         : append_string_embeds("<|audio_start|>");
+        if (!build_ok) { goto fail; }
 
+        // audio
         if (n_audio_tokens > 0) {
-            if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, embeds.audio_embed.data(), n_audio_tokens,
-                                                params->n_batch, n_past, seq_id, replay)) {
-                goto fail;
-            }
+            append_raw_embeds(embeds.audio_embed.data(), n_audio_tokens);
         }
 
+        // <|audio_end|>
         if (!ctx_omni->duplex_mode) {
-            if (!omni_llm_stage_eval_string_seq(ctx_omni, params, "<|audio_end|>", params->n_batch, n_past, seq_id,
-                                                false, false, replay)) {
+            if (!append_string_embeds("<|audio_end|>")) { goto fail; }
+        }
+    }
+
+    // --- Evaluate the entire unified buffer in one call ---
+    {
+        const int total_tokens = (int) (unified.size() / hidden_size);
+        if (total_tokens > 0) {
+            if (!omni_llm_stage_eval_embeds_seq(ctx_omni, params, unified.data(), total_tokens,
+                                                params->n_batch, n_past, seq_id, replay)) {
                 goto fail;
             }
         }

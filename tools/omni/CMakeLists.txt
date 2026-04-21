@@ -67,6 +67,7 @@ target_link_libraries     (omni PUBLIC ggml llama common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
+target_include_directories(omni PRIVATE ../../src)
 target_include_directories(omni PRIVATE ../../vendor)
 target_compile_features   (omni PRIVATE cxx_std_17)
 
