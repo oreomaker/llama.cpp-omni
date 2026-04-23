@@ -20,15 +20,11 @@
 #include <utility>
 
 namespace {
-struct LlmDecodeRuntime {
-    int  max_tgt_len             = 0;
-    int  step_size               = 10;
-    int  llm_n_embd              = 0;
-    int  generated_decode_tokens = 0;
-    int  current_chunk_tokens    = 0;
-    bool llm_finish              = false;
-    bool llm_first_token_logged  = false;
-};
+// =============================================================================
+// Timing / Async Pipeline Bookkeeping
+// Internal helpers for duplex timing, async request/result pairing, and worker
+// decode preparation. These are not model-forward helpers.
+// =============================================================================
 
 double omni_llm_stage_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
                                         const std::chrono::high_resolution_clock::time_point & end) {
@@ -153,9 +149,14 @@ void omni_llm_stage_prepare_worker_decode(struct omni_context *             ctx_
     }
 }
 
+// Current design:
+// - This is a worker-side compatibility wrapper for one full decode cycle.
+// - It still owns worker-only concerns: request fetch, state reset, timing,
+//   turn close, and pipeline-result posting.
+// - Future attach-prefill scheduling should move this orchestration into a real
+//   scheduler loop and call decode_begin/decode_slice/... directly.
 bool omni_llm_stage_worker_decode_once(struct omni_context * ctx_omni, struct common_params * params) {
     (void) params;
-    // The worker owns the full async decode lifecycle: reset state, run decode, close turn, post result.
     const OmniLlmStageDecodeRequest request = omni_llm_stage_get_pipeline_request(ctx_omni);
     omni_llm_stage_prepare_worker_decode(ctx_omni, request);
 
@@ -177,6 +178,12 @@ bool omni_llm_stage_worker_decode_once(struct omni_context * ctx_omni, struct co
                                         decode_result.ended_with_listen);
     return decode_ok;
 }
+
+// =============================================================================
+// LLM Forward Internals
+// Low-level token/hidden-state forward helpers and decode protocol helpers.
+// These functions directly interact with llama forward/sampling state.
+// =============================================================================
 
 bool omni_llm_stage_eval_tokens_with_hidden(struct omni_context *    ctx_omni,
                                             struct common_params *   params,
@@ -329,13 +336,33 @@ void omni_llm_stage_apply_decode_prefix(struct omni_context * ctx_omni, const st
     }
 }
 
-LlmDecodeRuntime omni_llm_stage_init_decode_runtime(struct omni_context * ctx_omni) {
-    LlmDecodeRuntime runtime;
-    runtime.max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
-    runtime.llm_n_embd  = llama_model_n_embd(llama_get_model(ctx_omni->ctx_llama));
-    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d\n", runtime.max_tgt_len,
-                         ctx_omni->params->n_predict, ctx_omni->params->n_ctx);
-    return runtime;
+int omni_llm_stage_max_chunk_tokens(const struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || !ctx_omni->duplex_mode) {
+        return 0;
+    }
+    return ctx_omni->max_new_speak_tokens_per_chunk;
+}
+
+void omni_llm_stage_eval_chunk_eos_token(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || ctx_omni->special_token_chunk_eos < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
+    std::vector<llama_token>    chunk_eos_tokens = { ctx_omni->special_token_chunk_eos };
+    omni_llm_stage_eval_tokens(ctx_omni, ctx_omni->params, std::move(chunk_eos_tokens), ctx_omni->params->n_batch,
+                               &ctx_omni->session.n_past);
+}
+
+void omni_llm_stage_eval_unit_end_token(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || !ctx_omni->duplex_mode || ctx_omni->special_token_unit_end < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
+    std::vector<llama_token>    unit_end_tokens = { ctx_omni->special_token_unit_end };
+    omni_llm_stage_eval_tokens(ctx_omni, ctx_omni->params, std::move(unit_end_tokens), ctx_omni->params->n_batch,
+                               &ctx_omni->session.n_past);
 }
 
 void omni_llm_stage_mark_decode_turn_end(struct omni_context * ctx_omni,
@@ -468,6 +495,11 @@ void omni_llm_stage_finish_decode_text_stream(struct omni_context * ctx_omni) {
 }
 }  // namespace
 
+// =============================================================================
+// Public LLM Forward API
+// Shared by prefill and decode paths for plain token/string evaluation.
+// =============================================================================
+
 bool omni_llm_stage_eval_tokens(struct omni_context *    ctx_omni,
                                 struct common_params *   params,
                                 std::vector<llama_token> tokens,
@@ -539,6 +571,11 @@ bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
     return omni_llm_stage_eval_tokens_with_hidden(ctx_omni, params, std::move(tokens), n_batch, n_past,
                                                   hidden_states);
 }
+
+// =============================================================================
+// Public Prefill Logic
+// Applies one encoded multimodal input unit onto the main LLM sequence.
+// =============================================================================
 
 void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                   struct common_params *     params,
@@ -629,6 +666,116 @@ void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni) {
     }
 }
 
+namespace {
+// =============================================================================
+// Future Scheduler Worker Helpers
+// These helpers currently preserve the legacy worker behavior (simplex: drain
+// all prefill then decode; duplex: per-chunk prefill->decode pairing). They
+// are the natural place to evolve into an explicit scheduler module.
+// =============================================================================
+
+void omni_llm_stage_log_prefill_activity(struct omni_context * ctx_omni, struct common_params * params) {
+    if (ctx_omni == nullptr || params == nullptr) {
+        return;
+    }
+
+    print_with_timestamp("LLM thread: start prefill, n_past=%d, n_keep=%d, n_ctx=%d\n", ctx_omni->session.n_past,
+                         ctx_omni->session.prompt.n_keep, params->n_ctx);
+    print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n",
+                         ctx_omni->session.n_past);
+}
+
+void omni_llm_stage_log_prefill_done(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    print_with_timestamp("LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",
+                         ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep,
+                         ctx_omni->session.n_past - ctx_omni->session.prompt.n_keep, ctx_omni->duplex_mode);
+}
+
+bool omni_llm_stage_process_duplex_work(struct omni_context *             ctx_omni,
+                                        struct common_params *            params,
+                                        std::vector<omni_embeds *> &      llm_embeds,
+                                        bool                              do_decode) {
+    if (ctx_omni == nullptr) {
+        return false;
+    }
+
+    if (llm_embeds.empty() && do_decode) {
+        return omni_llm_stage_worker_decode_once(ctx_omni, params);
+    }
+
+    size_t embeds_idx = 0;
+    for (; embeds_idx < llm_embeds.size(); ++embeds_idx) {
+        auto * embeds = llm_embeds[embeds_idx];
+        if (embeds->encode_failed) {
+            print_with_timestamp("LLM thread: skip chunk %d because encode stage failed\n", embeds->index);
+            delete embeds;
+            omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
+            continue;
+        }
+
+        omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, embeds->index);
+        const auto prefill_start = std::chrono::high_resolution_clock::now();
+        omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
+        omni_llm_stage_finalize_prefill(ctx_omni);
+        omni_llm_stage_note_prefill_timing(
+            ctx_omni, embeds->index,
+            omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
+        delete embeds;
+
+        omni_llm_stage_log_prefill_done(ctx_omni);
+
+        if (!omni_llm_stage_worker_decode_once(ctx_omni, params)) {
+            ++embeds_idx;
+            break;
+        }
+    }
+
+    if (embeds_idx == llm_embeds.size()) {
+        return true;
+    }
+
+    for (; embeds_idx < llm_embeds.size(); ++embeds_idx) {
+        delete llm_embeds[embeds_idx];
+    }
+    return false;
+}
+
+bool omni_llm_stage_process_simplex_work(struct omni_context *        ctx_omni,
+                                         struct common_params *       params,
+                                         std::vector<omni_embeds *> & llm_embeds,
+                                         bool                         do_decode) {
+    if (ctx_omni == nullptr) {
+        return false;
+    }
+
+    for (auto * embeds : llm_embeds) {
+        omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
+        delete embeds;
+    }
+
+    if (!llm_embeds.empty()) {
+        omni_llm_stage_log_prefill_done(ctx_omni);
+        omni_llm_stage_finalize_prefill(ctx_omni);
+    }
+
+    if (do_decode) {
+        return omni_llm_stage_worker_decode_once(ctx_omni, params);
+    }
+
+    return true;
+}
+}  // namespace
+
+// =============================================================================
+// Worker Loop Entry
+// Current implementation still drives legacy worker behavior through helper
+// wrappers above; future scheduling policy should concentrate here.
+// =============================================================================
+
 void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params) {
     if (ctx_omni == nullptr || ctx_omni->llm_thread_info == nullptr) {
         return;
@@ -665,74 +812,13 @@ void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_pa
         ctx_omni->llm_thread_info->cv.notify_all();
 
         if (!llm_embeds.empty()) {
-            print_with_timestamp("LLM thread: start prefill, n_past=%d, n_keep=%d, n_ctx=%d\n", ctx_omni->session.n_past,
-                                 ctx_omni->session.prompt.n_keep, params->n_ctx);
-            print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n",
-                                 ctx_omni->session.n_past);
+            omni_llm_stage_log_prefill_activity(ctx_omni, params);
         }
 
-        if (ctx_omni->duplex_mode) {
-            bool worker_ok = true;
-            if (llm_embeds.empty() && do_decode) {
-                if (!omni_llm_stage_worker_decode_once(ctx_omni, params)) {
-                    break;
-                }
-                continue;
-            }
-
-            size_t embeds_idx = 0;
-            // Keep each duplex chunk as a closed prefill->decode pair to avoid cross-chunk unit interleaving.
-            for (; embeds_idx < llm_embeds.size(); ++embeds_idx) {
-                auto * embeds = llm_embeds[embeds_idx];
-                if (embeds->encode_failed) {
-                    print_with_timestamp("LLM thread: skip chunk %d because encode stage failed\n", embeds->index);
-                    delete embeds;
-                    omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
-                    continue;
-                }
-
-                omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, embeds->index);
-                const auto prefill_start = std::chrono::high_resolution_clock::now();
-                omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
-                omni_llm_stage_finalize_prefill(ctx_omni);
-                omni_llm_stage_note_prefill_timing(
-                    ctx_omni, embeds->index,
-                    omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
-                delete embeds;
-
-                print_with_timestamp("LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",
-                                     ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep,
-                                     ctx_omni->session.n_past - ctx_omni->session.prompt.n_keep,
-                                     ctx_omni->duplex_mode);
-
-                if (!omni_llm_stage_worker_decode_once(ctx_omni, params)) {
-                    worker_ok = false;
-                    break;
-                }
-            }
-            if (!worker_ok) {
-                for (++embeds_idx; embeds_idx < llm_embeds.size(); ++embeds_idx) {
-                    delete llm_embeds[embeds_idx];
-                }
-                break;
-            }
-            continue;
-        }
-
-        // Simplex keeps the legacy "drain all prefill, then decode once" ordering.
-        for (auto * embeds : llm_embeds) {
-            omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
-            delete embeds;
-        }
-
-        if (!llm_embeds.empty()) {
-            print_with_timestamp("LLM thread: prefill done, n_past=%d, n_keep=%d, 本次消耗 %d tokens, duplex_mode=%d\n",
-                                 ctx_omni->session.n_past, ctx_omni->session.prompt.n_keep,
-                                 ctx_omni->session.n_past - ctx_omni->session.prompt.n_keep, ctx_omni->duplex_mode);
-            omni_llm_stage_finalize_prefill(ctx_omni);
-        }
-
-        if (do_decode && !omni_llm_stage_worker_decode_once(ctx_omni, params)) {
+        const bool worker_ok = ctx_omni->duplex_mode ?
+                                   omni_llm_stage_process_duplex_work(ctx_omni, params, llm_embeds, do_decode) :
+                                   omni_llm_stage_process_simplex_work(ctx_omni, params, llm_embeds, do_decode);
+        if (!worker_ok) {
             break;
         }
     }
@@ -771,6 +857,167 @@ void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni) {
     print_with_timestamp("📍 为下一轮准备: eval <|im_end|>\\n<|im_start|>user\\n, n_past=%d\n", ctx_omni->session.n_past);
 }
 
+// =============================================================================
+// Decode Lifecycle Primitives
+// These functions are the decode-side base for a future scheduler: explicit
+// begin/slice/complete/publish/finish boundaries.
+// =============================================================================
+
+void omni_llm_stage_decode_begin(struct omni_context * ctx_omni, OmniLlmStageDecodeState * state) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->params == nullptr || state == nullptr) {
+        return;
+    }
+
+    *state = {};
+    omni_llm_stage_apply_decode_prefix(ctx_omni, omni_llm_stage_build_decode_prefix(ctx_omni));
+
+    state->max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
+    state->llm_n_embd  = llama_model_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+    print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d\n", state->max_tgt_len,
+                         ctx_omni->params->n_predict, ctx_omni->params->n_ctx);
+}
+
+bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
+                                 OmniLlmStageDecodeState * state,
+                                 OmniLlmStageDecodeSlice * out_slice) {
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || ctx_omni->params == nullptr || state == nullptr ||
+        out_slice == nullptr) {
+        return false;
+    }
+
+    *out_slice = {};
+
+    if (state->llm_finish || state->generated_decode_tokens >= state->max_tgt_len) {
+        return true;
+    }
+
+    if (ctx_omni->gate.break_event.load()) {
+        state->llm_finish      = true;
+        state->interrupted     = true;
+        out_slice->interrupted = true;
+        return true;
+    }
+
+    fflush(stdout);
+
+    int        valid_chunk_count   = 0;
+    const int  max_chunk_tokens    = omni_llm_stage_max_chunk_tokens(ctx_omni);
+    bool &     chunk_limit_reached = out_slice->chunk_limit_reached;
+    chunk_limit_reached            = max_chunk_tokens > 0 && state->current_chunk_tokens >= max_chunk_tokens;
+
+    while (valid_chunk_count < state->step_size && !state->llm_finish && !ctx_omni->gate.break_event.load() &&
+           !chunk_limit_reached) {
+        const char * tmp           = nullptr;
+        float *      hidden_states = nullptr;
+        llama_token  sampled_token = 0;
+
+        {
+            std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
+            tmp = omni_llm_stage_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler,
+                                                            ctx_omni->session.n_past, hidden_states, sampled_token);
+        }
+
+        out_slice->total_tokens_generated++;
+
+        if (tmp == nullptr) {
+            free(hidden_states);
+            LOG_ERR("llama_loop returned nullptr!");
+            break;
+        }
+
+        if (hidden_states != nullptr && omni_tts_is_valid_token(sampled_token)) {
+            out_slice->chunk.token_ids.push_back(sampled_token);
+            out_slice->chunk.hidden_states.insert(out_slice->chunk.hidden_states.end(), hidden_states,
+                                                  hidden_states + state->llm_n_embd);
+            valid_chunk_count++;
+            state->current_chunk_tokens++;
+
+            if (max_chunk_tokens > 0 && state->current_chunk_tokens >= max_chunk_tokens) {
+                chunk_limit_reached = true;
+            }
+        }
+        free(hidden_states);
+
+        if (!state->llm_first_token_logged) {
+            state->llm_first_token_logged = true;
+        }
+
+        const OmniTokenType token_type = omni_get_token_type(ctx_omni, sampled_token);
+        omni_llm_stage_mark_decode_turn_end(ctx_omni, token_type, out_slice->chunk.is_end_of_turn);
+
+        if (omni_is_end_token(ctx_omni, sampled_token)) {
+            state->llm_finish = true;
+            omni_llm_stage_handle_decode_end_token(ctx_omni, token_type);
+            break;
+        }
+
+        out_slice->chunk.text += std::string(tmp);
+        fflush(stdout);
+    }
+
+    return true;
+}
+
+void omni_llm_stage_complete_decode_slice(struct omni_context *     ctx_omni,
+                                          OmniLlmStageDecodeState * state,
+                                          OmniLlmStageDecodeSlice * slice) {
+    if (ctx_omni == nullptr || state == nullptr || slice == nullptr) {
+        return;
+    }
+
+    if (slice->chunk_limit_reached) {
+        omni_llm_stage_eval_chunk_eos_token(ctx_omni);
+        state->llm_finish           = true;
+        state->current_chunk_tokens = 0;
+    }
+
+    omni_llm_stage_eval_unit_end_token(ctx_omni);
+
+    state->generated_decode_tokens += slice->total_tokens_generated;
+    slice->chunk.llm_finish = state->llm_finish;
+}
+
+void omni_llm_stage_publish_decode_slice(struct omni_context *             ctx_omni,
+                                         const OmniLlmStageDecodeRequest & request,
+                                         const OmniLlmStageDecodeState &   state,
+                                         const OmniLlmStageDecodeSlice &   slice) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    OmniLlmStageDecodeChunk publish_chunk = slice.chunk;
+    publish_chunk.llm_finish              = state.llm_finish;
+
+    omni_llm_stage_strip_decode_special_tokens(publish_chunk.text);
+    omni_llm_stage_publish_decode_response(ctx_omni, publish_chunk.text);
+    omni_llm_stage_dispatch_decode_chunk_to_tts(ctx_omni, request, publish_chunk, state.llm_n_embd);
+}
+
+void omni_llm_stage_finish_decode(struct omni_context *           ctx_omni,
+                                  const OmniLlmStageDecodeState & state,
+                                  OmniLlmStageDecodeResult *      out_result) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+
+    omni_llm_stage_finish_decode_text_stream(ctx_omni);
+
+    if (out_result != nullptr) {
+        out_result->llm_finish              = state.llm_finish;
+        out_result->interrupted             = state.interrupted;
+        out_result->ended_with_listen       = ctx_omni->turn.ended_with_listen.load();
+        out_result->generated_decode_tokens = state.generated_decode_tokens;
+    }
+}
+
+// Current design:
+// - This is still a compatibility wrapper that runs a full decode round by
+//   looping over decode_slice() until finish/interruption.
+// - It owns decode execution only; worker-side lifecycle concerns remain in
+//   worker_decode_once().
+// - Future attach-prefill scheduling should treat this as a legacy wrapper and
+//   directly orchestrate decode_begin/decode_slice/complete/publish/finish.
 bool omni_llm_stage_decode_run(struct omni_context *             ctx_omni,
                                const OmniLlmStageDecodeRequest & request,
                                OmniLlmStageDecodeResult *        out_result) {
@@ -778,114 +1025,23 @@ bool omni_llm_stage_decode_run(struct omni_context *             ctx_omni,
         return false;
     }
 
-    omni_llm_stage_apply_decode_prefix(ctx_omni, omni_llm_stage_build_decode_prefix(ctx_omni));
+    OmniLlmStageDecodeState state;
+    omni_llm_stage_decode_begin(ctx_omni, &state);
 
-    OmniLlmStageDecodeResult result;
-    LlmDecodeRuntime         runtime = omni_llm_stage_init_decode_runtime(ctx_omni);
+    while (!state.llm_finish && state.generated_decode_tokens < state.max_tgt_len) {
+        OmniLlmStageDecodeSlice slice;
+        if (!omni_llm_stage_decode_slice(ctx_omni, &state, &slice)) {
+            return false;
+        }
 
-    for (; runtime.generated_decode_tokens < runtime.max_tgt_len;) {
-        if (ctx_omni->gate.break_event.load()) {
-            runtime.llm_finish = true;
-            result.interrupted = true;
+        if (slice.interrupted) {
             break;
         }
 
-        fflush(stdout);
-
-        OmniLlmStageDecodeChunk chunk;
-        int                     valid_chunk_tokens      = 0;
-        int                     total_tokens_generated  = 0;
-        const int               max_chunk_tokens        =
-            ctx_omni->duplex_mode ? ctx_omni->max_new_speak_tokens_per_chunk : 0;
-        bool chunk_limit_reached = max_chunk_tokens > 0 && runtime.current_chunk_tokens >= max_chunk_tokens;
-
-        while (valid_chunk_tokens < runtime.step_size && !runtime.llm_finish && !ctx_omni->gate.break_event.load() &&
-               !chunk_limit_reached) {
-            const char * tmp           = nullptr;
-            float *      hidden_states = nullptr;
-            llama_token  sampled_token = 0;
-
-            {
-                std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-                tmp = omni_llm_stage_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler,
-                                                                ctx_omni->session.n_past, hidden_states, sampled_token);
-            }
-
-            total_tokens_generated++;
-
-            if (tmp == nullptr) {
-                free(hidden_states);
-                LOG_ERR("llama_loop returned nullptr!");
-                break;
-            }
-
-            if (hidden_states != nullptr && omni_tts_is_valid_token(sampled_token)) {
-                chunk.token_ids.push_back(sampled_token);
-                chunk.hidden_states.insert(chunk.hidden_states.end(), hidden_states, hidden_states + runtime.llm_n_embd);
-                valid_chunk_tokens++;
-                runtime.current_chunk_tokens++;
-
-                if (max_chunk_tokens > 0 && runtime.current_chunk_tokens >= max_chunk_tokens) {
-                    chunk_limit_reached = true;
-                }
-            }
-            free(hidden_states);
-
-            if (!runtime.llm_first_token_logged) {
-                runtime.llm_first_token_logged = true;
-            }
-
-            const OmniTokenType token_type = omni_get_token_type(ctx_omni, sampled_token);
-            omni_llm_stage_mark_decode_turn_end(ctx_omni, token_type, chunk.is_end_of_turn);
-
-            if (omni_is_end_token(ctx_omni, sampled_token)) {
-                runtime.llm_finish = true;
-                omni_llm_stage_handle_decode_end_token(ctx_omni, token_type);
-                break;
-            }
-
-            chunk.text += std::string(tmp);
-            fflush(stdout);
-        }
-
-        if (chunk_limit_reached) {
-            if (ctx_omni->special_token_chunk_eos >= 0) {
-                std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-                std::vector<llama_token>    chunk_eos_tokens = { ctx_omni->special_token_chunk_eos };
-                omni_llm_stage_eval_tokens(ctx_omni, ctx_omni->params, std::move(chunk_eos_tokens),
-                                           ctx_omni->params->n_batch, &ctx_omni->session.n_past);
-            }
-            runtime.llm_finish           = true;
-            runtime.current_chunk_tokens = 0;
-        }
-
-        if (ctx_omni->duplex_mode && ctx_omni->special_token_unit_end >= 0) {
-            std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
-            std::vector<llama_token>    unit_end_tokens = { ctx_omni->special_token_unit_end };
-            omni_llm_stage_eval_tokens(ctx_omni, ctx_omni->params, std::move(unit_end_tokens), ctx_omni->params->n_batch,
-                                       &ctx_omni->session.n_past);
-        }
-
-        runtime.generated_decode_tokens += total_tokens_generated;
-        chunk.llm_finish = runtime.llm_finish;
-
-        omni_llm_stage_strip_decode_special_tokens(chunk.text);
-        omni_llm_stage_publish_decode_response(ctx_omni, chunk.text);
-        omni_llm_stage_dispatch_decode_chunk_to_tts(ctx_omni, request, chunk, runtime.llm_n_embd);
-
-        if (runtime.llm_finish) {
-            break;
-        }
+        omni_llm_stage_complete_decode_slice(ctx_omni, &state, &slice);
+        omni_llm_stage_publish_decode_slice(ctx_omni, request, state, slice);
     }
 
-    omni_llm_stage_finish_decode_text_stream(ctx_omni);
-
-    result.llm_finish              = runtime.llm_finish;
-    result.ended_with_listen       = ctx_omni->turn.ended_with_listen.load();
-    result.generated_decode_tokens = runtime.generated_decode_tokens;
-    if (out_result != nullptr) {
-        *out_result = result;
-    }
-
+    omni_llm_stage_finish_decode(ctx_omni, state, out_result);
     return true;
 }
