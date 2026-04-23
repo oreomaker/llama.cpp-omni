@@ -435,6 +435,13 @@ ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device) {
     return device->iface.event_new(device);
 }
 
+ggml_backend_event_t ggml_backend_event_new_timed(ggml_backend_dev_t device) {
+    if (device == NULL || device->iface.event_new_timed == NULL) {
+        return NULL;
+    }
+    return device->iface.event_new_timed(device);
+}
+
 void ggml_backend_event_free(ggml_backend_event_t event) {
     if (event == NULL) {
         return;
@@ -461,6 +468,17 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     GGML_ASSERT(backend->iface.event_wait != NULL);
 
     backend->iface.event_wait(backend, event);
+}
+
+float ggml_backend_event_elapsed_ms(ggml_backend_event_t start, ggml_backend_event_t end) {
+    if (start == NULL || end == NULL) {
+        return -1.0f;
+    }
+    if (start->device != end->device || start->device->iface.event_elapsed_ms == NULL) {
+        return -1.0f;
+    }
+
+    return start->device->iface.event_elapsed_ms(start->device, start, end);
 }
 
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -543,6 +561,11 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
     }
 
     return false;
+}
+
+bool ggml_backend_dev_supports_timed_events(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+    return device->iface.event_new_timed != NULL && device->iface.event_elapsed_ms != NULL;
 }
 
 // Backend (reg)

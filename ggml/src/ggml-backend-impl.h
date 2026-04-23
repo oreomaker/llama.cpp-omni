@@ -179,6 +179,9 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        // profiling-only timed events
+        ggml_backend_event_t (*event_new_timed)   (ggml_backend_dev_t dev);
+        float                (*event_elapsed_ms)  (ggml_backend_dev_t dev, ggml_backend_event_t start, ggml_backend_event_t end);
     };
 
     struct ggml_backend_device {

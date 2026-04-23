@@ -3724,6 +3724,24 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 #endif
 }
 
+static ggml_backend_event_t ggml_backend_cuda_device_event_new_timed(ggml_backend_dev_t dev) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    return nullptr;
+#else
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    ggml_cuda_set_device(dev_ctx->device);
+
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDefault));
+
+    return new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ event,
+    };
+#endif
+}
+
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
@@ -3734,6 +3752,15 @@ static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_bac
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+}
+
+static float ggml_backend_cuda_device_event_elapsed_ms(ggml_backend_dev_t dev, ggml_backend_event_t start, ggml_backend_event_t end) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
+    ggml_cuda_set_device(dev_ctx->device);
+
+    float ms = -1.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, (cudaEvent_t)start->context, (cudaEvent_t)end->context));
+    return ms;
 }
 
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
@@ -3752,6 +3779,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_new               = */ ggml_backend_cuda_device_event_new,
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
+    /* .event_new_timed         = */ ggml_backend_cuda_device_event_new_timed,
+    /* .event_elapsed_ms        = */ ggml_backend_cuda_device_event_elapsed_ms,
 };
 
 // backend reg

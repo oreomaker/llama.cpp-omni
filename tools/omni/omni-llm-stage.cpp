@@ -10,6 +10,7 @@
 #include "omni-tts-stage.h"
 #include "omni-turn-coordinator.h"
 #include "omni.h"
+#include "src/llama-context.h"
 #include "src/llama-model.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <utility>
 
 namespace {
@@ -27,9 +29,206 @@ namespace {
 // decode preparation. These are not model-forward helpers.
 // =============================================================================
 
+constexpr const char * kOmniBackendProfileTag = "TAG=OMNI_BACKEND_PROFILE";
+
 double omni_llm_stage_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
                                         const std::chrono::high_resolution_clock::time_point & end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+bool omni_llm_stage_backend_profile_enabled() {
+    static const bool enabled = std::getenv("OMNI_BACKEND_PROFILE") != nullptr;
+    return enabled;
+}
+
+int omni_llm_stage_peek_decode_step_idx(struct omni_context * ctx_omni, int chunk_idx) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto                        it = ctx_omni->duplex_chunk_timings.find(chunk_idx);
+    if (it == ctx_omni->duplex_chunk_timings.end()) {
+        return 1;
+    }
+
+    return static_cast<int>(it->second.llm_decode_steps.size()) + 1;
+}
+
+const char * omni_llm_stage_backend_profile_stage_name(OmniBackendProfileStage stage) {
+    switch (stage) {
+        case OmniBackendProfileStage::llm_prefill:               return "llm_prefill_device";
+        case OmniBackendProfileStage::llm_decode_eval_hidden:    return "llm_decode_eval_hidden_device";
+        case OmniBackendProfileStage::llm_decode_control_chunk_eos: return "llm_decode_control_chunk_eos_device";
+        case OmniBackendProfileStage::llm_decode_control_unit_end:  return "llm_decode_control_unit_end_device";
+    }
+
+    return "unknown";
+}
+
+void omni_llm_stage_backend_profile_discard_span(OmniBackendProfileSpan & span) {
+    for (auto & event_pair : span.events) {
+        ggml_backend_event_free(event_pair.start);
+        ggml_backend_event_free(event_pair.end);
+        event_pair.start = nullptr;
+        event_pair.end   = nullptr;
+        event_pair.backend = nullptr;
+    }
+    span.events.clear();
+}
+
+bool omni_llm_stage_backend_profile_begin_span(struct omni_context *     ctx_omni,
+                                               OmniBackendProfileStage   stage,
+                                               int                       chunk_idx,
+                                               int                       step_idx,
+                                               llama_token               token,
+                                               int                       n_tokens,
+                                               int                       n_past_before,
+                                               OmniBackendProfileSpan &  out_span) {
+    out_span = {};
+    out_span.stage         = stage;
+    out_span.chunk_idx     = chunk_idx;
+    out_span.step_idx      = step_idx;
+    out_span.token         = token;
+    out_span.n_tokens      = n_tokens;
+    out_span.n_past_before = n_past_before;
+
+    if (!omni_llm_stage_backend_profile_enabled() || ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr) {
+        return false;
+    }
+
+    auto * lctx  = ctx_omni->ctx_llama;
+    auto * sched = lctx->get_sched();
+    if (sched == nullptr) {
+        return false;
+    }
+
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    out_span.events.reserve(n_backends);
+
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t     backend = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t device  = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+        if (backend == nullptr || device == nullptr || !ggml_backend_dev_supports_timed_events(device)) {
+            continue;
+        }
+
+        ggml_backend_event_t start = ggml_backend_event_new_timed(device);
+        ggml_backend_event_t end   = ggml_backend_event_new_timed(device);
+        if (start == nullptr || end == nullptr) {
+            ggml_backend_event_free(start);
+            ggml_backend_event_free(end);
+            continue;
+        }
+
+        ggml_backend_event_record(start, backend);
+        out_span.events.push_back({
+            /* .backend = */ backend,
+            /* .start = */ start,
+            /* .end = */ end,
+            /* .backend_name = */ ggml_backend_dev_name(device),
+        });
+    }
+
+    return !out_span.events.empty();
+}
+
+void omni_llm_stage_backend_profile_end_span(OmniBackendProfileSpan & span, double submit_ms, int n_past_after) {
+    span.submit_ms    = submit_ms;
+    span.n_past_after = n_past_after;
+
+    for (auto & event_pair : span.events) {
+        if (event_pair.backend != nullptr && event_pair.end != nullptr) {
+            ggml_backend_event_record(event_pair.end, event_pair.backend);
+        }
+    }
+}
+
+bool omni_llm_stage_backend_profile_finalize_span(OmniBackendProfileSpan & span,
+                                                  double &                 device_ms,
+                                                  std::string &            backend_breakdown) {
+    device_ms = -1.0;
+    backend_breakdown.clear();
+
+    bool first = true;
+    for (auto & event_pair : span.events) {
+        const float backend_ms = ggml_backend_event_elapsed_ms(event_pair.start, event_pair.end);
+        if (backend_ms >= 0.0f) {
+            device_ms = device_ms < 0.0 ? (double) backend_ms : std::max(device_ms, (double) backend_ms);
+            if (!first) {
+                backend_breakdown += ",";
+            }
+            first = false;
+
+            char ms_buf[32];
+            snprintf(ms_buf, sizeof(ms_buf), "%.3f", backend_ms);
+            backend_breakdown += event_pair.backend_name;
+            backend_breakdown += "=";
+            backend_breakdown += ms_buf;
+        }
+
+        ggml_backend_event_free(event_pair.start);
+        ggml_backend_event_free(event_pair.end);
+        event_pair.start   = nullptr;
+        event_pair.end     = nullptr;
+        event_pair.backend = nullptr;
+    }
+
+    span.events.clear();
+    return device_ms >= 0.0;
+}
+
+void omni_llm_stage_backend_profile_log_span(const OmniBackendProfileSpan & span,
+                                             double                         device_ms,
+                                             const std::string &            backend_breakdown) {
+    if (span.step_idx >= 0) {
+        print_with_timestamp(
+            "%s stage=%s chunk=%d step=%d submit_ms=%.3f device_ms=%.3f token=%d n_tokens=%d n_past_before=%d "
+            "n_past_after=%d backends=%s\n",
+            kOmniBackendProfileTag, omni_llm_stage_backend_profile_stage_name(span.stage), span.chunk_idx, span.step_idx,
+            span.submit_ms, device_ms, span.token, span.n_tokens, span.n_past_before, span.n_past_after,
+            backend_breakdown.c_str());
+        return;
+    }
+
+    print_with_timestamp(
+        "%s stage=%s chunk=%d submit_ms=%.3f device_ms=%.3f token=%d n_tokens=%d n_past_before=%d n_past_after=%d "
+        "backends=%s\n",
+        kOmniBackendProfileTag, omni_llm_stage_backend_profile_stage_name(span.stage), span.chunk_idx, span.submit_ms,
+        device_ms, span.token, span.n_tokens, span.n_past_before, span.n_past_after, backend_breakdown.c_str());
+}
+
+void omni_llm_stage_backend_profile_enqueue_pending(struct omni_context * ctx_omni, OmniBackendProfileSpan && span) {
+    if (ctx_omni == nullptr || span.events.empty()) {
+        omni_llm_stage_backend_profile_discard_span(span);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->backend_profile_mtx);
+    ctx_omni->backend_profile_pending.push_back(std::move(span));
+}
+
+void omni_llm_stage_backend_profile_flush_pending(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr || !omni_llm_stage_backend_profile_enabled()) {
+        return;
+    }
+
+    std::vector<OmniBackendProfileSpan> pending;
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->backend_profile_mtx);
+        if (ctx_omni->backend_profile_pending.empty()) {
+            return;
+        }
+        pending.swap(ctx_omni->backend_profile_pending);
+    }
+
+    for (auto & span : pending) {
+        double      device_ms         = -1.0;
+        std::string backend_breakdown;
+        if (omni_llm_stage_backend_profile_finalize_span(span, device_ms, backend_breakdown)) {
+            omni_llm_stage_backend_profile_log_span(span, device_ms, backend_breakdown);
+        }
+    }
 }
 
 void omni_llm_stage_note_prefill_timing(struct omni_context * ctx_omni, int chunk_idx, double ms) {
@@ -185,7 +384,10 @@ bool omni_llm_stage_eval_tokens_with_hidden(struct omni_context *    ctx_omni,
                                             std::vector<llama_token> tokens,
                                             int                      n_batch,
                                             int *                    n_past,
-                                            float *&                 hidden_states) {
+                                            float *&                 hidden_states,
+                                            int                      profile_chunk_idx = -1,
+                                            int                      profile_step_idx = -1,
+                                            llama_token              profile_token = -1) {
     const int n_tokens = (int) tokens.size();
     if (n_tokens == 0) {
         hidden_states = nullptr;
@@ -219,16 +421,36 @@ bool omni_llm_stage_eval_tokens_with_hidden(struct omni_context *    ctx_omni,
             batch.pos[j] = *n_past + j;
         }
 
+        const int              n_past_before = n_past != nullptr ? *n_past : -1;
+        OmniBackendProfileSpan profile_span;
+        const bool             profile_active = omni_llm_stage_backend_profile_begin_span(
+            ctx_omni, OmniBackendProfileStage::llm_decode_eval_hidden, profile_chunk_idx, profile_step_idx,
+            profile_token, n_eval, n_past_before, profile_span);
+        const auto decode_submit_start = std::chrono::high_resolution_clock::now();
         if (llama_decode(ctx_omni->ctx_llama, batch)) {
             LOG_ERR("%s : failed to eval. token %d/%d (batch size %d, n_past %d)\n", __func__, i, n_tokens, n_batch,
                     *n_past);
+            omni_llm_stage_backend_profile_discard_span(profile_span);
             llama_set_embeddings(ctx_omni->ctx_llama, false);
             free(hidden_states);
             hidden_states = nullptr;
             return false;
         }
+        const double decode_submit_ms =
+            omni_llm_stage_timing_elapsed_ms(decode_submit_start, std::chrono::high_resolution_clock::now());
+        if (profile_active) {
+            omni_llm_stage_backend_profile_end_span(profile_span, decode_submit_ms, n_past_before + n_eval);
+        }
 
         float * emb = llama_get_embeddings(ctx_omni->ctx_llama);
+        omni_llm_stage_backend_profile_flush_pending(ctx_omni);
+        if (profile_active) {
+            double      device_ms         = -1.0;
+            std::string backend_breakdown;
+            if (omni_llm_stage_backend_profile_finalize_span(profile_span, device_ms, backend_breakdown)) {
+                omni_llm_stage_backend_profile_log_span(profile_span, device_ms, backend_breakdown);
+            }
+        }
         if (emb != nullptr) {
             memcpy(hidden_states + tokens_processed * n_embd, emb, n_eval * n_embd * sizeof(float));
         }
@@ -245,9 +467,12 @@ bool omni_llm_stage_eval_id_with_hidden(struct omni_context *  ctx_omni,
                                         struct common_params * params,
                                         llama_token            id,
                                         int *                  n_past,
-                                        float *&               hidden_states) {
+                                        float *&               hidden_states,
+                                        int                    profile_chunk_idx = -1,
+                                        int                    profile_step_idx = -1) {
     std::vector<llama_token> tokens = { id };
-    return omni_llm_stage_eval_tokens_with_hidden(ctx_omni, params, std::move(tokens), 1, n_past, hidden_states);
+    return omni_llm_stage_eval_tokens_with_hidden(ctx_omni, params, std::move(tokens), 1, n_past, hidden_states,
+                                                  profile_chunk_idx, profile_step_idx, id);
 }
 
 const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler * smpl,
@@ -256,7 +481,10 @@ const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler *
                                                          int *                   n_past,
                                                          float *&                hidden_states,
                                                          llama_token &           token_id) {
+    const int chunk_idx = omni_llm_stage_active_duplex_chunk_idx(ctx_omni);
+    const int step_idx  = omni_llm_stage_peek_decode_step_idx(ctx_omni, chunk_idx);
     float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    omni_llm_stage_backend_profile_flush_pending(ctx_omni);
 
     if (ctx_omni->duplex_mode && logits != nullptr) {
         if (ctx_omni->special_token_listen >= 0) {
@@ -289,7 +517,7 @@ const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler *
         ret = common_token_to_piece(ctx_omni->ctx_llama, id);
     }
 
-    omni_llm_stage_eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
+    omni_llm_stage_eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states, chunk_idx, step_idx);
     return ret.c_str();
 }
 
@@ -343,10 +571,24 @@ void omni_llm_stage_eval_chunk_eos_token(struct omni_context * ctx_omni) {
         return;
     }
 
+    OmniBackendProfileSpan profile_span;
+    const int              chunk_idx      = omni_llm_stage_active_duplex_chunk_idx(ctx_omni);
+    const int              n_past_before  = ctx_omni->session.n_past;
+    const bool             profile_active = omni_llm_stage_backend_profile_begin_span(
+        ctx_omni, OmniBackendProfileStage::llm_decode_control_chunk_eos, chunk_idx, -1,
+        ctx_omni->special_token_chunk_eos, 1, n_past_before, profile_span);
+    const auto control_submit_start = std::chrono::high_resolution_clock::now();
     std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
     std::vector<llama_token>    chunk_eos_tokens = { ctx_omni->special_token_chunk_eos };
     omni_llm_stage_eval_tokens(ctx_omni, ctx_omni->params, std::move(chunk_eos_tokens), ctx_omni->params->n_batch,
                                &ctx_omni->session.n_past);
+    if (profile_active) {
+        omni_llm_stage_backend_profile_end_span(
+            profile_span,
+            omni_llm_stage_timing_elapsed_ms(control_submit_start, std::chrono::high_resolution_clock::now()),
+            ctx_omni->session.n_past);
+        omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+    }
 }
 
 void omni_llm_stage_eval_unit_end_token(struct omni_context * ctx_omni) {
@@ -354,10 +596,24 @@ void omni_llm_stage_eval_unit_end_token(struct omni_context * ctx_omni) {
         return;
     }
 
+    OmniBackendProfileSpan profile_span;
+    const int              chunk_idx      = omni_llm_stage_active_duplex_chunk_idx(ctx_omni);
+    const int              n_past_before  = ctx_omni->session.n_past;
+    const bool             profile_active = omni_llm_stage_backend_profile_begin_span(
+        ctx_omni, OmniBackendProfileStage::llm_decode_control_unit_end, chunk_idx, -1,
+        ctx_omni->special_token_unit_end, 1, n_past_before, profile_span);
+    const auto control_submit_start = std::chrono::high_resolution_clock::now();
     std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
     std::vector<llama_token>    unit_end_tokens = { ctx_omni->special_token_unit_end };
     omni_llm_stage_eval_tokens(ctx_omni, ctx_omni->params, std::move(unit_end_tokens), ctx_omni->params->n_batch,
                                &ctx_omni->session.n_past);
+    if (profile_active) {
+        omni_llm_stage_backend_profile_end_span(
+            profile_span,
+            omni_llm_stage_timing_elapsed_ms(control_submit_start, std::chrono::high_resolution_clock::now()),
+            ctx_omni->session.n_past);
+        omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+    }
 }
 
 void omni_llm_stage_mark_decode_turn_end(struct omni_context * ctx_omni,
@@ -811,6 +1067,7 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                   struct common_params *     params,
                                   const struct omni_embeds & embeds) {
     const int hidden_size = llama_model_n_embd(llama_get_model(ctx_omni->ctx_llama));
+    const int chunk_idx   = embeds.index;
 
     if (ctx_omni->session.sliding_window_config.mode != "off") {
         sliding_window_register_unit_start(ctx_omni);
@@ -835,17 +1092,53 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
     if (lora_active) {
         LOG_WRN("%s: active LoRA detected, using legacy segmented prefill to preserve token embedding deltas\n",
                 __func__);
+        OmniBackendProfileSpan profile_span;
+        const bool             profile_active = omni_llm_stage_backend_profile_begin_span(
+            ctx_omni, OmniBackendProfileStage::llm_prefill, chunk_idx, -1, -1, -1, ctx_omni->session.n_past,
+            profile_span);
+        const auto prefill_submit_start = std::chrono::high_resolution_clock::now();
         omni_llm_stage_prefill_apply_legacy(ctx_omni, params, embeds, hidden_size);
+        if (profile_active) {
+            omni_llm_stage_backend_profile_end_span(
+                profile_span,
+                omni_llm_stage_timing_elapsed_ms(prefill_submit_start, std::chrono::high_resolution_clock::now()),
+                ctx_omni->session.n_past);
+            omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+        }
     } else if (!omni_llm_stage_build_prefill_embeddings(ctx_omni, embeds, hidden_size, merged_embeddings)) {
         LOG_WRN("%s: merged prefill build failed, falling back to legacy segmented prefill\n", __func__);
+        OmniBackendProfileSpan profile_span;
+        const bool             profile_active = omni_llm_stage_backend_profile_begin_span(
+            ctx_omni, OmniBackendProfileStage::llm_prefill, chunk_idx, -1, -1, -1, ctx_omni->session.n_past,
+            profile_span);
+        const auto prefill_submit_start = std::chrono::high_resolution_clock::now();
         omni_llm_stage_prefill_apply_legacy(ctx_omni, params, embeds, hidden_size);
+        if (profile_active) {
+            omni_llm_stage_backend_profile_end_span(
+                profile_span,
+                omni_llm_stage_timing_elapsed_ms(prefill_submit_start, std::chrono::high_resolution_clock::now()),
+                ctx_omni->session.n_past);
+            omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+        }
     } else {
         const int total_tokens = merged_embeddings.empty() ? 0 : (int) (merged_embeddings.size() / hidden_size);
         if (total_tokens > 0) {
             const int prefill_batch = params->n_batch > 0 ? std::min(total_tokens, params->n_batch) : total_tokens;
+            OmniBackendProfileSpan profile_span;
+            const bool             profile_active = omni_llm_stage_backend_profile_begin_span(
+                ctx_omni, OmniBackendProfileStage::llm_prefill, chunk_idx, -1, -1, total_tokens,
+                ctx_omni->session.n_past, profile_span);
+            const auto prefill_submit_start = std::chrono::high_resolution_clock::now();
             if (!prefill_with_emb(ctx_omni, params, merged_embeddings.data(), total_tokens, prefill_batch,
                                   &ctx_omni->session.n_past)) {
                 LOG_ERR("%s: merged prefill decode failed\n", __func__);
+            }
+            if (profile_active) {
+                omni_llm_stage_backend_profile_end_span(
+                    profile_span,
+                    omni_llm_stage_timing_elapsed_ms(prefill_submit_start, std::chrono::high_resolution_clock::now()),
+                    ctx_omni->session.n_past);
+                omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
             }
         }
     }

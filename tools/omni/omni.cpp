@@ -82,7 +82,17 @@ struct omni_output {
 
 omni_context::omni_context() = default;
 
-omni_context::~omni_context() = default;
+omni_context::~omni_context() {
+    for (auto & span : backend_profile_pending) {
+        for (auto & event_pair : span.events) {
+            ggml_backend_event_free(event_pair.start);
+            ggml_backend_event_free(event_pair.end);
+            event_pair.start = nullptr;
+            event_pair.end   = nullptr;
+        }
+    }
+    backend_profile_pending.clear();
+}
 
 static double timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
                                 const std::chrono::high_resolution_clock::time_point & end) {
@@ -1700,8 +1710,8 @@ void omni_free(struct omni_context * ctx_omni) {
         delete ctx_omni->omni_output;
     }
 
-    llama_backend_free();
     delete ctx_omni;
+    llama_backend_free();
 }
 
 // ==================== 语言设置函数 ====================

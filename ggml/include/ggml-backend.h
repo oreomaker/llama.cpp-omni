@@ -118,10 +118,14 @@ extern "C" {
     //
 
     GGML_API ggml_backend_event_t ggml_backend_event_new(ggml_backend_dev_t device);
+    // profiling-only timed event; returns NULL if the backend does not support device timing
+    GGML_API ggml_backend_event_t ggml_backend_event_new_timed(ggml_backend_dev_t device);
     GGML_API void                 ggml_backend_event_free(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+    // returns a negative value if timing is unsupported or the events are incompatible
+    GGML_API float                ggml_backend_event_elapsed_ms(ggml_backend_event_t start, ggml_backend_event_t end);
 
     //
     // Backend device
@@ -184,6 +188,7 @@ extern "C" {
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
+    GGML_API bool                          ggml_backend_dev_supports_timed_events(ggml_backend_dev_t device);
 
     //
     // Backend (reg)

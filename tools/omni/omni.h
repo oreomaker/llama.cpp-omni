@@ -173,6 +173,32 @@ struct omni_duplex_chunk_timing {
     bool   token2wav_done         = false;
 };
 
+enum class OmniBackendProfileStage : uint8_t {
+    llm_prefill,
+    llm_decode_eval_hidden,
+    llm_decode_control_chunk_eos,
+    llm_decode_control_unit_end,
+};
+
+struct OmniBackendProfileEventPair {
+    ggml_backend_t       backend = nullptr;
+    ggml_backend_event_t start = nullptr;
+    ggml_backend_event_t end   = nullptr;
+    std::string          backend_name;
+};
+
+struct OmniBackendProfileSpan {
+    OmniBackendProfileStage                stage = OmniBackendProfileStage::llm_prefill;
+    int                                    chunk_idx = -1;
+    int                                    step_idx = -1;
+    llama_token                            token = -1;
+    int                                    n_tokens = 0;
+    int                                    n_past_before = -1;
+    int                                    n_past_after = -1;
+    double                                 submit_ms = -1.0;
+    std::vector<OmniBackendProfileEventPair> events;
+};
+
 struct omni_context {
     struct vision_ctx *   ctx_vision = NULL;
     struct audition_ctx * ctx_audio  = NULL;
@@ -317,6 +343,10 @@ struct omni_context {
     std::mutex                                        duplex_timing_mtx;
     std::unordered_map<int, omni_duplex_chunk_timing> duplex_chunk_timings;
     int                                               active_duplex_chunk_idx = -1;
+
+    // Profiling-only timed backend events for low-disturbance device timing.
+    std::mutex                            backend_profile_mtx;
+    std::vector<OmniBackendProfileSpan>   backend_profile_pending;
 
     // C++ Token2Wav session for audio synthesis
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
