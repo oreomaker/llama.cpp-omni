@@ -78,7 +78,8 @@ struct LLMThreadInfo {
     std::queue<omni_embeds *>             queue;
     std::mutex                            mtx;
     std::condition_variable               cv;
-    // Simplex sets this explicitly; duplex auto-promotes queued prefill to decode.
+    // Scheduler wake-up for a decode cycle.
+    // Simplex sets this explicitly; duplex also infers decode from queued prefill.
     std::atomic<bool>                     decode_requested{ false };
     std::chrono::steady_clock::time_point start;
     std::chrono::steady_clock::time_point end;

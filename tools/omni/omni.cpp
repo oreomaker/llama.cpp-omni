@@ -1909,6 +1909,7 @@ static bool omni_run_session_bootstrap_if_needed(struct omni_context *        ct
         omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
 
         if (ctx_omni->duplex_mode && ctx_omni->llm_thread_info != nullptr) {
+            // Kick the LLM scheduler so duplex bootstrap can enter the first decode cycle.
             ctx_omni->llm_thread_info->decode_requested.store(true);
             ctx_omni->llm_thread_info->cv.notify_one();
         }
@@ -2227,7 +2228,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 
     if (ctx_omni->async) {
         {
-            // The worker reads request metadata right before it starts decode.
+            // The LLM scheduler reads request metadata right before a decode cycle starts.
             std::lock_guard<std::mutex> lock(ctx_omni->pipeline_request_mtx);
             ctx_omni->pipeline_debug_dir = std::move(debug_dir);
             ctx_omni->pipeline_round_idx = round_idx;
@@ -2236,7 +2237,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
 
         if (!ctx_omni->duplex_mode && ctx_omni->llm_thread_info != nullptr) {
-            // Simplex async needs an explicit "prefill is complete, decode now" signal.
+            // Simplex async explicitly asks the LLM scheduler to start one decode cycle.
             ctx_omni->llm_thread_info->decode_requested.store(true);
             ctx_omni->llm_thread_info->cv.notify_one();
         }
