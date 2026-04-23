@@ -108,6 +108,7 @@ struct ChunkTimingReport {
     double      audio_embedding_ms = -1.0;
     double      llm_prefill_ms     = -1.0;
     double      llm_decode_ms      = -1.0;
+    std::vector<omni_duplex_decode_step_timing> llm_decode_steps;
     double      tts_audio_token_ms = -1.0;
     double      token2wav_ms       = -1.0;
     bool        tts_done           = false;
@@ -143,6 +144,53 @@ static std::string sanitize_summary_text(const std::string & text) {
     return out;
 }
 
+static std::string format_decode_step_details(const std::vector<omni_duplex_decode_step_timing> & steps) {
+    if (steps.empty()) {
+        return "n/a";
+    }
+
+    std::string out;
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const auto & step = steps[i];
+        char         buf[128];
+        snprintf(buf, sizeof(buf), "#%zu %.1f ms | valid_tok=%d", i + 1, step.elapsed_ms, step.valid_token_count);
+        if (!out.empty()) {
+            out += " | ";
+        }
+        out += buf;
+        if (step.sampled_token_count != 1) {
+            char sampled_buf[64];
+            snprintf(sampled_buf, sizeof(sampled_buf), " (sampled=%d)", step.sampled_token_count);
+            out += sampled_buf;
+        }
+
+        if (step.chunk_limit_reached) {
+            out += " [chunk-limit]";
+        }
+        if (step.ended_with_listen) {
+            out += " [listen]";
+        }
+        if (step.llm_finish) {
+            out += " [finish]";
+        }
+        if (step.interrupted) {
+            out += " [interrupt]";
+        }
+    }
+
+    return out;
+}
+
+static std::string format_average_count(double value) {
+    if (value < 0.0) {
+        return "n/a";
+    }
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f", value);
+    return buf;
+}
+
 static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTimingReport & report) {
     omni_duplex_chunk_timing timing;
     if (!omni_get_duplex_chunk_timing(ctx_omni, report.chunk_idx, &timing)) {
@@ -152,6 +200,7 @@ static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTim
     report.audio_embedding_ms = timing.audio_embedding_ms;
     report.llm_prefill_ms     = timing.llm_prefill_ms;
     report.llm_decode_ms      = timing.llm_decode_ms;
+    report.llm_decode_steps   = timing.llm_decode_steps;
     report.tts_audio_token_ms = timing.tts_audio_token_ms;
     report.token2wav_ms       = timing.token2wav_ms;
     report.tts_done           = timing.tts_done;
@@ -169,6 +218,34 @@ static double average_stage_ms(const std::vector<ChunkTimingReport> &           
             count++;
         }
     }
+    return count > 0 ? total / count : -1.0;
+}
+
+static double average_decode_steps_per_chunk(const std::vector<ChunkTimingReport> & reports) {
+    if (reports.empty()) {
+        return -1.0;
+    }
+
+    size_t total_steps = 0;
+    for (const auto & report : reports) {
+        total_steps += report.llm_decode_steps.size();
+    }
+
+    return static_cast<double>(total_steps) / reports.size();
+}
+
+static double average_decode_step_ms(const std::vector<ChunkTimingReport> & reports) {
+    double total = 0.0;
+    int    count = 0;
+    for (const auto & report : reports) {
+        for (const auto & step : report.llm_decode_steps) {
+            if (step.elapsed_ms >= 0.0) {
+                total += step.elapsed_ms;
+                count++;
+            }
+        }
+    }
+
     return count > 0 ? total / count : -1.0;
 }
 
@@ -212,12 +289,18 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
         printf("  chunk %04d | vit: %s | audio: %s | llm_prefill: %s | llm_decode: %s", report.chunk_idx,
                format_stage_ms(report.vit_embedding_ms).c_str(), format_stage_ms(report.audio_embedding_ms).c_str(),
                format_stage_ms(report.llm_prefill_ms).c_str(), format_stage_ms(report.llm_decode_ms).c_str());
+        if (!report.llm_decode_steps.empty()) {
+            printf(" (%zu steps)", report.llm_decode_steps.size());
+        }
         if (use_tts) {
             printf(" | tts(audio token): %s | token2wav: %s",
                    format_stage_ms(report.tts_audio_token_ms, report.tts_done).c_str(),
                    format_stage_ms(report.token2wav_ms, report.token2wav_done).c_str());
         }
         printf(" | decision: %s\n", report.ended_with_listen ? "<|listen|>" : "<|speak|>");
+        if (!report.llm_decode_steps.empty()) {
+            printf("    decode_steps: %s\n", format_decode_step_details(report.llm_decode_steps).c_str());
+        }
         if (!report.ended_with_listen) {
             const std::string text = sanitize_summary_text(report.generated_text);
             printf("    text: \"%s\"\n", text.empty() ? "" : text.c_str());
@@ -246,6 +329,8 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
                 return r.token2wav_ms;
             })).c_str());
     }
+    printf("\n  avg decode_step: %s | avg decode_steps/chunk: %s", format_stage_ms(average_decode_step_ms(reports)).c_str(),
+           format_average_count(average_decode_steps_per_chunk(reports)).c_str());
     printf("\n========================================\n");
 }
 

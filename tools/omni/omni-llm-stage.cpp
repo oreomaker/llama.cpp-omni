@@ -52,6 +52,32 @@ void omni_llm_stage_note_decode_timing(struct omni_context * ctx_omni, int chunk
     timing.llm_decode_ms               = timing.llm_decode_ms < 0.0 ? ms : timing.llm_decode_ms + ms;
 }
 
+void omni_llm_stage_note_decode_step_timing(struct omni_context *             ctx_omni,
+                                            int                               chunk_idx,
+                                            double                            ms,
+                                            int                               sampled_token_count,
+                                            int                               valid_token_count,
+                                            bool                              chunk_limit_reached,
+                                            bool                              ended_with_listen,
+                                            bool                              llm_finish,
+                                            bool                              interrupted) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.llm_decode_steps.emplace_back();
+    auto & step = timing.llm_decode_steps.back();
+    step.elapsed_ms                    = ms;
+    step.sampled_token_count           = sampled_token_count;
+    step.valid_token_count             = valid_token_count;
+    step.chunk_limit_reached           = chunk_limit_reached;
+    step.ended_with_listen             = ended_with_listen;
+    step.llm_finish                    = llm_finish;
+    step.interrupted                   = interrupted;
+}
+
 int omni_llm_stage_active_duplex_chunk_idx(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr) {
         return -1;
@@ -1235,6 +1261,7 @@ bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
         const char * tmp           = nullptr;
         float *      hidden_states = nullptr;
         llama_token  sampled_token = 0;
+        const auto   step_start    = std::chrono::high_resolution_clock::now();
 
         {
             std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
@@ -1243,6 +1270,7 @@ bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
         }
 
         out_slice->total_tokens_generated++;
+        const double step_ms = omni_llm_stage_timing_elapsed_ms(step_start, std::chrono::high_resolution_clock::now());
 
         if (tmp == nullptr) {
             free(hidden_states);
@@ -1250,11 +1278,13 @@ bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
             break;
         }
 
+        int valid_token_count = 0;
         if (hidden_states != nullptr && omni_tts_is_valid_token(sampled_token)) {
             out_slice->chunk.token_ids.push_back(sampled_token);
             out_slice->chunk.hidden_states.insert(out_slice->chunk.hidden_states.end(), hidden_states,
                                                   hidden_states + state->llm_n_embd);
             valid_chunk_count++;
+            valid_token_count = 1;
             state->current_chunk_tokens++;
 
             if (max_chunk_tokens > 0 && state->current_chunk_tokens >= max_chunk_tokens) {
@@ -1273,10 +1303,16 @@ bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
         if (omni_is_end_token(ctx_omni, sampled_token)) {
             state->llm_finish = true;
             omni_llm_stage_handle_decode_end_token(ctx_omni, token_type);
+            omni_llm_stage_note_decode_step_timing(ctx_omni, omni_llm_stage_active_duplex_chunk_idx(ctx_omni), step_ms,
+                                                   1, valid_token_count, chunk_limit_reached,
+                                                   ctx_omni->turn.ended_with_listen.load(), state->llm_finish, false);
             break;
         }
 
         out_slice->chunk.text += std::string(tmp);
+        omni_llm_stage_note_decode_step_timing(ctx_omni, omni_llm_stage_active_duplex_chunk_idx(ctx_omni), step_ms, 1,
+                                               valid_token_count, chunk_limit_reached,
+                                               ctx_omni->turn.ended_with_listen.load(), state->llm_finish, false);
         fflush(stdout);
     }
 
