@@ -10,6 +10,7 @@
 #include "omni-tts-stage.h"
 #include "omni-turn-coordinator.h"
 #include "omni.h"
+#include "src/llama-model.h"
 
 #include <algorithm>
 #include <chrono>
@@ -543,14 +544,178 @@ bool omni_llm_stage_eval_string_with_hidden(struct omni_context *  ctx_omni,
 // Applies one encoded multimodal input unit onto the main LLM sequence.
 // =============================================================================
 
-void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
-                                  struct common_params *     params,
-                                  const struct omni_embeds & embeds) {
-    const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
-
-    if (ctx_omni->session.sliding_window_config.mode != "off") {
-        sliding_window_register_unit_start(ctx_omni);
+static bool omni_llm_stage_append_prefill_token_embeddings(struct omni_context * ctx_omni,
+                                                           const std::string &   segment,
+                                                           int                   hidden_size,
+                                                           std::vector<float> &  merged_embeddings) {
+    if (ctx_omni == nullptr || ctx_omni->model == nullptr || ctx_omni->model->tok_embd == nullptr) {
+        LOG_ERR("%s: missing LLM token embeddings\n", __func__);
+        return false;
     }
+
+    if (segment.empty()) {
+        return true;
+    }
+
+    std::string              segment_buf = segment;
+    std::vector<llama_token> tokens      = common_tokenize(ctx_omni->ctx_llama, segment_buf, false, true);
+    if (tokens.empty()) {
+        return true;
+    }
+
+    struct ggml_tensor * tok_embd = ctx_omni->model->tok_embd;
+    if (tok_embd->ne[0] != hidden_size) {
+        LOG_ERR("%s: token embedding width mismatch: got %lld expected %d\n", __func__, (long long) tok_embd->ne[0],
+                hidden_size);
+        return false;
+    }
+
+    const int64_t vocab_size = tok_embd->ne[1];
+    const size_t  row_stride = tok_embd->nb[1];
+    const size_t  row_size   = ggml_row_size(tok_embd->type, tok_embd->ne[0]);
+    if (row_stride < row_size) {
+        LOG_ERR("%s: token embedding row stride too small: stride=%zu row_size=%zu\n", __func__, row_stride, row_size);
+        return false;
+    }
+
+    const struct ggml_type_traits * type_traits = ggml_get_type_traits(tok_embd->type);
+    if (type_traits == nullptr) {
+        LOG_ERR("%s: failed to get ggml type traits for token embeddings\n", __func__);
+        return false;
+    }
+
+    if (ggml_is_quantized(tok_embd->type)) {
+        if (type_traits->to_float == nullptr) {
+            LOG_ERR("%s: token embedding type %s does not support dequantize\n", __func__,
+                    ggml_type_name(tok_embd->type));
+            return false;
+        }
+        ggml_quantize_init(tok_embd->type);
+    } else if (tok_embd->type != GGML_TYPE_F32 && tok_embd->type != GGML_TYPE_F16) {
+        LOG_ERR("%s: unsupported token embedding type %s\n", __func__, ggml_type_name(tok_embd->type));
+        return false;
+    }
+
+    std::vector<uint8_t> raw_row(row_size);
+    std::vector<float>   f32_row(hidden_size);
+    merged_embeddings.reserve(merged_embeddings.size() + tokens.size() * (size_t) hidden_size);
+
+    for (llama_token token_id : tokens) {
+        if (token_id < 0 || token_id >= vocab_size) {
+            LOG_ERR("%s: token id %d out of token embedding range [0, %lld)\n", __func__, token_id,
+                    (long long) vocab_size);
+            return false;
+        }
+
+        ggml_backend_tensor_get(tok_embd, raw_row.data(), (size_t) token_id * row_stride, row_size);
+
+        switch (tok_embd->type) {
+            case GGML_TYPE_F32:
+                memcpy(f32_row.data(), raw_row.data(), hidden_size * sizeof(float));
+                break;
+            case GGML_TYPE_F16:
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw_row.data(), f32_row.data(), hidden_size);
+                break;
+            default:
+                type_traits->to_float(raw_row.data(), f32_row.data(), hidden_size);
+                break;
+        }
+
+        merged_embeddings.insert(merged_embeddings.end(), f32_row.begin(), f32_row.end());
+    }
+
+    return true;
+}
+
+static bool omni_llm_stage_append_prefill_raw_embeddings(const std::vector<float> & source,
+                                                         int                        hidden_size,
+                                                         std::vector<float> &       merged_embeddings) {
+    if (source.empty()) {
+        return true;
+    }
+
+    if (hidden_size <= 0 || source.size() % (size_t) hidden_size != 0) {
+        LOG_ERR("%s: invalid embedding payload size=%zu hidden_size=%d\n", __func__, source.size(), hidden_size);
+        return false;
+    }
+
+    merged_embeddings.insert(merged_embeddings.end(), source.begin(), source.end());
+    return true;
+}
+
+static bool omni_llm_stage_build_prefill_embeddings(struct omni_context *      ctx_omni,
+                                                    const struct omni_embeds & embeds,
+                                                    int                        hidden_size,
+                                                    std::vector<float> &       merged_embeddings) {
+    if (ctx_omni == nullptr) {
+        return false;
+    }
+
+    if (!embeds.vision_embed.empty()) {
+        const bool has_slices = embeds.vision_embed.size() > 1;
+
+        if (!omni_llm_stage_append_prefill_token_embeddings(
+                ctx_omni, ctx_omni->duplex_mode ? "<unit><image>" : "<image>", hidden_size, merged_embeddings) ||
+            !omni_llm_stage_append_prefill_raw_embeddings(embeds.vision_embed[0], hidden_size, merged_embeddings) ||
+            !omni_llm_stage_append_prefill_token_embeddings(ctx_omni, "</image>", hidden_size, merged_embeddings)) {
+            return false;
+        }
+
+        if (has_slices) {
+            for (size_t i = 1; i < embeds.vision_embed.size(); ++i) {
+                if (!omni_llm_stage_append_prefill_token_embeddings(ctx_omni, "<slice>", hidden_size,
+                                                                    merged_embeddings) ||
+                    !omni_llm_stage_append_prefill_raw_embeddings(embeds.vision_embed[i], hidden_size,
+                                                                  merged_embeddings) ||
+                    !omni_llm_stage_append_prefill_token_embeddings(ctx_omni, "</slice>", hidden_size,
+                                                                    merged_embeddings)) {
+                    return false;
+                }
+            }
+
+            if (!omni_llm_stage_append_prefill_token_embeddings(ctx_omni, "\n", hidden_size, merged_embeddings)) {
+                return false;
+            }
+        }
+
+        if (!embeds.audio_embed.empty()) {
+            if (!ctx_omni->duplex_mode && !omni_llm_stage_append_prefill_token_embeddings(
+                                              ctx_omni, "<|audio_start|>", hidden_size, merged_embeddings)) {
+                return false;
+            }
+
+            if (!omni_llm_stage_append_prefill_raw_embeddings(embeds.audio_embed, hidden_size, merged_embeddings)) {
+                return false;
+            }
+
+            if (!ctx_omni->duplex_mode && !omni_llm_stage_append_prefill_token_embeddings(
+                                              ctx_omni, "<|audio_end|>", hidden_size, merged_embeddings)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (!omni_llm_stage_append_prefill_token_embeddings(ctx_omni, ctx_omni->duplex_mode ? "<unit>" : "<|audio_start|>",
+                                                        hidden_size, merged_embeddings) ||
+        !omni_llm_stage_append_prefill_raw_embeddings(embeds.audio_embed, hidden_size, merged_embeddings)) {
+        return false;
+    }
+
+    if (!ctx_omni->duplex_mode &&
+        !omni_llm_stage_append_prefill_token_embeddings(ctx_omni, "<|audio_end|>", hidden_size, merged_embeddings)) {
+        return false;
+    }
+
+    return true;
+}
+
+static void omni_llm_stage_prefill_apply_legacy(struct omni_context *      ctx_omni,
+                                                struct common_params *     params,
+                                                const struct omni_embeds & embeds,
+                                                int                        hidden_size) {
+    LOG_WRN("%s: using legacy segmented prefill path (multiple decode passes)\n", __func__);
 
     if (!embeds.vision_embed.empty()) {
         const int  n_chunks         = (int) embeds.vision_embed.size();
@@ -582,9 +747,6 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
             omni_llm_stage_eval_string(ctx_omni, params, "\n", params->n_batch, &ctx_omni->session.n_past, false);
         }
 
-        print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
-                             tokens_per_chunk, n_audio_tokens, has_slices);
-
         if (has_audio) {
             if (!ctx_omni->duplex_mode) {
                 omni_llm_stage_eval_string(ctx_omni, params, "<|audio_start|>", params->n_batch,
@@ -599,7 +761,6 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         }
     } else {
         const int n_audio_tokens = embeds.audio_embed.size() / hidden_size;
-        print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
 
         if (ctx_omni->duplex_mode) {
             omni_llm_stage_eval_string(ctx_omni, params, "<unit>", params->n_batch, &ctx_omni->session.n_past, false);
@@ -616,6 +777,50 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
         if (!ctx_omni->duplex_mode) {
             omni_llm_stage_eval_string(ctx_omni, params, "<|audio_end|>", params->n_batch, &ctx_omni->session.n_past,
                                        false);
+        }
+    }
+}
+
+void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
+                                  struct common_params *     params,
+                                  const struct omni_embeds & embeds) {
+    const int hidden_size = llama_model_n_embd(llama_get_model(ctx_omni->ctx_llama));
+
+    if (ctx_omni->session.sliding_window_config.mode != "off") {
+        sliding_window_register_unit_start(ctx_omni);
+    }
+
+    if (!embeds.vision_embed.empty()) {
+        const int  n_chunks         = (int) embeds.vision_embed.size();
+        const int  tokens_per_chunk = (int) embeds.vision_embed[0].size() / hidden_size;
+        const int  n_audio_tokens   = embeds.audio_embed.size() / hidden_size;
+        const bool has_slices       = n_chunks > 1;
+
+        print_with_timestamp("Omni模式: %d vision chunks (%d tokens each), %d audio tokens, has_slices=%d\n", n_chunks,
+                             tokens_per_chunk, n_audio_tokens, has_slices);
+    } else {
+        const int n_audio_tokens = embeds.audio_embed.size() / hidden_size;
+        print_with_timestamp("用户语音: %d audio tokens\n", n_audio_tokens);
+    }
+
+    const bool lora_active = params != nullptr && !params->lora_init_without_apply && !params->lora_adapters.empty();
+
+    std::vector<float> merged_embeddings;
+    if (lora_active) {
+        LOG_WRN("%s: active LoRA detected, using legacy segmented prefill to preserve token embedding deltas\n",
+                __func__);
+        omni_llm_stage_prefill_apply_legacy(ctx_omni, params, embeds, hidden_size);
+    } else if (!omni_llm_stage_build_prefill_embeddings(ctx_omni, embeds, hidden_size, merged_embeddings)) {
+        LOG_WRN("%s: merged prefill build failed, falling back to legacy segmented prefill\n", __func__);
+        omni_llm_stage_prefill_apply_legacy(ctx_omni, params, embeds, hidden_size);
+    } else {
+        const int total_tokens = merged_embeddings.empty() ? 0 : (int) (merged_embeddings.size() / hidden_size);
+        if (total_tokens > 0) {
+            const int prefill_batch = params->n_batch > 0 ? std::min(total_tokens, params->n_batch) : total_tokens;
+            if (!prefill_with_emb(ctx_omni, params, merged_embeddings.data(), total_tokens, prefill_batch,
+                                  &ctx_omni->session.n_past)) {
+                LOG_ERR("%s: merged prefill decode failed\n", __func__);
+            }
         }
     }
 
