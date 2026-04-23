@@ -129,6 +129,13 @@ set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
+# LLM 推理性能基准测试
+set(TARGET_LLM_BENCH llama-omni-test-llm-bench)
+add_executable         (${TARGET_LLM_BENCH} test/test-llm-bench.cpp)
+set_target_properties  (${TARGET_LLM_BENCH} PROPERTIES OUTPUT_NAME llama-omni-test-llm-bench)
+target_link_libraries  (${TARGET_LLM_BENCH} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_LLM_BENCH} PRIVATE cxx_std_17)
+
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
