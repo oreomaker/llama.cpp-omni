@@ -2229,3 +2229,10 @@ bool vision_image_batch_encode_coreml(vision_ctx * ctx, const vision_image_f32_b
     return false;
 #endif
 }
+
+ggml_backend_sched_t vision_get_sched(struct vision_ctx * ctx) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    return ctx->sched.get();
+}

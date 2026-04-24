@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -108,3 +109,6 @@ bool vision_image_batch_encode(struct vision_ctx * ctx, int n_threads, const str
 void vision_set_coreml_model_path(struct vision_ctx * ctx, const char * coreml_model_path);
 bool vision_coreml_warmup(struct vision_ctx * ctx);
 bool vision_image_batch_encode_coreml(struct vision_ctx * ctx, const struct vision_image_f32_batch * imgs, float * vec);
+
+// backend accessors for profiling
+ggml_backend_sched_t vision_get_sched(struct vision_ctx * ctx);

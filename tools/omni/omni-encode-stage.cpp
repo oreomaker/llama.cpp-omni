@@ -8,6 +8,8 @@
 #include "omni.h"
 #include "vision.h"
 
+#include "ggml-backend.h"
+
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -16,9 +18,132 @@
 
 namespace {
 
+constexpr const char * kOmniBackendProfileTag = "TAG=OMNI_BACKEND_PROFILE";
+
 double omni_encode_timing_elapsed_ms(const std::chrono::high_resolution_clock::time_point & start,
                                      const std::chrono::high_resolution_clock::time_point & end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+bool omni_encode_backend_profile_enabled() {
+    static const bool enabled = std::getenv("OMNI_BACKEND_PROFILE") != nullptr;
+    return enabled;
+}
+
+void omni_encode_backend_profile_discard_span(OmniBackendProfileSpan & span) {
+    for (auto & event_pair : span.events) {
+        ggml_backend_event_free(event_pair.start);
+        ggml_backend_event_free(event_pair.end);
+        event_pair.start   = nullptr;
+        event_pair.end     = nullptr;
+        event_pair.backend = nullptr;
+    }
+    span.events.clear();
+}
+
+bool omni_encode_backend_profile_begin_span(ggml_backend_sched_t      sched,
+                                           OmniBackendProfileStage   stage,
+                                           int                       chunk_idx,
+                                           int                       n_tokens,
+                                           OmniBackendProfileSpan &  out_span) {
+    out_span          = {};
+    out_span.stage     = stage;
+    out_span.chunk_idx = chunk_idx;
+    out_span.n_tokens  = n_tokens;
+
+    if (!omni_encode_backend_profile_enabled() || sched == nullptr) {
+        return false;
+    }
+
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    out_span.events.reserve(n_backends);
+
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t     backend = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t device  = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+        if (backend == nullptr || device == nullptr || !ggml_backend_dev_supports_timed_events(device)) {
+            continue;
+        }
+
+        ggml_backend_event_t start = ggml_backend_event_new_timed(device);
+        ggml_backend_event_t end   = ggml_backend_event_new_timed(device);
+        if (start == nullptr || end == nullptr) {
+            ggml_backend_event_free(start);
+            ggml_backend_event_free(end);
+            continue;
+        }
+
+        ggml_backend_event_record(start, backend);
+        out_span.events.push_back({
+            /* .backend = */ backend,
+            /* .start   = */ start,
+            /* .end     = */ end,
+            /* .backend_name = */ ggml_backend_dev_name(device),
+        });
+    }
+
+    return !out_span.events.empty();
+}
+
+void omni_encode_backend_profile_end_span(OmniBackendProfileSpan & span, double submit_ms) {
+    span.submit_ms = submit_ms;
+
+    for (auto & event_pair : span.events) {
+        if (event_pair.backend != nullptr && event_pair.end != nullptr) {
+            ggml_backend_event_record(event_pair.end, event_pair.backend);
+        }
+    }
+}
+
+void omni_encode_backend_profile_log_span(const OmniBackendProfileSpan & span, double device_ms,
+                                         const std::string & backend_breakdown) {
+    const char * stage_name = "unknown";
+    switch (span.stage) {
+        case OmniBackendProfileStage::encode_vit_embed:   stage_name = "encode_vit_embed_device"; break;
+        case OmniBackendProfileStage::encode_audio_embed: stage_name = "encode_audio_embed_device"; break;
+        default: break;
+    }
+
+    print_with_timestamp(
+        "%s stage=%s chunk=%d submit_ms=%.3f device_ms=%.3f n_tokens=%d backends=%s\n",
+        kOmniBackendProfileTag, stage_name, span.chunk_idx, span.submit_ms, device_ms, span.n_tokens,
+        backend_breakdown.c_str());
+}
+
+void omni_encode_backend_profile_finalize_and_log(OmniBackendProfileSpan & span) {
+    double      device_ms         = -1.0;
+    std::string backend_breakdown;
+
+    bool first = true;
+    for (auto & event_pair : span.events) {
+        ggml_backend_event_synchronize(event_pair.start);
+        ggml_backend_event_synchronize(event_pair.end);
+        const float backend_ms = ggml_backend_event_elapsed_ms(event_pair.start, event_pair.end);
+        if (backend_ms >= 0.0f) {
+            device_ms = device_ms < 0.0 ? (double) backend_ms : std::max(device_ms, (double) backend_ms);
+            if (!first) {
+                backend_breakdown += ",";
+            }
+            first = false;
+
+            char ms_buf[32];
+            snprintf(ms_buf, sizeof(ms_buf), "%.3f", backend_ms);
+            backend_breakdown += event_pair.backend_name;
+            backend_breakdown += "=";
+            backend_breakdown += ms_buf;
+        }
+
+        ggml_backend_event_free(event_pair.start);
+        ggml_backend_event_free(event_pair.end);
+        event_pair.start   = nullptr;
+        event_pair.end     = nullptr;
+        event_pair.backend = nullptr;
+    }
+    span.events.clear();
+
+    if (device_ms >= 0.0) {
+        omni_encode_backend_profile_log_span(span, device_ms, backend_breakdown);
+    }
 }
 
 void omni_encode_stage_note_vit(struct omni_context * ctx_omni, int chunk_idx, double ms) {
@@ -70,11 +195,19 @@ bool omni_encode_prefill_input(struct omni_context * ctx_omni,
             LOG_INF("%s: [临时] max_slice_nums=%d for this prefill\n", __func__, max_slice_nums);
         }
 
+        OmniBackendProfileSpan vit_profile_span;
+        const bool             vit_profile_active = omni_encode_backend_profile_begin_span(
+            vision_get_sched(ctx_omni->ctx_vision), OmniBackendProfileStage::encode_vit_embed, index, -1, vit_profile_span);
         auto       vit_embed_start = std::chrono::high_resolution_clock::now();
         const bool image_embed_ok  = omni_image_embed_make_chunks_with_filename(
             ctx_omni->ctx_vision, ctx_omni->params->cpuparams.n_threads, img_fname, encoded.vision_embed);
-        omni_encode_stage_note_vit(ctx_omni, index,
-                                   omni_encode_timing_elapsed_ms(vit_embed_start, std::chrono::high_resolution_clock::now()));
+        const double vit_submit_ms =
+            omni_encode_timing_elapsed_ms(vit_embed_start, std::chrono::high_resolution_clock::now());
+        omni_encode_stage_note_vit(ctx_omni, index, vit_submit_ms);
+        if (vit_profile_active) {
+            omni_encode_backend_profile_end_span(vit_profile_span, vit_submit_ms);
+            omni_encode_backend_profile_finalize_and_log(vit_profile_span);
+        }
         if (!image_embed_ok) {
             LOG_ERR("%s: failed to create vision embeddings for %s\n", __func__, img_fname.c_str());
             return false;
@@ -84,12 +217,19 @@ bool omni_encode_prefill_input(struct omni_context * ctx_omni,
 
     if (!aud_fname.empty()) {
         print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
+        OmniBackendProfileSpan audio_profile_span;
+        const bool             audio_profile_active = omni_encode_backend_profile_begin_span(
+            audition_get_sched(ctx_omni->ctx_audio), OmniBackendProfileStage::encode_audio_embed, index, -1, audio_profile_span);
         auto   audio_embed_start = std::chrono::high_resolution_clock::now();
         auto * audio_embeds =
             omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
-        omni_encode_stage_note_audio(
-            ctx_omni, index,
-            omni_encode_timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now()));
+        const double audio_submit_ms =
+            omni_encode_timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now());
+        omni_encode_stage_note_audio(ctx_omni, index, audio_submit_ms);
+        if (audio_profile_active) {
+            omni_encode_backend_profile_end_span(audio_profile_span, audio_submit_ms);
+            omni_encode_backend_profile_finalize_and_log(audio_profile_span);
+        }
         if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
             print_with_timestamp("stream_prefill(index=%d): user audio embedding: n_pos=%d\n", index,
                                  audio_embeds->n_pos);

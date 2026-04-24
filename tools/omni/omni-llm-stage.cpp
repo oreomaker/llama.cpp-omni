@@ -61,6 +61,8 @@ const char * omni_llm_stage_backend_profile_stage_name(OmniBackendProfileStage s
         case OmniBackendProfileStage::llm_decode_eval_hidden:    return "llm_decode_eval_hidden_device";
         case OmniBackendProfileStage::llm_decode_control_chunk_eos: return "llm_decode_control_chunk_eos_device";
         case OmniBackendProfileStage::llm_decode_control_unit_end:  return "llm_decode_control_unit_end_device";
+        case OmniBackendProfileStage::encode_vit_embed:          return "encode_vit_embed_device";
+        case OmniBackendProfileStage::encode_audio_embed:        return "encode_audio_embed_device";
     }
 
     return "unknown";

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <stddef.h>
@@ -180,3 +181,6 @@ void audition_whisper_free_kv_cache(struct audition_ctx * ctx);
 
 // Clear KV cache and reset iteration counter (call before processing new audio sequence)
 void audition_whisper_clear_kv_cache(struct audition_ctx * ctx);
+
+// backend accessors for profiling
+ggml_backend_sched_t audition_get_sched(struct audition_ctx * ctx);

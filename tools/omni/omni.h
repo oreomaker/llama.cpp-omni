@@ -178,6 +178,8 @@ enum class OmniBackendProfileStage : uint8_t {
     llm_decode_eval_hidden,
     llm_decode_control_chunk_eos,
     llm_decode_control_unit_end,
+    encode_vit_embed,
+    encode_audio_embed,
 };
 
 struct OmniBackendProfileEventPair {

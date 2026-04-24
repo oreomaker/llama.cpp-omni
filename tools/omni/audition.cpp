@@ -2114,11 +2114,18 @@ bool audition_audio_preprocess(
     mel_f32->nx = mel_spec.n_len;   // 时间维度（frames）
     mel_f32->ny = mel_spec.n_mel;   // Mel bins 数量
     mel_f32->buf = std::move(mel_spec.data);  // 移动数据避免拷贝
-    
+
     *out_mel = mel_f32;
-    
+
     LOG_INF("%s: Mel spectrogram ready - n_len=%d, n_mel=%d, total_size=%zu\n",
             __func__, mel_f32->nx, mel_f32->ny, mel_f32->buf.size());
-    
+
     return true;
+}
+
+ggml_backend_sched_t audition_get_sched(struct audition_ctx * ctx) {
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    return ctx->sched.get();
 }
