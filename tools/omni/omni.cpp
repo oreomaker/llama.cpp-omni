@@ -1435,7 +1435,8 @@ bool prefill_with_emb_tts(struct omni_context * ctx_omni,
                           int                   n_batch,
                           int *                 n_past_tts) {
     (void) params;
-    // 🔧 [安全检查] 验证输入参数
+    const auto t_func_start = std::chrono::high_resolution_clock::now();
+
     if (n_pos <= 0) {
         LOG_ERR("%s: invalid n_pos=%d, skipping\n", __func__, n_pos);
         return false;
@@ -1451,20 +1452,17 @@ bool prefill_with_emb_tts(struct omni_context * ctx_omni,
 
     int n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
 
-    // 🔧 [安全检查] 验证 n_embd 是合理值
     if (n_embd <= 0 || n_embd > 10000) {
         LOG_ERR("%s: invalid n_embd=%d from TTS model, likely model corruption\n", __func__, n_embd);
         return false;
     }
 
-    // 🔧 [安全检查] 检查乘法溢出
     if (n_pos > (INT_MAX / n_embd)) {
         LOG_ERR("%s: n_pos=%d * n_embd=%d would overflow\n", __func__, n_pos, n_embd);
         return false;
     }
 
     // Save condition embeddings for first audio token re-forward (if not already saved)
-    // This is needed to match Python's behavior: first audio token re-forwards the condition
     if (!ctx_omni->tts_condition_saved && n_pos > 0) {
         ctx_omni->tts_condition_embeddings.resize(n_pos * n_embd);
         std::memcpy(ctx_omni->tts_condition_embeddings.data(), embed, n_pos * n_embd * sizeof(float));
@@ -1473,38 +1471,44 @@ bool prefill_with_emb_tts(struct omni_context * ctx_omni,
         ctx_omni->tts_condition_saved  = true;
     }
 
-    // Save the starting position before the loop
     int text_start_pos = *n_past_tts;
 
-    // Check if we need to save all hidden states (for alignment testing)
     const char * save_hidden_states_dir = getenv("TTS_SAVE_HIDDEN_STATES_DIR");
     bool         save_all_hidden_states = (save_hidden_states_dir != nullptr);
+
+    double total_decode_submit_ms = 0.0;
+    const int n_batches_total = (n_pos + n_batch - 1) / n_batch;
 
     for (int i = 0; i < n_pos; i += n_batch) {
         int n_eval = std::min(n_pos - i, n_batch);
 
         llama_batch batch = {};
         batch.n_tokens    = int32_t(n_eval);
-        batch.embd        = (embed + i * n_embd);  // 使用embedding作为输入
+        batch.embd        = (embed + i * n_embd);
 
-        // 设置pos值以确保正确的KV cache位置
-        // Python: pos_ids = torch.arange(text_start_pos, text_start_pos + condition_length)
-        // C++: batch.pos[j] = text_start_pos + i + j (where i is the offset within the current batch)
         std::vector<llama_pos> pos_vec(n_eval);
         batch.pos = pos_vec.data();
         for (int j = 0; j < n_eval; j++) {
-            batch.pos[j] = text_start_pos + i + j;  // Fix: use text_start_pos + i + j instead of *n_past_tts + j
+            batch.pos[j] = text_start_pos + i + j;
         }
 
-        // Enable embeddings output for TTS model (needed for head_code logits calculation)
         llama_set_embeddings(ctx_omni->ctx_tts_llama, true);
 
+        // ── GPU: llama_decode async submission ──
+        const auto t_decode_submit = std::chrono::high_resolution_clock::now();
         if (llama_decode(ctx_omni->ctx_tts_llama, batch)) {
             LOG_ERR("%s : failed to eval TTS embeddings. pos %d/%d (batch size %d, n_past %d)\n", __func__, i, n_pos,
                     n_batch, *n_past_tts);
             llama_set_embeddings(ctx_omni->ctx_tts_llama, false);
             return false;
         }
+        const auto t_decode_done = std::chrono::high_resolution_clock::now();
+        const double decode_ms = std::chrono::duration<double, std::milli>(t_decode_done - t_decode_submit).count();
+        total_decode_submit_ms += decode_ms;
+
+        print_with_timestamp(
+            "prefill_emb_tts: llama_decode[%d/%d] batch=%d pos=%d n_past=%d submit→return=%.2fms [GPU async submit]\n",
+            i / n_batch + 1, n_batches_total, n_eval, text_start_pos + i, *n_past_tts, decode_ms);
 
         // Save hidden states for each token in the batch (for alignment testing)
         // Note: llama_get_embeddings_ith uses negative indices relative to the end of the batch
@@ -1537,6 +1541,13 @@ bool prefill_with_emb_tts(struct omni_context * ctx_omni,
 
     // Update n_past_tts after all tokens are processed
     *n_past_tts = text_start_pos + n_pos;
+
+    const auto t_func_end = std::chrono::high_resolution_clock::now();
+    const double total_elapsed_ms = std::chrono::duration<double, std::milli>(t_func_end - t_func_start).count();
+    print_with_timestamp(
+        "prefill_emb_tts: DONE n_pos=%d n_embd=%d batches=%d llama_decode_submit_total=%.2fms TOTAL=%.2fms(overhead=%.2fms)\n",
+        n_pos, n_embd, n_batches_total, total_decode_submit_ms, total_elapsed_ms,
+        total_elapsed_ms - total_decode_submit_ms);
 
     return true;
 }

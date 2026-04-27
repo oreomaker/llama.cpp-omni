@@ -170,7 +170,9 @@ bool omni_tts_eval_tokens(struct omni_context *    ctx_omni,
                           int                      n_batch,
                           int *                    n_past_tts) {
     (void) params;
-    const int N = (int) tokens.size();
+    const auto t_start = std::chrono::high_resolution_clock::now();
+    const int  N       = (int) tokens.size();
+
     for (int i = 0; i < N; i += n_batch) {
         int n_eval = (int) tokens.size() - i;
         n_eval     = std::min(n_eval, n_batch);
@@ -190,7 +192,16 @@ bool omni_tts_eval_tokens(struct omni_context *    ctx_omni,
         }
 
         llama_set_embeddings(ctx_omni->ctx_tts_llama, true);
-        const int decode_ret = llama_decode(ctx_omni->ctx_tts_llama, batch);
+
+        const auto t_decode_submit = std::chrono::high_resolution_clock::now();
+        const int  decode_ret      = llama_decode(ctx_omni->ctx_tts_llama, batch);
+        const auto t_decode_done   = std::chrono::high_resolution_clock::now();
+        const double decode_ms = omni_tts_timing_elapsed_ms(t_decode_submit, t_decode_done);
+
+        print_with_timestamp(
+            "TTS eval_tokens: llama_decode[%d/%d] batch=%d n_past=%d submit→return=%.2fms [GPU async submit]\n",
+            i, N, n_eval, *n_past_tts, decode_ms);
+
         if (decode_ret != 0) {
             LOG_ERR("%s : failed to eval TTS tokens. token %d/%d (batch size %d, n_past %d), decode_ret=%d\n", __func__,
                     i, N, n_batch, *n_past_tts, decode_ret);
@@ -199,6 +210,11 @@ bool omni_tts_eval_tokens(struct omni_context *    ctx_omni,
 
         *n_past_tts += n_eval;
     }
+
+    const auto t_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS eval_tokens: total=%zu tokens, elapsed=%.2fms (avg=%.3fms/token)\n",
+                         tokens.size(), omni_tts_timing_elapsed_ms(t_start, t_end),
+                         tokens.size() > 0 ? omni_tts_timing_elapsed_ms(t_start, t_end) / tokens.size() : 0.0);
 
     return true;
 }
@@ -630,6 +646,7 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
                                         const char *                     missing_weight_log,
                                         OmniTtsPreparedChunk &           prepared_chunk,
                                         OmniTtsComputationDebugData *    debug_data) {
+    const auto t_merge_start = std::chrono::high_resolution_clock::now();
     OmniTTSAuxWeights & tts_aux = ctx_omni->tts_aux;
 
     prepared_chunk.tts_n_embd = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
@@ -638,6 +655,11 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
         return true;
     }
 
+    print_with_timestamp("TTS compute_merged: start n_tokens=%d n_embd=%d\n",
+                         prepared_chunk.n_tokens_filtered, prepared_chunk.tts_n_embd);
+
+    // Step 1: emb_text (token embedding lookup)
+    const auto t_emb_text_start = std::chrono::high_resolution_clock::now();
     std::vector<float> llm_embeds(prepared_chunk.n_tokens_filtered * prepared_chunk.tts_n_embd, 0.0f);
     for (int i = 0; i < prepared_chunk.n_tokens_filtered; ++i) {
         if (!omni_tts_emb_text(ctx_omni, filtered_token_ids[i], llm_embeds.data() + i * prepared_chunk.tts_n_embd,
@@ -645,21 +667,38 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
             return true;
         }
     }
+    const auto t_emb_text_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS compute_merged: emb_text done %d tokens %.2fms\n",
+                         prepared_chunk.n_tokens_filtered,
+                         omni_tts_timing_elapsed_ms(t_emb_text_start, t_emb_text_end));
 
+    // Step 2: projector_semantic (semantic projection)
+    const auto t_projector_start = std::chrono::high_resolution_clock::now();
     std::vector<float> projected_hidden(prepared_chunk.n_tokens_filtered * prepared_chunk.tts_n_embd, 0.0f);
     if (!omni_tts_projector_semantic(ctx_omni, filtered_hidden_states.data(), prepared_chunk.n_tokens_filtered,
                                      current_chunk_n_embd, projected_hidden.data(), prepared_chunk.tts_n_embd)) {
         print_with_timestamp("TTS: WARNING - projector_semantic failed, skipping merged embedding save\n");
         return true;
     }
+    const auto t_projector_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS compute_merged: projector_semantic done %d tokens %.2fms (input_dim=%d->output_dim=%d)\n",
+                         prepared_chunk.n_tokens_filtered,
+                         omni_tts_timing_elapsed_ms(t_projector_start, t_projector_end),
+                         current_chunk_n_embd, prepared_chunk.tts_n_embd);
 
     if (debug_data != nullptr) {
         debug_data->llm_embeds                   = llm_embeds;
         debug_data->projected_hidden_before_norm = projected_hidden;
     }
 
+    // Step 3: normalize_l2_per_token
+    const auto t_norm_start = std::chrono::high_resolution_clock::now();
     omni_tts_normalize_l2_per_token(projected_hidden.data(), prepared_chunk.n_tokens_filtered,
                                     prepared_chunk.tts_n_embd);
+    const auto t_norm_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS compute_merged: normalize_l2 done %d tokens %.2fms\n",
+                         prepared_chunk.n_tokens_filtered,
+                         omni_tts_timing_elapsed_ms(t_norm_start, t_norm_end));
 
     if (debug_data != nullptr) {
         debug_data->projected_hidden_after_norm = projected_hidden;
@@ -675,9 +714,13 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
 
     prepared_chunk.merged_embeddings.resize(merge_size);
 
-    // Use SIMD-accelerated element-wise addition
+    // Step 4: merge (SIMD vec_add: llm_embeds + projected_hidden)
+    const auto t_merge_op_start = std::chrono::high_resolution_clock::now();
     ggml_vec_add_f32((int)merge_size, prepared_chunk.merged_embeddings.data(),
                      llm_embeds.data(), projected_hidden.data());
+    const auto t_merge_op_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS compute_merged: vec_add merge %.2fms (size=%zu)\n",
+                         omni_tts_timing_elapsed_ms(t_merge_op_start, t_merge_op_end), merge_size);
 
     if (append_audio_bos) {
         std::vector<float> audio_bos_embed(prepared_chunk.tts_n_embd, 0.0f);
@@ -688,6 +731,11 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
             prepared_chunk.n_tokens_filtered += 1;
         }
     }
+
+    const auto t_merge_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS compute_merged: TOTAL %.2fms (n_tokens=%d n_embd=%d merge_size=%zu)\n",
+                         omni_tts_timing_elapsed_ms(t_merge_start, t_merge_end),
+                         prepared_chunk.n_tokens_filtered, prepared_chunk.tts_n_embd, merge_size);
 
     prepared_chunk.merged_success = true;
     return true;
@@ -912,13 +960,19 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
                                                    int                              token_index_in_chunk,
                                                    bool                             force_no_eos        = false,
                                                    bool                             is_final_text_chunk = false) {
+    const auto t_sample_start = std::chrono::high_resolution_clock::now();
+
     const bool is_audio_bos =
         (all_generated_tokens == nullptr || all_generated_tokens->empty()) && (token_index_in_chunk == 0);
     if (is_audio_bos) {
         print_with_timestamp("TTS simplex: is_audio_bos=true (first audio token)\n");
     }
 
+    // ── Step 1: Condition re-forward (GPU: llama_decode async submit) ──
+    double elapsed_cond_refwd = 0.0;
     if (is_audio_bos && ctx_omni->tts_condition_saved && ctx_omni->tts_condition_length > 0) {
+        const auto t_cond_start = std::chrono::high_resolution_clock::now();
+
         llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
         if (mem) {
             llama_memory_seq_rm(mem, 0, 0, -1);
@@ -930,13 +984,26 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
             return 0;
         }
         *n_past_tts = condition_n_past;
+        elapsed_cond_refwd = omni_tts_timing_elapsed_ms(t_cond_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS simplex sample: cond_refwd done len=%d n_past=%d %.2fms [GPU async llama_decode for condition]\n",
+            ctx_omni->tts_condition_length, condition_n_past, elapsed_cond_refwd);
     }
 
+    // ── Step 2: Get hidden state (GPU sync point) ──
+    const auto t_hidden_start = std::chrono::high_resolution_clock::now();
     const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+    const auto t_hidden_end = std::chrono::high_resolution_clock::now();
+    const double elapsed_hidden_get = omni_tts_timing_elapsed_ms(t_hidden_start, t_hidden_end);
+
     if (hidden_state == nullptr) {
         LOG_ERR("TTS simplex: failed to get hidden state\n");
         return 0;
     }
+
+    print_with_timestamp(
+        "TTS simplex sample: get_hidden_state %.2fms [GPU sync point - waits for decode]\n",
+        elapsed_hidden_get);
 
     if (ctx_omni->tts_aux.head_code_weight == nullptr) {
         LOG_ERR("TTS simplex: head_code weight not loaded\n");
@@ -949,6 +1016,8 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
         return 0;
     }
 
+    // ── Step 3: Compute head_code logits (CPU) ──
+    const auto t_logits_start = std::chrono::high_resolution_clock::now();
     std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
     const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
     const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
@@ -966,7 +1035,11 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
             audio_logits[i] = sum;
         }
     });
+    const auto t_logits_end = std::chrono::high_resolution_clock::now();
+    const double elapsed_head_code = omni_tts_timing_elapsed_ms(t_logits_start, t_logits_end);
 
+    // ── Step 4: Sampling ──
+    const auto t_sampling_start = std::chrono::high_resolution_clock::now();
     std::mt19937 * rng = omni_tts_get_sampler_rng(smpl);
     std::mt19937   local_rng;
     if (rng == nullptr) {
@@ -1030,10 +1103,19 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
     common_sampler_accept(smpl, id, true);
 
     const bool is_eos = selected_relative_idx == OMNI_TTS_AUDIO_EOS_RELATIVE_IDX;
+    const auto t_sampling_end = std::chrono::high_resolution_clock::now();
+    const double elapsed_sampling = omni_tts_timing_elapsed_ms(t_sampling_start, t_sampling_end);
+
     if (is_eos && !is_final_text_chunk) {
+        const double elapsed_total = omni_tts_timing_elapsed_ms(t_sample_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS simplex sample: step=%d rel_idx=%d is_eos=1 (early return) head_code=%.2fms sampling=%.2fms TOTAL=%.2fms\n",
+            token_index_in_chunk, selected_relative_idx, elapsed_head_code, elapsed_sampling, elapsed_total);
         return id;
     }
 
+    // ── Step 5: emb_code embedding lookup + decode (GPU: llama_decode async submit) ──
+    const auto t_emb_decode_start = std::chrono::high_resolution_clock::now();
     if (ctx_omni->tts_aux.emb_code_weight != nullptr && selected_relative_idx >= 0 &&
         selected_relative_idx < ctx_omni->tts_aux.emb_code_vocab_size) {
         const float * emb_code_w           = ctx_omni->tts_aux.emb_code_weight;
@@ -1051,10 +1133,20 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
             }
         }
 
+        const auto t_emb_llama_submit = std::chrono::high_resolution_clock::now();
         if (!prefill_with_emb_tts(ctx_omni, params, audio_token_embedding.data(), 1, 1, n_past_tts)) {
             LOG_ERR("TTS simplex: failed to decode audio token embedding\n");
             return 0;
         }
+        const auto t_emb_llama_done = std::chrono::high_resolution_clock::now();
+        const double elapsed_emb_decode = omni_tts_timing_elapsed_ms(t_emb_decode_start, t_emb_llama_done);
+        const double elapsed_emb_llama  = omni_tts_timing_elapsed_ms(t_emb_llama_submit, t_emb_llama_done);
+
+        const double elapsed_total = omni_tts_timing_elapsed_ms(t_sample_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS simplex sample: step=%d rel_idx=%d head_code=%.2fms sampling=%.2fms emb_decode=%.2fms(llama=%.2fms) TOTAL=%.2fms\n",
+            token_index_in_chunk, selected_relative_idx, elapsed_head_code, elapsed_sampling,
+            elapsed_emb_decode, elapsed_emb_llama, elapsed_total);
     } else {
         LOG_ERR("TTS simplex: emb_code not available\n");
         return 0;
@@ -1072,6 +1164,7 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
                                            int                              token_index_in_chunk,
                                            bool                             force_no_eos,
                                            bool                             is_final_text_chunk = false) {
+    const auto t_sample_start = std::chrono::high_resolution_clock::now();
     const char * logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
 
     const bool is_first_token_overall =
@@ -1082,7 +1175,11 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         print_with_timestamp("TTS sample: is_first_token_overall=true, duplex_mode=%d\n", ctx_omni->duplex_mode);
     }
 
+    // ── Step 1: Condition re-forward (GPU: llama_decode async submit) ──
+    double elapsed_cond_refwd = 0.0;
     if (is_first_token_overall && ctx_omni->tts_condition_saved && ctx_omni->tts_condition_length > 0) {
+        const auto t_cond_start = std::chrono::high_resolution_clock::now();
+
         const int    cond_len      = ctx_omni->tts_condition_length;
         const int    cond_n_embd   = ctx_omni->tts_condition_n_embd;
         const size_t cond_emb_size = ctx_omni->tts_condition_embeddings.size();
@@ -1117,13 +1214,26 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         }
 
         *n_past_tts = condition_n_past;
+        elapsed_cond_refwd = omni_tts_timing_elapsed_ms(t_cond_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS sample: cond_refwd done len=%d n_past=%d %.2fms [GPU async llama_decode for condition]\n",
+            ctx_omni->tts_condition_length, condition_n_past, elapsed_cond_refwd);
     }
 
+    // ── Step 2: Get hidden state (GPU sync point: waits for decode to finish) ──
+    const auto t_hidden_start = std::chrono::high_resolution_clock::now();
     const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+    const auto t_hidden_end = std::chrono::high_resolution_clock::now();
+    const double elapsed_hidden_get = omni_tts_timing_elapsed_ms(t_hidden_start, t_hidden_end);
+
     if (hidden_state == nullptr) {
         LOG_ERR("TTS: failed to get hidden state from TTS model\n");
         return 0;
     }
+
+    print_with_timestamp(
+        "TTS sample: get_hidden_state %.2fms [GPU sync point - waits for llama_decode to complete on device]\n",
+        elapsed_hidden_get);
 
     if (logits_debug_dir != nullptr) {
         const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
@@ -1142,6 +1252,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         return 0;
     }
 
+    // ── Step 3: Compute head_code logits (CPU: parallel dot products) ──
+    const auto t_logits_start = std::chrono::high_resolution_clock::now();
     std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
     const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
     const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
@@ -1159,6 +1271,10 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
             audio_logits[i] = sum;
         }
     });
+    const auto t_logits_end = std::chrono::high_resolution_clock::now();
+    const double elapsed_head_code = omni_tts_timing_elapsed_ms(t_logits_start, t_logits_end);
+    print_with_timestamp("TTS sample: head_code_logits done %.2fms (n_logits=%d hidden=%d threads=%d)\n",
+                         elapsed_head_code, n_logits, hidden_size, n_threads_use);
 
     if (logits_debug_dir != nullptr) {
         omni_tts_save_logits_to_file(logits_debug_dir, audio_logits.data(), OMNI_TTS_NUM_AUDIO_TOKENS,
@@ -1186,6 +1302,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         }
     }
 
+    // ── Step 4: Sampling ──
+    const auto t_sampling_start = std::chrono::high_resolution_clock::now();
     std::mt19937 * rng = omni_tts_get_sampler_rng(smpl);
     std::mt19937   local_rng;
     if (rng == nullptr) {
@@ -1244,10 +1362,19 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
     common_sampler_accept(smpl, id, true);
 
     const bool is_eos = selected_relative_idx == OMNI_TTS_AUDIO_EOS_RELATIVE_IDX;
+    const auto t_sampling_end = std::chrono::high_resolution_clock::now();
+    const double elapsed_sampling = omni_tts_timing_elapsed_ms(t_sampling_start, t_sampling_end);
+
     if (ctx_omni->duplex_mode && is_eos && !is_final_text_chunk) {
+        const double elapsed_total = omni_tts_timing_elapsed_ms(t_sample_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS sample: step=%d rel_idx=%d is_eos=1 (duplex early return) sampling=%.2fms TOTAL=%.2fms\n",
+            token_index_in_chunk, selected_relative_idx, elapsed_sampling, elapsed_total);
         return id;
     }
 
+    // ── Step 5: emb_code embedding lookup + decode (GPU: llama_decode async submit) ──
+    const auto t_emb_decode_start = std::chrono::high_resolution_clock::now();
     if (ctx_omni->tts_aux.emb_code_weight != nullptr && selected_relative_idx >= 0 &&
         selected_relative_idx < ctx_omni->tts_aux.emb_code_vocab_size) {
         const float * emb_code_w           = ctx_omni->tts_aux.emb_code_weight;
@@ -1265,11 +1392,23 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
             }
         }
 
+        const auto t_emb_llama_submit = std::chrono::high_resolution_clock::now();
         if (!prefill_with_emb_tts(ctx_omni, params, audio_token_embedding.data(), 1, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token embedding\n");
             return 0;
         }
+        const auto t_emb_llama_done = std::chrono::high_resolution_clock::now();
+        const double elapsed_emb_decode = omni_tts_timing_elapsed_ms(t_emb_decode_start, t_emb_llama_done);
+        const double elapsed_emb_llama  = omni_tts_timing_elapsed_ms(t_emb_llama_submit, t_emb_llama_done);
+
+        const double elapsed_total = omni_tts_timing_elapsed_ms(t_sample_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS sample: step=%d rel_idx=%d head_code=%.2fms sampling=%.2fms emb_decode=%.2fms(llama=%.2fms) TOTAL=%.2fms\n",
+            token_index_in_chunk, selected_relative_idx, elapsed_head_code, elapsed_sampling,
+            elapsed_emb_decode, elapsed_emb_llama, elapsed_total);
     } else {
+        const auto t_emb_llama_done = std::chrono::high_resolution_clock::now();
+        const double elapsed_emb_decode = omni_tts_timing_elapsed_ms(t_emb_decode_start, t_emb_llama_done);
         LOG_ERR("TTS: emb_code not available, falling back to token IDs (may fail if token exceeds vocab)\n");
         std::vector<llama_token> tokens;
         tokens.push_back(id);
@@ -1277,6 +1416,12 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
             LOG_ERR("TTS: failed to decode audio token ID (token may exceed vocab size)\n");
             return 0;
         }
+
+        const double elapsed_total = omni_tts_timing_elapsed_ms(t_sample_start, std::chrono::high_resolution_clock::now());
+        print_with_timestamp(
+            "TTS sample: step=%d rel_idx=%d head_code=%.2fms sampling=%.2fms emb_decode(fallback)=%.2fms TOTAL=%.2fms\n",
+            token_index_in_chunk, selected_relative_idx, elapsed_head_code, elapsed_sampling,
+            elapsed_emb_decode, elapsed_total);
     }
 
     return id;
@@ -1296,7 +1441,8 @@ bool omni_tts_prepare_duplex_chunk(struct omni_context *            ctx_omni,
                                    const std::vector<float> &       current_chunk_hidden_states,
                                    int                              current_chunk_n_embd,
                                    OmniTtsPreparedChunk &           prepared_chunk) {
-    prepared_chunk = {};
+    const auto t_prepare_start = std::chrono::high_resolution_clock::now();
+    prepared_chunk             = {};
 
     if (current_chunk_n_embd <= 0 || current_chunk_n_embd > 16384) {
         LOG_ERR("TTS Duplex: invalid current_chunk_n_embd=%d\n", current_chunk_n_embd);
@@ -1311,10 +1457,18 @@ bool omni_tts_prepare_duplex_chunk(struct omni_context *            ctx_omni,
 
     prepared_chunk.n_tokens_orig = (int) (current_chunk_hidden_states.size() / current_chunk_n_embd);
 
+    // Step 1: filter_special_tokens
+    const auto t_filter_start = std::chrono::high_resolution_clock::now();
     std::vector<llama_token> filtered_token_ids     = current_chunk_token_ids;
     std::vector<float>       filtered_hidden_states = current_chunk_hidden_states;
     omni_tts_filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
     prepared_chunk.n_tokens_filtered = (int) (filtered_hidden_states.size() / current_chunk_n_embd);
+    const auto t_filter_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Duplex prepare: filter_special_tokens %.2fms n_tokens=%d->%d (removed %d)\n",
+                         omni_tts_timing_elapsed_ms(t_filter_start, t_filter_end),
+                         prepared_chunk.n_tokens_orig, prepared_chunk.n_tokens_filtered,
+                         prepared_chunk.n_tokens_orig - prepared_chunk.n_tokens_filtered);
+
     if (prepared_chunk.n_tokens_filtered <= 0) {
         return false;
     }
@@ -1328,6 +1482,11 @@ bool omni_tts_prepare_duplex_chunk(struct omni_context *            ctx_omni,
     omni_tts_write_duplex_debug_dump(llm_debug_output_dir, current_chunk_idx, llm_text, current_chunk_token_ids,
                                      current_chunk_hidden_states, current_chunk_n_embd, prepared_chunk);
 
+    const auto t_prepare_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Duplex prepare: TOTAL %.2fms chunk=%d n_tokens=%d\n",
+                         omni_tts_timing_elapsed_ms(t_prepare_start, t_prepare_end),
+                         current_chunk_idx, prepared_chunk.n_tokens_filtered);
+
     return true;
 }
 
@@ -1339,7 +1498,8 @@ bool omni_tts_prepare_simplex_chunk(struct omni_context *            ctx_omni,
                                     const std::vector<float> &       current_chunk_hidden_states,
                                     int                              current_chunk_n_embd,
                                     OmniTtsPreparedChunk &           prepared_chunk) {
-    prepared_chunk = {};
+    const auto t_prepare_start = std::chrono::high_resolution_clock::now();
+    prepared_chunk             = {};
 
     if (current_chunk_n_embd <= 0 || current_chunk_n_embd > 16384) {
         LOG_ERR("TTS: invalid current_chunk_n_embd=%d, skipping chunk %d\n", current_chunk_n_embd, current_chunk_idx);
@@ -1362,12 +1522,16 @@ bool omni_tts_prepare_simplex_chunk(struct omni_context *            ctx_omni,
 
     prepared_chunk.n_tokens_orig = (int) (current_chunk_hidden_states.size() / current_chunk_n_embd);
 
+    // Step 1: filter_special_tokens
+    const auto t_filter_start = std::chrono::high_resolution_clock::now();
     std::vector<llama_token> filtered_token_ids     = current_chunk_token_ids;
     std::vector<float>       filtered_hidden_states = current_chunk_hidden_states;
     omni_tts_filter_special_tokens(filtered_token_ids, filtered_hidden_states, current_chunk_n_embd);
     prepared_chunk.n_tokens_filtered = (int) (filtered_hidden_states.size() / current_chunk_n_embd);
+    const auto t_filter_end = std::chrono::high_resolution_clock::now();
 
-    print_with_timestamp("TTS: n_tokens_orig=%d, n_tokens_filtered=%d (filtered %d special tokens)\n",
+    print_with_timestamp("TTS Simplex prepare: filter_special_tokens %.2fms n_tokens=%d->%d (filtered %d special tokens)\n",
+                         omni_tts_timing_elapsed_ms(t_filter_start, t_filter_end),
                          prepared_chunk.n_tokens_orig, prepared_chunk.n_tokens_filtered,
                          prepared_chunk.n_tokens_orig - prepared_chunk.n_tokens_filtered);
 
@@ -1387,6 +1551,11 @@ bool omni_tts_prepare_simplex_chunk(struct omni_context *            ctx_omni,
     omni_tts_write_simplex_debug_dump(llm_debug_output_dir, current_chunk_idx, response, current_chunk_token_ids,
                                       current_chunk_hidden_states, current_chunk_n_embd, prepared_chunk, debug_data);
 
+    const auto t_prepare_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Simplex prepare: TOTAL %.2fms chunk=%d n_tokens=%d\n",
+                         omni_tts_timing_elapsed_ms(t_prepare_start, t_prepare_end),
+                         current_chunk_idx, prepared_chunk.n_tokens_filtered);
+
     return true;
 }
 
@@ -1400,6 +1569,7 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
                                                   const OmniRoundMeta &      round_meta,
                                                   const std::string &        output_dir,
                                                   bool                       is_final_text_chunk) {
+    const auto t_stage_start = std::chrono::high_resolution_clock::now();
     print_with_timestamp("TTS Simplex: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d)\n", chunk_idx,
                          n_tokens, tts_n_embd);
 
@@ -1421,6 +1591,8 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
         return false;
     }
 
+    // ── Condition preparation ──
+    const auto t_cond_prep_start = std::chrono::high_resolution_clock::now();
     std::vector<float> condition_with_bos = merged_embeddings;
     int                extra_tokens       = 0;
 
@@ -1439,6 +1611,10 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
     ctx_omni->tts_condition_length     = n_tokens_with_bos;
     ctx_omni->tts_condition_n_embd     = tts_n_embd;
     ctx_omni->tts_condition_saved      = true;
+    const auto t_cond_prep_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Simplex: condition_prep done n=%d+%d=%d tokens %.2fms\n",
+                         n_tokens, extra_tokens, n_tokens_with_bos,
+                         omni_tts_timing_elapsed_ms(t_cond_prep_start, t_cond_prep_end));
 
     int n_past_tts = 0;
     if (chunk_idx == 0) {
@@ -1456,12 +1632,16 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
         print_with_timestamp("TTS Simplex: chunk %d - keeping KV cache, n_past_tts=%d\n", chunk_idx, n_past_tts);
     }
 
+    // ── Initial prefill (GPU: llama_decode async submit) ──
+    const auto t_prefill_start = std::chrono::high_resolution_clock::now();
     if (!prefill_with_emb_tts(ctx_omni, params, condition_with_bos.data(), n_tokens_with_bos, params->n_batch,
                               &n_past_tts)) {
         LOG_ERR("TTS Simplex: prefill_with_emb_tts failed\n");
         return false;
     }
-    print_with_timestamp("TTS Simplex: prefill completed, n_past_tts=%d\n", n_past_tts);
+    const auto t_prefill_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Simplex: prefill completed n_past=%d %.2fms [GPU async llama_decode on condition]\n",
+                         n_past_tts, omni_tts_timing_elapsed_ms(t_prefill_start, t_prefill_end));
 
     common_params_sampling tts_sampling = params->sampling;
     tts_sampling.temp                   = 0.8f;
@@ -1471,17 +1651,21 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
     tts_sampling.min_p                  = 0.01f;
     tts_sampling.penalty_last_n         = 16;
 
+    const auto t_sampler_start = std::chrono::high_resolution_clock::now();
     struct common_sampler * tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
     if (tts_sampler == nullptr) {
         LOG_ERR("TTS Simplex: failed to create sampler\n");
         return false;
     }
-    print_with_timestamp("TTS Simplex: sampler created\n");
+    const auto t_sampler_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Simplex: sampler_init %.2fms\n",
+                         omni_tts_timing_elapsed_ms(t_sampler_start, t_sampler_end));
 
     output_audio_tokens.clear();
     constexpr int min_new_tokens = 0;
     bool          need_phase2    = false;
 
+    const auto t_loop_start = std::chrono::high_resolution_clock::now();
     for (int t = 0; t < max_audio_tokens; ++t) {
         if (ctx_omni->gate.break_event.load()) {
             print_with_timestamp("TTS Simplex: break_event detected at step %d, stopping immediately\n", t);
@@ -1539,13 +1723,19 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
         }
 
         if (t < 5 || (t + 1) % 25 == 0) {
-            print_with_timestamp("TTS Simplex Phase1: token %d/%d: rel_id=%d\n", t + 1, max_audio_tokens, relative_idx);
+            const double elapsed_since_start = omni_tts_timing_elapsed_ms(t_stage_start, std::chrono::high_resolution_clock::now());
+            print_with_timestamp("TTS Simplex Phase1: token %d/%d rel_id=%d elapsed=%.2fms\n",
+                                 t + 1, max_audio_tokens, relative_idx, elapsed_since_start);
         }
 
         if (is_eos) {
             break;
         }
     }
+    const auto t_phase1_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Simplex Phase1: loop done %zu tokens %.2fms\n",
+                         output_audio_tokens.size(),
+                         omni_tts_timing_elapsed_ms(t_loop_start, t_phase1_end));
 
     if (need_phase2 && !ctx_omni->gate.break_event.load()) {
         print_with_timestamp("TTS Simplex Phase2: injecting text_eos_embed + audio_bos at n_past=%d\n", n_past_tts);
@@ -1663,9 +1853,14 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
     }
 
     common_sampler_free(tts_sampler);
+    const auto t_end = std::chrono::high_resolution_clock::now();
 
-    print_with_timestamp("TTS Simplex: generated %zu audio tokens for chunk %d\n", output_audio_tokens.size(),
-                         chunk_idx);
+    const double elapsed_total_ms = omni_tts_timing_elapsed_ms(t_stage_start, t_end);
+    const int    n_generated      = (int) output_audio_tokens.size();
+    print_with_timestamp(
+        "TTS Simplex: generated %zu audio tokens chunk=%d Total=%.2fms(avg=%.3fms/token)\n",
+        output_audio_tokens.size(), chunk_idx, elapsed_total_ms,
+        n_generated > 0 ? elapsed_total_ms / n_generated : 0.0);
 
     if (!output_audio_tokens.empty()) {
         std::string first_tokens;
@@ -1761,6 +1956,8 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
         return finish_tts_stage(false);
     }
 
+    // ── Condition preparation ──
+    const auto t_cond_prep_start = std::chrono::high_resolution_clock::now();
     std::vector<float> condition_with_bos = merged_embeddings;
     int                extra_tokens       = 0;
 
@@ -1791,6 +1988,10 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
     ctx_omni->tts_condition_length     = n_tokens_with_bos;
     ctx_omni->tts_condition_n_embd     = tts_n_embd;
     ctx_omni->tts_condition_saved      = true;
+    const auto t_cond_prep_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Local: condition_prep done n=%d+%d=%d tokens %.2fms\n",
+                         n_tokens, extra_tokens, n_tokens_with_bos,
+                         omni_tts_timing_elapsed_ms(t_cond_prep_start, t_cond_prep_end));
 
     int n_past_tts = 0;
     if (chunk_idx == 0) {
@@ -1810,12 +2011,16 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
         print_with_timestamp("TTS Local: chunk %d - keeping KV cache, n_past_tts=%d\n", chunk_idx, n_past_tts);
     }
 
+    // ── Initial prefill (GPU: llama_decode async submit) ──
+    const auto t_prefill_start = std::chrono::high_resolution_clock::now();
     if (!prefill_with_emb_tts(ctx_omni, params, condition_with_bos.data(), n_tokens_with_bos, params->n_batch,
                               &n_past_tts)) {
         LOG_ERR("TTS Local: prefill_with_emb_tts failed\n");
         return finish_tts_stage(false);
     }
-    print_with_timestamp("TTS Local: prefill completed, n_past_tts=%d\n", n_past_tts);
+    const auto t_prefill_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Local: prefill completed n_past=%d %.2fms [GPU async llama_decode on condition]\n",
+                         n_past_tts, omni_tts_timing_elapsed_ms(t_prefill_start, t_prefill_end));
 
     common_params_sampling tts_sampling = params->sampling;
     tts_sampling.temp                   = 0.8f;
@@ -1825,11 +2030,15 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
     tts_sampling.min_p                  = 0.01f;
     tts_sampling.penalty_last_n         = 16;
 
+    const auto t_sampler_start = std::chrono::high_resolution_clock::now();
     struct common_sampler * tts_sampler = common_sampler_init(ctx_omni->model_tts, tts_sampling);
     if (tts_sampler == nullptr) {
         LOG_ERR("TTS Local: failed to create sampler\n");
         return finish_tts_stage(false);
     }
+    const auto t_sampler_end = std::chrono::high_resolution_clock::now();
+    print_with_timestamp("TTS Local: sampler_init %.2fms\n",
+                         omni_tts_timing_elapsed_ms(t_sampler_start, t_sampler_end));
 
     output_audio_tokens.clear();
     std::vector<llama_token> chunk_generated_tokens;
@@ -1839,6 +2048,7 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
     bool                 first_chunk_pushed = false;
     std::vector<int32_t> stream_buffer;
 
+    const auto t_loop_start = std::chrono::high_resolution_clock::now();
     for (int t = 0; t < max_audio_tokens; ++t) {
         const bool        force_no_eos      = t < min_new_tokens;
         const llama_token sampled_token_abs = omni_tts_sample_token_internal(
@@ -1907,9 +2117,18 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
         }
         ctx_omni->t2w_thread_info->cv.notify_one();
     }
+    const auto t_loop_end = std::chrono::high_resolution_clock::now();
 
     common_sampler_free(tts_sampler);
     ctx_omni->tts_n_past_accumulated = n_past_tts;
+
+    const double elapsed_loop_ms = omni_tts_timing_elapsed_ms(t_loop_start, t_loop_end);
+    const double elapsed_total_ms = omni_tts_timing_elapsed_ms(tts_stage_start, t_loop_end);
+    const int    n_generated      = (int) output_audio_tokens.size();
+    print_with_timestamp(
+        "TTS Local: generation done chunk=%d n_tokens=%d max_steps=%d loop=%.2fms(avg=%.3fms/token) TOTAL=%.2fms\n",
+        chunk_idx, n_generated, max_audio_tokens, elapsed_loop_ms,
+        n_generated > 0 ? elapsed_loop_ms / n_generated : 0.0, elapsed_total_ms);
 
     if (!output_dir.empty() && !output_audio_tokens.empty()) {
         const std::string tokens_file = output_dir + "/audio_tokens_chunk_" + std::to_string(chunk_idx) + ".bin";
