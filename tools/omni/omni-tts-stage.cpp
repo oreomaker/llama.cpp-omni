@@ -14,12 +14,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "vec.h"
 
 #ifdef _WIN32
 #    include <sys/stat.h>
@@ -36,6 +40,30 @@
 #endif
 
 namespace {
+
+// ── Parallel for helper ───────────────────────────────────────────────────
+// Splits [0, n_items) across n_threads threads.
+// When n_threads <= 1 or work is too small, runs inline on the calling thread.
+void parallel_for(int n_items, int n_threads, const std::function<void(int, int)> & fn) {
+    if (n_threads <= 1 || n_items < n_threads * 4) {
+        fn(0, n_items);
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads - 1);
+    for (int t = 0; t < n_threads; t++) {
+        const int start = (int)(((int64_t)n_items * t) / n_threads);
+        const int end   = (int)(((int64_t)n_items * (t + 1)) / n_threads);
+        if (t == n_threads - 1) {
+            fn(start, end);
+        } else {
+            threads.emplace_back([start, end, &fn] { fn(start, end); });
+        }
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+}
 
 void duplex_timing_mark_tts_done(struct omni_context * ctx_omni, int chunk_idx) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
@@ -211,20 +239,18 @@ void omni_tts_save_hidden_states_to_file(const char *  filepath,
 }
 
 int omni_tts_random_sampling(const float * logits, int num_tokens, std::mt19937 & rng) {
-    float max_logit = logits[0];
-    for (int i = 1; i < num_tokens; ++i) {
-        max_logit = std::max(logits[i], max_logit);
-    }
+    float max_logit = 0.0f;
+    ggml_vec_max_f32(num_tokens, &max_logit, logits);
 
     std::vector<float> probs(num_tokens);
-    float              sum = 0.0f;
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
-    }
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
-    }
+    // probs[i] = exp(logits[i] - max_logit)
+    ggml_vec_set_f32(num_tokens, probs.data(), -max_logit);
+    ggml_vec_acc_f32(num_tokens, probs.data(), logits);
+    ggml_vec_exp_f32(num_tokens, probs.data(), probs.data());
+
+    float sum = 0.0f;
+    ggml_vec_sum_f32(num_tokens, &sum, probs.data());
+    ggml_vec_scale_f32(num_tokens, probs.data(), 1.0f / sum);
 
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     const float                           r   = dist(rng);
@@ -275,20 +301,17 @@ int omni_tts_nucleus_sampling_with_min_keep(const float *  logits,
                                             int            top_k,
                                             int            min_tokens_to_keep,
                                             std::mt19937 & rng) {
-    float max_logit = logits[0];
-    for (int i = 1; i < num_tokens; ++i) {
-        max_logit = std::max(logits[i], max_logit);
-    }
+    float max_logit = 0.0f;
+    ggml_vec_max_f32(num_tokens, &max_logit, logits);
 
     std::vector<float> probs(num_tokens);
-    float              sum = 0.0f;
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] = expf(logits[i] - max_logit);
-        sum += probs[i];
-    }
-    for (int i = 0; i < num_tokens; ++i) {
-        probs[i] /= sum;
-    }
+    ggml_vec_set_f32(num_tokens, probs.data(), -max_logit);
+    ggml_vec_acc_f32(num_tokens, probs.data(), logits);
+    ggml_vec_exp_f32(num_tokens, probs.data(), probs.data());
+
+    float sum = 0.0f;
+    ggml_vec_sum_f32(num_tokens, &sum, probs.data());
+    ggml_vec_scale_f32(num_tokens, probs.data(), 1.0f / sum);
 
     std::vector<std::pair<float, int>> sorted_probs;
     sorted_probs.reserve(num_tokens);
@@ -412,71 +435,79 @@ bool omni_tts_projector_semantic(struct omni_context * ctx_omni,
     const int input_dim  = tts_aux.projector_semantic_input_dim;
     const int output_dim = tts_aux.projector_semantic_output_dim;
 
-    for (int t = 0; t < n_tokens; ++t) {
-        const float *      hidden = llm_hidden_states + t * input_dim;
-        float *            output = projected_hidden_states + t * output_dim;
-        std::vector<float> temp(output_dim);
+    const int n_threads_max = (int)std::thread::hardware_concurrency();
+    const int n_threads_use = std::max(1, std::min(n_threads_max, n_tokens));
 
-        for (int j = 0; j < output_dim; ++j) {
-            float sum = tts_aux.projector_semantic_linear1_bias[j];
+    // Pre-allocate per-thread temp buffers to avoid repeated allocation
+    const int          n_temp_rows = std::min(n_tokens, n_threads_use);
+    std::vector<float> temp_shared((size_t)n_temp_rows * output_dim);
+
+    parallel_for(n_tokens, n_threads_use, [&](int start, int end) {
+        const int tid  = (n_threads_use > 1) ? (int)((int64_t)start * n_threads_use / n_tokens) : 0;
+        float *   temp = temp_shared.data() + (size_t)tid * output_dim;
+
+        for (int t = start; t < end; ++t) {
+            const float * h = llm_hidden_states + t * input_dim;
+            float *       o = projected_hidden_states + t * output_dim;
+
+            // Linear1: temp = b1 + sum_i(h[i] * w1_row[i])
+            // Restructured as saxpy (contiguous access): start with bias, then accumulate
+            memcpy(temp, tts_aux.projector_semantic_linear1_bias, output_dim * sizeof(float));
             for (int i = 0; i < input_dim; ++i) {
-                sum += hidden[i] * tts_aux.projector_semantic_linear1_weight[i * output_dim + j];
+                ggml_vec_mad_f32(output_dim, temp,
+                                 tts_aux.projector_semantic_linear1_weight + i * output_dim,
+                                 h[i]);
             }
-            temp[j] = sum;
-        }
 
-        for (int j = 0; j < output_dim; ++j) {
-            temp[j] = temp[j] > 0.0f ? temp[j] : 0.0f;
-        }
+            // ReLU in-place via SIMD kernel
+            ggml_vec_relu_f32(output_dim, temp, temp);
 
-        for (int j = 0; j < output_dim; ++j) {
-            float sum = tts_aux.projector_semantic_linear2_bias[j];
+            // Linear2: o = b2 + sum_i(temp[i] * w2_row[i])
+            memcpy(o, tts_aux.projector_semantic_linear2_bias, output_dim * sizeof(float));
             for (int i = 0; i < output_dim; ++i) {
-                sum += temp[i] * tts_aux.projector_semantic_linear2_weight[i * output_dim + j];
+                ggml_vec_mad_f32(output_dim, o,
+                                 tts_aux.projector_semantic_linear2_weight + i * output_dim,
+                                 temp[i]);
             }
-            output[j] = sum;
         }
-    }
+    });
 
     return true;
 }
 
 void omni_tts_normalize_l2_per_token(float * embeddings, int n_tokens, int n_embd, float eps = 1e-8f) {
-    for (int t = 0; t < n_tokens; ++t) {
-        float * vec     = embeddings + t * n_embd;
-        float   norm_sq = 0.0f;
-        for (int i = 0; i < n_embd; ++i) {
-            const float val = vec[i];
-            norm_sq += val * val;
-        }
+    const int n_threads_max = (int)std::thread::hardware_concurrency();
+    const int n_threads_use = std::max(1, std::min(n_threads_max, n_tokens));
 
-        const float norm = std::sqrt(norm_sq + eps);
-        if (norm > 0.0f) {
-            const float inv_norm = 1.0f / norm;
-            for (int i = 0; i < n_embd; ++i) {
-                vec[i] *= inv_norm;
-            }
-        } else {
-            LOG_WRN("TTS: WARNING - zero norm detected for token %d, setting to unit vector\n", t);
-            const float inv_sqrt_n = 1.0f / std::sqrt((float) n_embd);
-            for (int i = 0; i < n_embd; ++i) {
-                vec[i] = inv_sqrt_n;
-            }
-        }
+    parallel_for(n_tokens, n_threads_use, [&](int start, int end) {
+        for (int t = start; t < end; ++t) {
+            float * vec     = embeddings + t * n_embd;
+            float   norm_sq = 0.0f;
 
-        float verify_norm_sq = 0.0f;
-        for (int i = 0; i < n_embd; ++i) {
-            const float val = vec[i];
-            verify_norm_sq += val * val;
+            // Use SIMD-accelerated dot product for squared norm
+            ggml_vec_dot_f32(n_embd, &norm_sq, 0, vec, 0, vec, 0, 1);
+
+            const float norm = std::sqrt(norm_sq + eps);
+            if (norm > 0.0f) {
+                // Use SIMD-accelerated scaling
+                ggml_vec_scale_f32(n_embd, vec, 1.0f / norm);
+            } else {
+                LOG_WRN("TTS: WARNING - zero norm detected for token %d, setting to unit vector\n", t);
+                ggml_vec_set_f32(n_embd, vec, 1.0f / std::sqrt((float) n_embd));
+            }
+
+            // Verification (uses SIMD dot product)
+            float verify_norm_sq = 0.0f;
+            ggml_vec_dot_f32(n_embd, &verify_norm_sq, 0, vec, 0, vec, 0, 1);
+            const float verify_norm = std::sqrt(verify_norm_sq);
+            if (std::abs(verify_norm - 1.0f) > 0.01f) {
+                LOG_ERR(
+                    "TTS: ERROR - normalization verification failed for token %d: norm=%.6f (expected ~1.0), "
+                    "norm_sq=%.6f\n",
+                    t, verify_norm, verify_norm_sq);
+            }
         }
-        const float verify_norm = std::sqrt(verify_norm_sq);
-        if (std::abs(verify_norm - 1.0f) > 0.01f) {
-            LOG_ERR(
-                "TTS: ERROR - normalization verification failed for token %d: norm=%.6f (expected ~1.0), "
-                "norm_sq=%.6f\n",
-                t, verify_norm, verify_norm_sq);
-        }
-    }
+    });
 }
 
 const std::vector<llama_token> OMNI_TTS_SPECIAL_TOKEN_IDS = {
@@ -643,9 +674,10 @@ bool omni_tts_compute_merged_embeddings(struct omni_context *            ctx_omn
     }
 
     prepared_chunk.merged_embeddings.resize(merge_size);
-    for (size_t i = 0; i < merge_size; ++i) {
-        prepared_chunk.merged_embeddings[i] = llm_embeds[i] + projected_hidden[i];
-    }
+
+    // Use SIMD-accelerated element-wise addition
+    ggml_vec_add_f32((int)merge_size, prepared_chunk.merged_embeddings.data(),
+                     llm_embeds.data(), projected_hidden.data());
 
     if (append_audio_bos) {
         std::vector<float> audio_bos_embed(prepared_chunk.tts_n_embd, 0.0f);
@@ -920,14 +952,20 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
     std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
     const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
     const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
-    for (int i = 0; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
-        const float * row = head_code_w + i * hidden_size;
-        float         sum = 0.0f;
-        for (int j = 0; j < hidden_size; ++j) {
-            sum += hidden_state[j] * row[j];
+    const int          n_logits    = OMNI_TTS_NUM_AUDIO_TOKENS;
+
+    // Parallelize the 6562 dot products across threads
+    const int n_threads_max = (int)std::thread::hardware_concurrency();
+    const int n_threads_use = std::min(n_threads_max, 4);
+
+    parallel_for(n_logits, n_threads_use, [&](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32(hidden_size, &sum, 0, hidden_state, 0,
+                             head_code_w + i * hidden_size, 0, 1);
+            audio_logits[i] = sum;
         }
-        audio_logits[i] = sum;
-    }
+    });
 
     std::mt19937 * rng = omni_tts_get_sampler_rng(smpl);
     std::mt19937   local_rng;
@@ -953,17 +991,9 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
     const bool use_argmax            = params->sampling.temp <= 0.0f;
     int        selected_relative_idx = 0;
     if (use_argmax) {
-        float max_logit = audio_logits[0];
-        for (int i = 1; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
-            if (audio_logits[i] > max_logit) {
-                max_logit             = audio_logits[i];
-                selected_relative_idx = i;
-            }
-        }
+        ggml_vec_argmax_f32(OMNI_TTS_NUM_AUDIO_TOKENS, &selected_relative_idx, audio_logits.data());
     } else {
-        for (int i = 0; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
-            audio_logits[i] /= temperature;
-        }
+        ggml_vec_scale_f32(OMNI_TTS_NUM_AUDIO_TOKENS, audio_logits.data(), 1.0f / temperature);
 
         if (!is_audio_bos && !decoded_tokens_relative.empty()) {
             const int         start_idx = std::max(0, (int) decoded_tokens_relative.size() - win_size);
@@ -1115,14 +1145,20 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
     std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
     const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
     const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
-    for (int i = 0; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
-        const float * row = head_code_w + i * hidden_size;
-        float         sum = 0.0f;
-        for (int j = 0; j < hidden_size; ++j) {
-            sum += hidden_state[j] * row[j];
+    const int          n_logits    = OMNI_TTS_NUM_AUDIO_TOKENS;
+
+    // Parallelize the 6562 dot products across threads
+    const int n_threads_max = (int)std::thread::hardware_concurrency();
+    const int n_threads_use = std::min(n_threads_max, 4);
+
+    parallel_for(n_logits, n_threads_use, [&](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32(hidden_size, &sum, 0, hidden_state, 0,
+                             head_code_w + i * hidden_size, 0, 1);
+            audio_logits[i] = sum;
         }
-        audio_logits[i] = sum;
-    }
+    });
 
     if (logits_debug_dir != nullptr) {
         omni_tts_save_logits_to_file(logits_debug_dir, audio_logits.data(), OMNI_TTS_NUM_AUDIO_TOKENS,
@@ -1181,17 +1217,9 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
     const bool use_argmax            = params->sampling.temp <= 0.0f;
     int        selected_relative_idx = 0;
     if (use_argmax) {
-        float max_logit = audio_logits[0];
-        for (int i = 1; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
-            if (audio_logits[i] > max_logit) {
-                max_logit             = audio_logits[i];
-                selected_relative_idx = i;
-            }
-        }
+        ggml_vec_argmax_f32(OMNI_TTS_NUM_AUDIO_TOKENS, &selected_relative_idx, audio_logits.data());
     } else {
-        for (int i = 0; i < OMNI_TTS_NUM_AUDIO_TOKENS; ++i) {
-            audio_logits[i] /= temperature;
-        }
+        ggml_vec_scale_f32(OMNI_TTS_NUM_AUDIO_TOKENS, audio_logits.data(), 1.0f / temperature);
 
         if (!skip_processors && !decoded_tokens_relative.empty()) {
             omni_tts_apply_repetition_penalty(audio_logits.data(), OMNI_TTS_NUM_AUDIO_TOKENS, decoded_tokens_relative,

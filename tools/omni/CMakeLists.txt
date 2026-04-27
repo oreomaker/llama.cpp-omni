@@ -68,6 +68,8 @@ target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
+target_include_directories(omni PRIVATE ../../ggml/src)
+target_include_directories(omni PRIVATE ../../ggml/src/ggml-cpu)
 target_compile_features   (omni PRIVATE cxx_std_17)
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled
