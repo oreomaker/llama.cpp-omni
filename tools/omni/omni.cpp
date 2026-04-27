@@ -6,8 +6,8 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
-#include "omni-impl.h"
 #include "omni-encode-stage.h"
+#include "omni-impl.h"
 #include "omni-llm-stage.h"
 #include "omni-log.h"
 #include "omni-output.h"
@@ -2140,7 +2140,7 @@ bool stream_prefill(struct omni_context * ctx_omni,
             omni_ensure_prefill_workers_started(ctx_omni, worker_fns);
 
             if (ctx_omni->encode_thread_info != nullptr) {
-                OmniEncodeRequest request = { aud_fname, img_fname, index, max_slice_nums };
+                OmniEncodeRequest            request = { aud_fname, img_fname, index, max_slice_nums };
                 std::unique_lock<std::mutex> lock(ctx_omni->encode_thread_info->mtx);
                 ctx_omni->encode_thread_info->cv.wait(lock, [&] {
                     return ctx_omni->encode_thread_info->queue.size() <
@@ -2170,7 +2170,7 @@ bool stream_prefill(struct omni_context * ctx_omni,
             return false;
         }
         const bool measure_inline_prefill = ctx_omni->duplex_mode && !ctx_omni->async;
-        auto       inline_prefill_start   = std::chrono::high_resolution_clock::time_point {};
+        auto       inline_prefill_start   = std::chrono::high_resolution_clock::time_point{};
         if (measure_inline_prefill) {
             inline_prefill_start = std::chrono::high_resolution_clock::now();
         }
@@ -2180,8 +2180,7 @@ bool stream_prefill(struct omni_context * ctx_omni,
         }
         if (measure_inline_prefill) {
             duplex_timing_note_llm_prefill(
-                ctx_omni, index,
-                timing_elapsed_ms(inline_prefill_start, std::chrono::high_resolution_clock::now()));
+                ctx_omni, index, timing_elapsed_ms(inline_prefill_start, std::chrono::high_resolution_clock::now()));
         }
     }
 
@@ -2209,9 +2208,8 @@ static bool omni_can_decode(struct omni_context * ctx_omni) {
 
 static bool omni_pipeline_wait_decode_result(struct omni_context * ctx_omni) {
     std::unique_lock<std::mutex> lock(ctx_omni->pipeline_result_mtx);
-    ctx_omni->pipeline_result_cv.wait(lock, [&] {
-        return !ctx_omni->pipeline_result_queue.empty() || !ctx_omni->workers.llm_thread_running;
-    });
+    ctx_omni->pipeline_result_cv.wait(
+        lock, [&] { return !ctx_omni->pipeline_result_queue.empty() || !ctx_omni->workers.llm_thread_running; });
 
     if (ctx_omni->pipeline_result_queue.empty()) {
         return false;
@@ -2228,11 +2226,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         return false;
     }
 
-    const OmniWorkerThreadFns       worker_fns = {
-        omni_encode_worker_loop,
-        omni_llm_stage_worker_loop,
-        omni_tts_worker_loop_simplex,
-        omni_tts_worker_loop_duplex,
+    const OmniWorkerThreadFns worker_fns = {
+        omni_encode_worker_loop, omni_llm_stage_worker_loop, omni_tts_worker_loop_simplex, omni_tts_worker_loop_duplex,
         t2w_thread_func,
     };
 
@@ -2259,11 +2254,8 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 
     omni_turn_coordinator_prepare_decode(ctx_omni, request.round_idx);
 
-    LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
-    LOG_INF("<assistant>");
-
     const bool measure_sync_decode = ctx_omni->duplex_mode && duplex_timing_get_active_chunk(ctx_omni) >= 0;
-    auto       sync_decode_start   = std::chrono::high_resolution_clock::time_point {};
+    auto       sync_decode_start   = std::chrono::high_resolution_clock::time_point{};
     if (measure_sync_decode) {
         sync_decode_start = std::chrono::high_resolution_clock::now();
     }
