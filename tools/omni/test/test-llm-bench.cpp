@@ -34,7 +34,7 @@
 // ==================== 配置 ====================
 
 static const std::vector<int> CONTEXT_LENGTHS  = { 128, 256, 512, 1024, 2048 };
-static const std::vector<int> PREFILL_LENGTHS  = { 16, 32, 64, 128, 256 };
+static const std::vector<int> PREFILL_LENGTHS  = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256 };
 static const int              DECODE_TOKENS    = 32;
 static const int              WARMUP_DECODES   = 4;
 
