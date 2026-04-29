@@ -41,7 +41,9 @@ bool ggml_metal_timed_event_is_completed(ggml_metal_timed_event_t event);
 double ggml_metal_timed_event_get_gpu_start_time(ggml_metal_timed_event_t event);
 double ggml_metal_timed_event_get_gpu_end_time(ggml_metal_timed_event_t event);
 
-// record a timed event on the backend's current command buffer (cmd_buf_last)
+// record a timed event on the backend's main-thread command buffer (cmd_bufs[n_cb])
+// this is the command buffer that always contains the first batch of encoded nodes,
+// unlike cmd_buf_last which may point to an empty async command buffer
 void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t event);
 
 #ifdef __cplusplus

@@ -150,15 +150,15 @@ void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t ev
         return;
     }
 
-    id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_last;
+    // use the main-thread command buffer (cmd_bufs[n_cb]) which always contains
+    // the first batch of encoded nodes. cmd_buf_last may point to an empty async
+    // command buffer when n_nodes < n_nodes_0 (common for single-token decode).
+    id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[ctx->n_cb].obj;
     if (cmd_buf == nil) {
-        // no command buffer available — mark as completed with zero times
-        // event_elapsed_ms will fall back to using the end event's own times
         event->completed = true;
         return;
     }
 
-    // retain the command buffer; GPUStartTime/GPUEndTime are read after waitUntilCompleted
     event->cmd_buf = [cmd_buf retain];
     event->completed = false;
 }
