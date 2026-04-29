@@ -75,6 +75,14 @@ struct ggml_metal {
     // abort ggml_metal_graph_compute if callback returns true
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
+
+    // profiling: pending cmd_bufs captured at graph_compute commit time.
+    // event_record(start) resets; graph_compute fills; event_record(end) transfers.
+    struct {
+        id<MTLCommandBuffer> cmd_buf_first;  // retained — main-thread buffer
+        id<MTLCommandBuffer> cmd_buf_last;   // retained — last async buffer
+        bool ready;                          // true if graph_compute has stored cmd_bufs
+    } profile_pending;
 };
 
 //
@@ -188,20 +196,30 @@ void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t ev
         return;
     }
 
-    // capture both the first and last command buffers to measure total GPU time:
-    // - cmd_bufs[n_cb]: main-thread buffer, always contains the first batch of nodes
-    // - cmd_buf_last:    last buffer from the async encoding loop, may contain
-    //                    remaining nodes when n_nodes > n_nodes_0
-    id<MTLCommandBuffer> first = ctx->cmd_bufs[ctx->n_cb].obj;
-    id<MTLCommandBuffer> last  = ctx->cmd_buf_last;
-
-    if (first == nil && last == nil) {
+    // transfer pending cmd_bufs (captured at graph_compute commit time) into the event.
+    // start event: receives cmd_bufs from the PREVIOUS graph_compute (stale, but ignored
+    //   by elapsed_ms which only uses the end event's timing).
+    // end event: receives cmd_bufs from the CURRENT graph_compute — captured at commit
+    //   time, immune to overwrites by concurrent graph_compute calls.
+    if (!ctx->profile_pending.ready) {
         event->completed = true;
         return;
     }
 
-    event->cmd_buf_first = first ? [first retain] : nil;
-    event->cmd_buf_last  = last  ? [last  retain] : nil;
+    // release any previously retained cmd_bufs in the event
+    if (event->cmd_buf_first) {
+        [event->cmd_buf_first release];
+    }
+    if (event->cmd_buf_last) {
+        [event->cmd_buf_last release];
+    }
+
+    // ownership transfer from pending slot to event
+    event->cmd_buf_first = ctx->profile_pending.cmd_buf_first;
+    event->cmd_buf_last  = ctx->profile_pending.cmd_buf_last;
+    ctx->profile_pending.cmd_buf_first = nil;
+    ctx->profile_pending.cmd_buf_last  = nil;
+    ctx->profile_pending.ready = false;
     event->completed = false;
 }
 
@@ -294,6 +312,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->cmd_buf_last = nil;
 
+    res->profile_pending.cmd_buf_first = nil;
+    res->profile_pending.cmd_buf_last  = nil;
+    res->profile_pending.ready         = false;
+
     res->pipelines_ext = ggml_metal_pipelines_init();
 
     return res;
@@ -306,6 +328,13 @@ void ggml_metal_free(ggml_metal_t ctx) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
         }
+    }
+
+    if (ctx->profile_pending.cmd_buf_first) {
+        [ctx->profile_pending.cmd_buf_first release];
+    }
+    if (ctx->profile_pending.cmd_buf_last) {
+        [ctx->profile_pending.cmd_buf_last release];
     }
 
     for (int i = 0; i < (int) ctx->cmd_bufs_ext.count; ++i) {
@@ -577,6 +606,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        // store committed cmd_bufs for profiling — captured at commit time so they
+        // cannot be overwritten by a concurrent graph_compute on the same backend
+        // before event_record(end) has a chance to read them.
+        {
+            // release previous pending if event_record(end) never consumed it
+            if (ctx->profile_pending.cmd_buf_first) {
+                [ctx->profile_pending.cmd_buf_first release];
+            }
+            if (ctx->profile_pending.cmd_buf_last) {
+                [ctx->profile_pending.cmd_buf_last release];
+            }
+            ctx->profile_pending.cmd_buf_first = [ctx->cmd_bufs[n_cb].obj retain];
+            ctx->profile_pending.cmd_buf_last  = ctx->cmd_buf_last ? [ctx->cmd_buf_last retain] : nil;
+            ctx->profile_pending.ready = true;
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
