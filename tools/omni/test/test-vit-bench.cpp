@@ -297,6 +297,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // 设置 CoreML 模型路径 (vision_init 不会自动从 ctx_params 复制)
+    if (!coreml_path.empty()) {
+        vision_set_coreml_model_path(ctx_vision, coreml_path.c_str());
+        printf("  CoreML model path set: %s\n", coreml_path.c_str());
+    }
+
     // 设置 max_slice_nums (如果指定)
     if (max_slice >= 1) {
         vision_set_max_slice_nums(ctx_vision, max_slice);
