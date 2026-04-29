@@ -77,6 +77,93 @@ struct ggml_metal {
     void *              abort_callback_data;
 };
 
+//
+// timed events for profiling
+//
+
+struct ggml_metal_timed_event {
+    double gpu_start_time;
+    double gpu_end_time;
+    bool completed;
+    id<MTLCommandBuffer> cmd_buf;  // retained
+};
+
+ggml_metal_timed_event_t ggml_metal_timed_event_init(void) {
+    ggml_metal_timed_event_t event = (ggml_metal_timed_event_t)calloc(1, sizeof(struct ggml_metal_timed_event));
+    if (event == NULL) {
+        return NULL;
+    }
+    event->gpu_start_time = 0.0;
+    event->gpu_end_time   = 0.0;
+    event->completed       = false;
+    event->cmd_buf         = nil;
+    return event;
+}
+
+void ggml_metal_timed_event_free(ggml_metal_timed_event_t event) {
+    if (event == NULL) {
+        return;
+    }
+    if (event->cmd_buf) {
+        [event->cmd_buf release];
+        event->cmd_buf = nil;
+    }
+    free(event);
+}
+
+void ggml_metal_timed_event_synchronize(ggml_metal_timed_event_t event) {
+    if (event == NULL || event->cmd_buf == nil) {
+        return;
+    }
+    [event->cmd_buf waitUntilCompleted];
+}
+
+bool ggml_metal_timed_event_is_completed(ggml_metal_timed_event_t event) {
+    if (event == NULL) {
+        return false;
+    }
+    return event->completed;
+}
+
+double ggml_metal_timed_event_get_gpu_start_time(ggml_metal_timed_event_t event) {
+    if (event == NULL) {
+        return 0.0;
+    }
+    return event->gpu_start_time;
+}
+
+double ggml_metal_timed_event_get_gpu_end_time(ggml_metal_timed_event_t event) {
+    if (event == NULL) {
+        return 0.0;
+    }
+    return event->gpu_end_time;
+}
+
+void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t event) {
+    if (ctx == NULL || event == NULL) {
+        return;
+    }
+
+    id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_last;
+    if (cmd_buf == nil) {
+        // no command buffer available — mark as completed with zero times
+        // event_elapsed_ms will fall back to using the end event's own times
+        event->completed = true;
+        return;
+    }
+
+    event->cmd_buf = [cmd_buf retain];
+
+    // capture GPU timestamps via completion handler — runs on Metal's internal thread
+    // after the command buffer has finished executing on the GPU
+    ggml_metal_timed_event_t te = event;
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+        te->gpu_start_time = buffer.GPUStartTime;
+        te->gpu_end_time   = buffer.GPUEndTime;
+        te->completed       = true;
+    }];
+}
+
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
 

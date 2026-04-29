@@ -429,6 +429,24 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
 
 }
 
+// backend stream event functions — record timed events on the current command buffer
+
+static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_timed_event_t te = (ggml_metal_timed_event_t)event->context;
+    ggml_metal_record_timed_event(ctx, te);
+}
+
+static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    // Metal cannot make one stream wait for an event on another stream directly.
+    // The simplest correct implementation is to synchronize the event (block until its command buffer completes).
+    ggml_metal_timed_event_t te = (ggml_metal_timed_event_t)event->context;
+    ggml_metal_timed_event_synchronize(te);
+
+    GGML_UNUSED(backend);
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -442,11 +460,9 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_metal_graph_compute,
 
-    // the events API is needed only for multi-GPU setups, so likely no need to implement it for Metal
-    // in any case, these docs seem relevant if we ever decide to implement it:
-    // https://developer.apple.com/documentation/metal/mtlcommandbuffer#Synchronizing-Passes-with-Events
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    // timed events for profiling (uses MTLCommandBuffer GPUStartTime/GPUEndTime)
+    /* .event_record            = */ ggml_backend_metal_event_record,
+    /* .event_wait              = */ ggml_backend_metal_event_wait,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
 };
 
@@ -544,7 +560,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .async                 = */ true,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ true,
-        /* .events                = */ false,
+        /* .events                = */ true,
     };
 }
 
@@ -626,6 +642,77 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
     GGML_UNUSED(op);
 }
 
+// device event functions — profiling-only timed events using MTLCommandBuffer GPU timestamps
+
+static ggml_backend_event_t ggml_backend_metal_device_event_new_timed(ggml_backend_dev_t dev) {
+    ggml_metal_timed_event_t te = ggml_metal_timed_event_init();
+    if (te == NULL) {
+        return NULL;
+    }
+
+    ggml_backend_event_t event = (ggml_backend_event_t)malloc(sizeof(struct ggml_backend_event));
+    if (event == NULL) {
+        ggml_metal_timed_event_free(te);
+        return NULL;
+    }
+
+    event->device  = dev;
+    event->context = te;
+    return event;
+}
+
+static void ggml_backend_metal_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+
+    if (event == NULL) {
+        return;
+    }
+
+    ggml_metal_timed_event_free((ggml_metal_timed_event_t)event->context);
+    free(event);
+}
+
+static void ggml_backend_metal_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+
+    if (event == NULL) {
+        return;
+    }
+
+    ggml_metal_timed_event_synchronize((ggml_metal_timed_event_t)event->context);
+}
+
+static float ggml_backend_metal_device_event_elapsed_ms(ggml_backend_dev_t dev,
+                                                         ggml_backend_event_t start,
+                                                         ggml_backend_event_t end) {
+    GGML_UNUSED(dev);
+
+    if (start == NULL || end == NULL) {
+        return -1.0f;
+    }
+
+    ggml_metal_timed_event_t te_start = (ggml_metal_timed_event_t)start->context;
+    ggml_metal_timed_event_t te_end   = (ggml_metal_timed_event_t)end->context;
+
+    // block until both command buffers have finished executing on the GPU
+    ggml_metal_timed_event_synchronize(te_start);
+    ggml_metal_timed_event_synchronize(te_end);
+
+    if (!ggml_metal_timed_event_is_completed(te_end)) {
+        return -1.0f;
+    }
+
+    // if the start event was not recorded (cmd_buf_last was nil before the first decode),
+    // fall back to measuring just the end event's command buffer duration
+    if (!ggml_metal_timed_event_is_completed(te_start) || ggml_metal_timed_event_get_gpu_start_time(te_start) == 0.0) {
+        return (float)(ggml_metal_timed_event_get_gpu_end_time(te_end) -
+                       ggml_metal_timed_event_get_gpu_start_time(te_end)) * 1000.0f;
+    }
+
+    return (float)(ggml_metal_timed_event_get_gpu_end_time(te_end) -
+                   ggml_metal_timed_event_get_gpu_start_time(te_start)) * 1000.0f;
+}
+
 static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .get_name             = */ ggml_backend_metal_device_get_name,
     /* .get_description      = */ ggml_backend_metal_device_get_description,
@@ -640,8 +727,11 @@ static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .supports_buft        = */ ggml_backend_metal_device_supports_buft,
     /* .offload_op           = */ ggml_backend_metal_device_offload_op,
     /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_free           = */ ggml_backend_metal_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_metal_device_event_synchronize,
+    // profiling-only timed events using MTLCommandBuffer GPUStartTime/GPUEndTime
+    /* .event_new_timed      = */ ggml_backend_metal_device_event_new_timed,
+    /* .event_elapsed_ms     = */ ggml_backend_metal_device_event_elapsed_ms,
 };
 
 // backend registry

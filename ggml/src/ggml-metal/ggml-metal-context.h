@@ -28,6 +28,22 @@ void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort
 bool ggml_metal_supports_family     (ggml_metal_t ctx, int family);
 void ggml_metal_capture_next_compute(ggml_metal_t ctx);
 
+//
+// timed events for profiling (uses MTLCommandBuffer GPUStartTime/GPUEndTime)
+//
+
+typedef struct ggml_metal_timed_event * ggml_metal_timed_event_t;
+
+ggml_metal_timed_event_t ggml_metal_timed_event_init(void);
+void ggml_metal_timed_event_free(ggml_metal_timed_event_t event);
+void ggml_metal_timed_event_synchronize(ggml_metal_timed_event_t event);
+bool ggml_metal_timed_event_is_completed(ggml_metal_timed_event_t event);
+double ggml_metal_timed_event_get_gpu_start_time(ggml_metal_timed_event_t event);
+double ggml_metal_timed_event_get_gpu_end_time(ggml_metal_timed_event_t event);
+
+// record a timed event on the backend's current command buffer (cmd_buf_last)
+void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t event);
+
 #ifdef __cplusplus
 }
 #endif
