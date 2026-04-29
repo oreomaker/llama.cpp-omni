@@ -686,31 +686,26 @@ static float ggml_backend_metal_device_event_elapsed_ms(ggml_backend_dev_t dev,
                                                          ggml_backend_event_t start,
                                                          ggml_backend_event_t end) {
     GGML_UNUSED(dev);
+    GGML_UNUSED(start);
 
-    if (start == NULL || end == NULL) {
+    if (end == NULL) {
         return -1.0f;
     }
 
-    ggml_metal_timed_event_t te_start = (ggml_metal_timed_event_t)start->context;
-    ggml_metal_timed_event_t te_end   = (ggml_metal_timed_event_t)end->context;
+    ggml_metal_timed_event_t te_end = (ggml_metal_timed_event_t)end->context;
 
-    // block until both command buffers have finished executing on the GPU
-    ggml_metal_timed_event_synchronize(te_start);
+    // block until the end event's command buffer has finished executing on the GPU
     ggml_metal_timed_event_synchronize(te_end);
 
     if (!ggml_metal_timed_event_is_completed(te_end)) {
         return -1.0f;
     }
 
-    // if the start event was not recorded (cmd_buf_last was nil before the first decode),
-    // fall back to measuring just the end event's command buffer duration
-    if (!ggml_metal_timed_event_is_completed(te_start) || ggml_metal_timed_event_get_gpu_start_time(te_start) == 0.0) {
-        return (float)(ggml_metal_timed_event_get_gpu_end_time(te_end) -
-                       ggml_metal_timed_event_get_gpu_start_time(te_end)) * 1000.0f;
-    }
-
+    // always measure just the end event's command buffer duration.
+    // Metal's cmd_buf_last is unreliable for cross-operation timing (cleared by synchronize),
+    // so we measure the GPU time of the command buffer submitted by the current graph_compute call.
     return (float)(ggml_metal_timed_event_get_gpu_end_time(te_end) -
-                   ggml_metal_timed_event_get_gpu_start_time(te_start)) * 1000.0f;
+                   ggml_metal_timed_event_get_gpu_start_time(te_end)) * 1000.0f;
 }
 
 static ggml_backend_device_i ggml_backend_metal_device_i = {
