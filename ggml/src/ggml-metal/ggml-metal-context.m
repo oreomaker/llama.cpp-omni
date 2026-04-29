@@ -132,21 +132,32 @@ void ggml_metal_timed_event_synchronize(ggml_metal_timed_event_t event) {
 
     // GPUStartTime/GPUEndTime are only valid after completion — read them now
     if (!event->completed) {
-        // start time: earliest GPU start (from the first command buffer)
-        // end time:   latest GPU end (from the last command buffer)
+        double first_start = 0.0, first_end = 0.0;
+        double last_start  = 0.0, last_end   = 0.0;
+
         if (event->cmd_buf_first) {
-            event->gpu_start_time = event->cmd_buf_first.GPUStartTime;
+            first_start = event->cmd_buf_first.GPUStartTime;
+            first_end   = event->cmd_buf_first.GPUEndTime;
         }
         if (event->cmd_buf_last) {
-            event->gpu_end_time = event->cmd_buf_last.GPUEndTime;
+            last_start = event->cmd_buf_last.GPUStartTime;
+            last_end   = event->cmd_buf_last.GPUEndTime;
         }
-        // fallback: if only one buffer is available, use its times for both
-        if (event->cmd_buf_first && !event->cmd_buf_last) {
-            event->gpu_end_time = event->cmd_buf_first.GPUEndTime;
+
+        // pick the widest interval: start from the earliest, end from the latest.
+        // when n_nodes <= n_nodes_0 the async cmd_buf_last is empty (last_end ≈ last_start),
+        // so we fall back to cmd_buf_first's interval automatically.
+        if (event->cmd_buf_first && event->cmd_buf_last) {
+            event->gpu_start_time = (first_start < last_start) ? first_start : last_start;
+            event->gpu_end_time   = (first_end   > last_end)   ? first_end   : last_end;
+        } else if (event->cmd_buf_first) {
+            event->gpu_start_time = first_start;
+            event->gpu_end_time   = first_end;
+        } else if (event->cmd_buf_last) {
+            event->gpu_start_time = last_start;
+            event->gpu_end_time   = last_end;
         }
-        if (!event->cmd_buf_first && event->cmd_buf_last) {
-            event->gpu_start_time = event->cmd_buf_last.GPUStartTime;
-        }
+
         event->completed = true;
     }
 }
