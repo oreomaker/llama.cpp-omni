@@ -116,6 +116,12 @@ void ggml_metal_timed_event_synchronize(ggml_metal_timed_event_t event) {
         return;
     }
     [event->cmd_buf waitUntilCompleted];
+    // GPUStartTime/GPUEndTime are only valid after completion — read them now
+    if (!event->completed) {
+        event->gpu_start_time = event->cmd_buf.GPUStartTime;
+        event->gpu_end_time   = event->cmd_buf.GPUEndTime;
+        event->completed       = true;
+    }
 }
 
 bool ggml_metal_timed_event_is_completed(ggml_metal_timed_event_t event) {
@@ -152,16 +158,9 @@ void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t ev
         return;
     }
 
+    // retain the command buffer; GPUStartTime/GPUEndTime are read after waitUntilCompleted
     event->cmd_buf = [cmd_buf retain];
-
-    // capture GPU timestamps via completion handler — runs on Metal's internal thread
-    // after the command buffer has finished executing on the GPU
-    ggml_metal_timed_event_t te = event;
-    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
-        te->gpu_start_time = buffer.GPUStartTime;
-        te->gpu_end_time   = buffer.GPUEndTime;
-        te->completed       = true;
-    }];
+    event->completed = false;
 }
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
