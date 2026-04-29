@@ -85,7 +85,8 @@ struct ggml_metal_timed_event {
     double gpu_start_time;
     double gpu_end_time;
     bool completed;
-    id<MTLCommandBuffer> cmd_buf;  // retained
+    id<MTLCommandBuffer> cmd_buf_first;  // main-thread buffer (cmd_bufs[n_cb]) — retained
+    id<MTLCommandBuffer> cmd_buf_last;   // last async buffer (cmd_buf_last) — retained
 };
 
 ggml_metal_timed_event_t ggml_metal_timed_event_init(void) {
@@ -96,7 +97,8 @@ ggml_metal_timed_event_t ggml_metal_timed_event_init(void) {
     event->gpu_start_time = 0.0;
     event->gpu_end_time   = 0.0;
     event->completed       = false;
-    event->cmd_buf         = nil;
+    event->cmd_buf_first   = nil;
+    event->cmd_buf_last    = nil;
     return event;
 }
 
@@ -104,23 +106,48 @@ void ggml_metal_timed_event_free(ggml_metal_timed_event_t event) {
     if (event == NULL) {
         return;
     }
-    if (event->cmd_buf) {
-        [event->cmd_buf release];
-        event->cmd_buf = nil;
+    if (event->cmd_buf_first) {
+        [event->cmd_buf_first release];
+        event->cmd_buf_first = nil;
+    }
+    if (event->cmd_buf_last) {
+        [event->cmd_buf_last release];
+        event->cmd_buf_last = nil;
     }
     free(event);
 }
 
 void ggml_metal_timed_event_synchronize(ggml_metal_timed_event_t event) {
-    if (event == NULL || event->cmd_buf == nil) {
+    if (event == NULL) {
         return;
     }
-    [event->cmd_buf waitUntilCompleted];
+
+    // wait for both command buffers to complete
+    if (event->cmd_buf_first) {
+        [event->cmd_buf_first waitUntilCompleted];
+    }
+    if (event->cmd_buf_last) {
+        [event->cmd_buf_last waitUntilCompleted];
+    }
+
     // GPUStartTime/GPUEndTime are only valid after completion — read them now
     if (!event->completed) {
-        event->gpu_start_time = event->cmd_buf.GPUStartTime;
-        event->gpu_end_time   = event->cmd_buf.GPUEndTime;
-        event->completed       = true;
+        // start time: earliest GPU start (from the first command buffer)
+        // end time:   latest GPU end (from the last command buffer)
+        if (event->cmd_buf_first) {
+            event->gpu_start_time = event->cmd_buf_first.GPUStartTime;
+        }
+        if (event->cmd_buf_last) {
+            event->gpu_end_time = event->cmd_buf_last.GPUEndTime;
+        }
+        // fallback: if only one buffer is available, use its times for both
+        if (event->cmd_buf_first && !event->cmd_buf_last) {
+            event->gpu_end_time = event->cmd_buf_first.GPUEndTime;
+        }
+        if (!event->cmd_buf_first && event->cmd_buf_last) {
+            event->gpu_start_time = event->cmd_buf_last.GPUStartTime;
+        }
+        event->completed = true;
     }
 }
 
@@ -150,16 +177,20 @@ void ggml_metal_record_timed_event(ggml_metal_t ctx, ggml_metal_timed_event_t ev
         return;
     }
 
-    // use the main-thread command buffer (cmd_bufs[n_cb]) which always contains
-    // the first batch of encoded nodes. cmd_buf_last may point to an empty async
-    // command buffer when n_nodes < n_nodes_0 (common for single-token decode).
-    id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[ctx->n_cb].obj;
-    if (cmd_buf == nil) {
+    // capture both the first and last command buffers to measure total GPU time:
+    // - cmd_bufs[n_cb]: main-thread buffer, always contains the first batch of nodes
+    // - cmd_buf_last:    last buffer from the async encoding loop, may contain
+    //                    remaining nodes when n_nodes > n_nodes_0
+    id<MTLCommandBuffer> first = ctx->cmd_bufs[ctx->n_cb].obj;
+    id<MTLCommandBuffer> last  = ctx->cmd_buf_last;
+
+    if (first == nil && last == nil) {
         event->completed = true;
         return;
     }
 
-    event->cmd_buf = [cmd_buf retain];
+    event->cmd_buf_first = first ? [first retain] : nil;
+    event->cmd_buf_last  = last  ? [last  retain] : nil;
     event->completed = false;
 }
 
