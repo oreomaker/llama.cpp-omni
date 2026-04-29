@@ -138,6 +138,13 @@ set_target_properties  (${TARGET_LLM_BENCH} PROPERTIES OUTPUT_NAME llama-omni-te
 target_link_libraries  (${TARGET_LLM_BENCH} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET_LLM_BENCH} PRIVATE cxx_std_17)
 
+# VIT 推理性能基准测试
+set(TARGET_VIT_BENCH llama-omni-test-vit-bench)
+add_executable         (${TARGET_VIT_BENCH} test/test-vit-bench.cpp)
+set_target_properties  (${TARGET_VIT_BENCH} PROPERTIES OUTPUT_NAME llama-omni-test-vit-bench)
+target_link_libraries  (${TARGET_VIT_BENCH} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_VIT_BENCH} PRIVATE cxx_std_17)
+
 # # Token2Wav 测试程序 - 完整 C++ 语音合成
 # add_executable(token2wav-example token2wav/token2wav-example.cpp)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
