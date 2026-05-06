@@ -238,14 +238,27 @@ struct audition_ctx {
             throw std::runtime_error("failed to initialize CPU backend");
         }
         if (audition_params.use_gpu) {
-            auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+            // Priority: param > env var > default GPU
+            const char * backend_name = audition_params.backend_name;
+            if (backend_name == nullptr) {
+                backend_name = std::getenv("OMNI_AUDIO_BACKEND");
+            }
+            if (backend_name == nullptr) {
+                backend_name = std::getenv("MTMD_BACKEND_DEVICE");
+            }
             if (backend_name != nullptr) {
-                backend = ggml_backend_init_by_name(backend_name, nullptr);
-                if (!backend) {
-                    LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                if (strcmp(backend_name, "cpu") == 0) {
+                    // Explicit CPU: don't use GPU at all
+                    audition_params.use_gpu = false;
+                    LOG_INF("%s: Audio encoder forced to CPU backend by '%s'\n", __func__, backend_name);
+                } else {
+                    backend = ggml_backend_init_by_name(backend_name, nullptr);
+                    if (!backend) {
+                        LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                    }
                 }
             }
-            if (!backend) {
+            if (!backend && audition_params.use_gpu) {
                 backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
             }
         }
