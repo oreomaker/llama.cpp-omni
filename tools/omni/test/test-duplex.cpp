@@ -571,6 +571,7 @@ static void show_usage(const char * prog_name) {
         "  --audio <path>      覆盖 audio 模型路径\n"
         "  --tts <path>        覆盖 TTS 模型路径\n"
         "  --projector <path>  覆盖 projector 模型路径\n"
+        "  --coreml <path>     CoreML 模型路径 (macOS ANE 加速 VIT)\n"
         "  --ref-audio <path>  参考音频路径 (默认: tools/omni/assets/default_ref_audio/default_ref_audio.wav)\n"
         "  -c, --ctx-size <n>  上下文大小 (默认: 4096)\n"
         "  -ngl <n>            GPU 层数 (默认: 99)\n"
@@ -595,6 +596,7 @@ int main(int argc, char ** argv) {
     std::string audio_path_override;
     std::string tts_path_override;
     std::string projector_path_override;
+    std::string vision_coreml_path;
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
     std::string output_dir     = "./tools/omni/output";
     int         n_ctx          = 4096;
@@ -620,6 +622,8 @@ int main(int argc, char ** argv) {
             tts_path_override = argv[++i];
         } else if (arg == "--projector" && i + 1 < argc) {
             projector_path_override = argv[++i];
+        } else if (arg == "--coreml" && i + 1 < argc) {
+            vision_coreml_path = argv[++i];
         } else if (arg == "--ref-audio" && i + 1 < argc) {
             ref_audio_path = argv[++i];
         } else if ((arg == "-c" || arg == "--ctx-size") && i + 1 < argc) {
@@ -699,6 +703,9 @@ int main(int argc, char ** argv) {
     params.vpm_model    = paths.vision;
     params.apm_model    = paths.audio;
     params.tts_model    = paths.tts;
+    if (!vision_coreml_path.empty()) {
+        params.vision_coreml_model_path = vision_coreml_path;
+    }
     params.n_ctx        = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
 
@@ -713,6 +720,9 @@ int main(int argc, char ** argv) {
     printf("  GPU layers: %d\n", n_gpu_layers);
     printf("  Output dir: %s\n", output_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    if (!vision_coreml_path.empty()) {
+        printf("  Vision CoreML: %s\n", vision_coreml_path.c_str());
+    }
     printf("  Mode: DUPLEX\n");
 
     // 关键: duplex_mode=true
