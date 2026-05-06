@@ -104,10 +104,12 @@ struct ChunkTimingReport {
     bool        has_image         = false;
     bool        ended_with_listen = false;
     std::string generated_text;
-    double      vit_embedding_ms   = -1.0;
-    double      audio_embedding_ms = -1.0;
-    double      llm_prefill_ms     = -1.0;
-    double      llm_decode_ms      = -1.0;
+    double      vit_embedding_ms         = -1.0;
+    double      audio_embedding_ms       = -1.0;
+    double      llm_prefill_ms           = -1.0;
+    double      llm_prefill_device_ms    = -1.0;
+    double      llm_decode_ms            = -1.0;
+    double      llm_decode_device_ms     = -1.0;
     std::vector<omni_duplex_decode_step_timing> llm_decode_steps;
     double      tts_audio_token_ms = -1.0;
     double      token2wav_ms       = -1.0;
@@ -125,6 +127,16 @@ static std::string format_stage_ms(double value_ms, bool ready = true, bool allo
         return "pending";
     }
     return "n/a";
+}
+
+static std::string format_stage_ms_with_gpu(double cpu_ms, double device_ms, bool ready = true, bool allow_pending = false) {
+    std::string result = format_stage_ms(cpu_ms, ready, allow_pending);
+    if (device_ms >= 0.0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), " (gpu: %.1f ms)", device_ms);
+        result += buf;
+    }
+    return result;
 }
 
 static std::string sanitize_summary_text(const std::string & text) {
@@ -153,7 +165,12 @@ static std::string format_decode_step_details(const std::vector<omni_duplex_deco
     for (size_t i = 0; i < steps.size(); ++i) {
         const auto & step = steps[i];
         char         buf[128];
-        snprintf(buf, sizeof(buf), "#%zu %.1f ms | valid_tok=%d", i + 1, step.elapsed_ms, step.valid_token_count);
+        if (step.device_ms >= 0.0) {
+            snprintf(buf, sizeof(buf), "#%zu %.1f ms (gpu: %.1f ms) | valid_tok=%d", i + 1, step.elapsed_ms,
+                     step.device_ms, step.valid_token_count);
+        } else {
+            snprintf(buf, sizeof(buf), "#%zu %.1f ms | valid_tok=%d", i + 1, step.elapsed_ms, step.valid_token_count);
+        }
         if (!out.empty()) {
             out += " | ";
         }
@@ -196,15 +213,17 @@ static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTim
     if (!omni_get_duplex_chunk_timing(ctx_omni, report.chunk_idx, &timing)) {
         return;
     }
-    report.vit_embedding_ms   = timing.vit_embedding_ms;
-    report.audio_embedding_ms = timing.audio_embedding_ms;
-    report.llm_prefill_ms     = timing.llm_prefill_ms;
-    report.llm_decode_ms      = timing.llm_decode_ms;
-    report.llm_decode_steps   = timing.llm_decode_steps;
-    report.tts_audio_token_ms = timing.tts_audio_token_ms;
-    report.token2wav_ms       = timing.token2wav_ms;
-    report.tts_done           = timing.tts_done;
-    report.token2wav_done     = timing.token2wav_done;
+    report.vit_embedding_ms      = timing.vit_embedding_ms;
+    report.audio_embedding_ms    = timing.audio_embedding_ms;
+    report.llm_prefill_ms        = timing.llm_prefill_ms;
+    report.llm_prefill_device_ms = timing.llm_prefill_device_ms;
+    report.llm_decode_ms         = timing.llm_decode_ms;
+    report.llm_decode_device_ms  = timing.llm_decode_device_ms;
+    report.llm_decode_steps      = timing.llm_decode_steps;
+    report.tts_audio_token_ms    = timing.tts_audio_token_ms;
+    report.token2wav_ms          = timing.token2wav_ms;
+    report.tts_done              = timing.tts_done;
+    report.token2wav_done        = timing.token2wav_done;
 }
 
 static double average_stage_ms(const std::vector<ChunkTimingReport> &                   reports,
@@ -288,7 +307,8 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
     for (const auto & report : reports) {
         printf("  chunk %04d | vit: %s | audio: %s | llm_prefill: %s | llm_decode: %s", report.chunk_idx,
                format_stage_ms(report.vit_embedding_ms).c_str(), format_stage_ms(report.audio_embedding_ms).c_str(),
-               format_stage_ms(report.llm_prefill_ms).c_str(), format_stage_ms(report.llm_decode_ms).c_str());
+               format_stage_ms_with_gpu(report.llm_prefill_ms, report.llm_prefill_device_ms).c_str(),
+               format_stage_ms_with_gpu(report.llm_decode_ms, report.llm_decode_device_ms).c_str());
         if (!report.llm_decode_steps.empty()) {
             printf(" (%zu steps)", report.llm_decode_steps.size());
         }
@@ -315,9 +335,14 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
             .c_str(),
         format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.audio_embedding_ms; }))
             .c_str(),
-        format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_prefill_ms; }))
+        format_stage_ms_with_gpu(
+            average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_prefill_ms; }),
+            average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_prefill_device_ms; }))
             .c_str(),
-        format_stage_ms(average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_decode_ms; })).c_str(),
+        format_stage_ms_with_gpu(
+            average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_decode_ms; }),
+            average_stage_ms(reports, [](const ChunkTimingReport & r) { return r.llm_decode_device_ms; }))
+            .c_str(),
         format_stage_ms(average_stage_ms(reports, llm_total_picker)).c_str(),
         format_stage_ms(average_stage_ms(reports, stage12_picker)).c_str());
     if (use_tts) {
@@ -482,8 +507,9 @@ static void duplex_test_case(struct omni_context * ctx_omni,
                                                        generated_text.c_str());
         }
         printf("  分阶段: vit=%s | audio=%s | prefill=%s | decode=%s", format_stage_ms(report.vit_embedding_ms).c_str(),
-               format_stage_ms(report.audio_embedding_ms).c_str(), format_stage_ms(report.llm_prefill_ms).c_str(),
-               format_stage_ms(report.llm_decode_ms).c_str());
+               format_stage_ms(report.audio_embedding_ms).c_str(),
+               format_stage_ms_with_gpu(report.llm_prefill_ms, report.llm_prefill_device_ms).c_str(),
+               format_stage_ms_with_gpu(report.llm_decode_ms, report.llm_decode_device_ms).c_str());
         if (ctx_omni->use_tts) {
             printf(" | tts(audio token)=%s | token2wav=%s",
                    format_stage_ms(report.tts_audio_token_ms, report.tts_done, true).c_str(),

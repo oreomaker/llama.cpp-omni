@@ -160,6 +160,7 @@ bool omni_llm_stage_backend_profile_finalize_span(OmniBackendProfileSpan & span,
 
     bool first = true;
     for (auto & event_pair : span.events) {
+        ggml_backend_event_synchronize(event_pair.end);
         const float backend_ms = ggml_backend_event_elapsed_ms(event_pair.start, event_pair.end);
         if (backend_ms >= 0.0f) {
             device_ms = device_ms < 0.0 ? (double) backend_ms : std::max(device_ms, (double) backend_ms);
@@ -239,7 +240,7 @@ void omni_llm_stage_backend_profile_flush_pending(struct omni_context * ctx_omni
     }
 }
 
-void omni_llm_stage_note_prefill_timing(struct omni_context * ctx_omni, int chunk_idx, double ms) {
+void omni_llm_stage_note_prefill_timing(struct omni_context * ctx_omni, int chunk_idx, double ms, double device_ms) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
         return;
     }
@@ -247,9 +248,13 @@ void omni_llm_stage_note_prefill_timing(struct omni_context * ctx_omni, int chun
     std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
     auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
     timing.llm_prefill_ms              = timing.llm_prefill_ms < 0.0 ? ms : timing.llm_prefill_ms + ms;
+    if (device_ms >= 0.0) {
+        timing.llm_prefill_device_ms = timing.llm_prefill_device_ms < 0.0 ? device_ms
+                                                                          : timing.llm_prefill_device_ms + device_ms;
+    }
 }
 
-void omni_llm_stage_note_decode_timing(struct omni_context * ctx_omni, int chunk_idx, double ms) {
+void omni_llm_stage_note_decode_timing(struct omni_context * ctx_omni, int chunk_idx, double ms, double device_ms) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
         return;
     }
@@ -257,11 +262,16 @@ void omni_llm_stage_note_decode_timing(struct omni_context * ctx_omni, int chunk
     std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
     auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
     timing.llm_decode_ms               = timing.llm_decode_ms < 0.0 ? ms : timing.llm_decode_ms + ms;
+    if (device_ms >= 0.0) {
+        timing.llm_decode_device_ms = timing.llm_decode_device_ms < 0.0 ? device_ms
+                                                                        : timing.llm_decode_device_ms + device_ms;
+    }
 }
 
 void omni_llm_stage_note_decode_step_timing(struct omni_context * ctx_omni,
                                             int                   chunk_idx,
                                             double                ms,
+                                            double                device_ms,
                                             int                   sampled_token_count,
                                             int                   valid_token_count,
                                             bool                  chunk_limit_reached,
@@ -277,6 +287,7 @@ void omni_llm_stage_note_decode_step_timing(struct omni_context * ctx_omni,
     timing.llm_decode_steps.emplace_back();
     auto & step              = timing.llm_decode_steps.back();
     step.elapsed_ms          = ms;
+    step.device_ms           = device_ms;
     step.sampled_token_count = sampled_token_count;
     step.valid_token_count   = valid_token_count;
     step.chunk_limit_reached = chunk_limit_reached;
@@ -395,7 +406,8 @@ bool omni_llm_stage_eval_tokens_with_hidden(struct omni_context *    ctx_omni,
                                             float *&                 hidden_states,
                                             int                      profile_chunk_idx = -1,
                                             int                      profile_step_idx  = -1,
-                                            llama_token              profile_token     = -1) {
+                                            llama_token              profile_token     = -1,
+                                            double *                 out_device_ms     = nullptr) {
     const int n_tokens = (int) tokens.size();
     if (n_tokens == 0) {
         hidden_states = nullptr;
@@ -457,6 +469,9 @@ bool omni_llm_stage_eval_tokens_with_hidden(struct omni_context *    ctx_omni,
             std::string backend_breakdown;
             if (omni_llm_stage_backend_profile_finalize_span(profile_span, device_ms, backend_breakdown)) {
                 omni_llm_stage_backend_profile_log_span(profile_span, device_ms, backend_breakdown);
+                if (out_device_ms != nullptr && device_ms >= 0.0) {
+                    *out_device_ms += device_ms;
+                }
             }
         }
         if (emb != nullptr) {
@@ -477,10 +492,11 @@ bool omni_llm_stage_eval_id_with_hidden(struct omni_context *  ctx_omni,
                                         int *                  n_past,
                                         float *&               hidden_states,
                                         int                    profile_chunk_idx = -1,
-                                        int                    profile_step_idx  = -1) {
+                                        int                    profile_step_idx  = -1,
+                                        double *               out_device_ms     = nullptr) {
     std::vector<llama_token> tokens = { id };
     return omni_llm_stage_eval_tokens_with_hidden(ctx_omni, params, std::move(tokens), 1, n_past, hidden_states,
-                                                  profile_chunk_idx, profile_step_idx, id);
+                                                  profile_chunk_idx, profile_step_idx, id, out_device_ms);
 }
 
 const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler * smpl,
@@ -488,7 +504,8 @@ const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler *
                                                          struct common_params *  params,
                                                          int *                   n_past,
                                                          float *&                hidden_states,
-                                                         llama_token &           token_id) {
+                                                         llama_token &           token_id,
+                                                         double *                out_device_ms = nullptr) {
     const int chunk_idx = omni_llm_stage_active_duplex_chunk_idx(ctx_omni);
     const int step_idx  = omni_llm_stage_peek_decode_step_idx(ctx_omni, chunk_idx);
     float *   logits    = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
@@ -525,7 +542,7 @@ const char * omni_llm_stage_sample_with_hidden_and_token(struct common_sampler *
         ret = common_token_to_piece(ctx_omni->ctx_llama, id);
     }
 
-    omni_llm_stage_eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states, chunk_idx, step_idx);
+    omni_llm_stage_eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states, chunk_idx, step_idx, out_device_ms);
     return ret.c_str();
 }
 
@@ -534,8 +551,10 @@ const char * omni_llm_stage_loop_with_hidden_and_token(struct omni_context *   c
                                                        struct common_sampler * smpl,
                                                        int &                   n_past,
                                                        float *&                hidden_states,
-                                                       llama_token &           token_id) {
-    return omni_llm_stage_sample_with_hidden_and_token(smpl, ctx_omni, params, &n_past, hidden_states, token_id);
+                                                       llama_token &           token_id,
+                                                       double *                out_device_ms) {
+    return omni_llm_stage_sample_with_hidden_and_token(smpl, ctx_omni, params, &n_past, hidden_states, token_id,
+                                                       out_device_ms);
 }
 
 std::string omni_llm_stage_build_decode_prefix(const struct omni_context * ctx_omni) {
@@ -1073,7 +1092,8 @@ static void omni_llm_stage_prefill_apply_legacy(struct omni_context *      ctx_o
 
 void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                   struct common_params *     params,
-                                  const struct omni_embeds & embeds) {
+                                  const struct omni_embeds & embeds,
+                                  double *                   out_device_ms) {
     const int hidden_size = llama_model_n_embd(llama_get_model(ctx_omni->ctx_llama));
     const int chunk_idx   = embeds.index;
 
@@ -1111,7 +1131,16 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                 profile_span,
                 omni_llm_stage_timing_elapsed_ms(prefill_submit_start, std::chrono::high_resolution_clock::now()),
                 ctx_omni->session.n_past);
-            omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+            if (out_device_ms != nullptr) {
+                double      device_ms = -1.0;
+                std::string backend_breakdown;
+                if (omni_llm_stage_backend_profile_finalize_span(profile_span, device_ms, backend_breakdown)) {
+                    omni_llm_stage_backend_profile_log_span(profile_span, device_ms, backend_breakdown);
+                    *out_device_ms = device_ms;
+                }
+            } else {
+                omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+            }
         }
     } else if (!omni_llm_stage_build_prefill_embeddings(ctx_omni, embeds, hidden_size, merged_embeddings)) {
         LOG_WRN("%s: merged prefill build failed, falling back to legacy segmented prefill\n", __func__);
@@ -1126,7 +1155,16 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                 profile_span,
                 omni_llm_stage_timing_elapsed_ms(prefill_submit_start, std::chrono::high_resolution_clock::now()),
                 ctx_omni->session.n_past);
-            omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+            if (out_device_ms != nullptr) {
+                double      device_ms = -1.0;
+                std::string backend_breakdown;
+                if (omni_llm_stage_backend_profile_finalize_span(profile_span, device_ms, backend_breakdown)) {
+                    omni_llm_stage_backend_profile_log_span(profile_span, device_ms, backend_breakdown);
+                    *out_device_ms = device_ms;
+                }
+            } else {
+                omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+            }
         }
     } else {
         const int total_tokens = merged_embeddings.empty() ? 0 : (int) (merged_embeddings.size() / hidden_size);
@@ -1146,7 +1184,16 @@ void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                     profile_span,
                     omni_llm_stage_timing_elapsed_ms(prefill_submit_start, std::chrono::high_resolution_clock::now()),
                     ctx_omni->session.n_past);
-                omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+                if (out_device_ms != nullptr) {
+                    double      device_ms = -1.0;
+                    std::string backend_breakdown;
+                    if (omni_llm_stage_backend_profile_finalize_span(profile_span, device_ms, backend_breakdown)) {
+                        omni_llm_stage_backend_profile_log_span(profile_span, device_ms, backend_breakdown);
+                        *out_device_ms = device_ms;
+                    }
+                } else {
+                    omni_llm_stage_backend_profile_enqueue_pending(ctx_omni, std::move(profile_span));
+                }
             }
         }
     }
@@ -1288,8 +1335,23 @@ bool omni_llm_stage_scheduler_run_decode_cycle(struct omni_context * ctx_omni) {
     const auto               decode_start = std::chrono::high_resolution_clock::now();
     OmniLlmStageDecodeResult decode_result;
     const bool               decode_ok = omni_llm_stage_decode_run(ctx_omni, request, &decode_result);
-    omni_llm_stage_note_decode_timing(
-        ctx_omni, chunk_idx, omni_llm_stage_timing_elapsed_ms(decode_start, std::chrono::high_resolution_clock::now()));
+    const double             decode_submit_ms =
+        omni_llm_stage_timing_elapsed_ms(decode_start, std::chrono::high_resolution_clock::now());
+
+    // Aggregate device_ms from per-step decode timings recorded during decode_run.
+    double decode_device_ms = -1.0;
+    {
+        std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+        auto                        it = ctx_omni->duplex_chunk_timings.find(chunk_idx);
+        if (it != ctx_omni->duplex_chunk_timings.end()) {
+            for (const auto & step : it->second.llm_decode_steps) {
+                if (step.device_ms >= 0.0) {
+                    decode_device_ms = decode_device_ms < 0.0 ? step.device_ms : decode_device_ms + step.device_ms;
+                }
+            }
+        }
+    }
+    omni_llm_stage_note_decode_timing(ctx_omni, chunk_idx, decode_submit_ms, decode_device_ms);
     if (decode_ok) {
         omni_turn_coordinator_close(ctx_omni,
                                     decode_result.interrupted ? OmniTurnCloseKind::abort : OmniTurnCloseKind::finish);
@@ -1352,12 +1414,13 @@ bool omni_llm_stage_scheduler_apply_duplex_prefill(struct omni_context *  ctx_om
     }
 
     omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, embeds->index);
-    const auto prefill_start = std::chrono::high_resolution_clock::now();
-    omni_llm_stage_prefill_apply(ctx_omni, params, *embeds);
+    const auto prefill_start    = std::chrono::high_resolution_clock::now();
+    double     prefill_device_ms = -1.0;
+    omni_llm_stage_prefill_apply(ctx_omni, params, *embeds, &prefill_device_ms);
     omni_llm_stage_finalize_prefill(ctx_omni);
     omni_llm_stage_note_prefill_timing(
         ctx_omni, embeds->index,
-        omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()));
+        omni_llm_stage_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()), prefill_device_ms);
     delete embeds;
 
     omni_llm_stage_log_prefill_done(ctx_omni);
@@ -1556,15 +1619,17 @@ bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
 
     while (valid_chunk_count < state->step_size && !state->llm_finish && !ctx_omni->gate.break_event.load() &&
            !chunk_limit_reached) {
-        const char * tmp           = nullptr;
-        float *      hidden_states = nullptr;
-        llama_token  sampled_token = 0;
-        const auto   step_start    = std::chrono::high_resolution_clock::now();
+        const char * tmp               = nullptr;
+        float *      hidden_states     = nullptr;
+        llama_token  sampled_token     = 0;
+        double       step_device_ms    = 0.0;
+        const auto   step_start        = std::chrono::high_resolution_clock::now();
 
         {
             std::lock_guard<std::mutex> llama_lock(ctx_omni->llama_mtx);
             tmp = omni_llm_stage_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler,
-                                                            ctx_omni->session.n_past, hidden_states, sampled_token);
+                                                            ctx_omni->session.n_past, hidden_states, sampled_token,
+                                                            &step_device_ms);
         }
 
         out_slice->total_tokens_generated++;
@@ -1602,14 +1667,14 @@ bool omni_llm_stage_decode_slice(struct omni_context *     ctx_omni,
             state->llm_finish = true;
             omni_llm_stage_handle_decode_end_token(ctx_omni, token_type);
             omni_llm_stage_note_decode_step_timing(ctx_omni, omni_llm_stage_active_duplex_chunk_idx(ctx_omni), step_ms,
-                                                   1, valid_token_count, chunk_limit_reached,
+                                                   step_device_ms, 1, valid_token_count, chunk_limit_reached,
                                                    ctx_omni->turn.ended_with_listen.load(), state->llm_finish, false);
             break;
         }
 
         out_slice->chunk.text += std::string(tmp);
-        omni_llm_stage_note_decode_step_timing(ctx_omni, omni_llm_stage_active_duplex_chunk_idx(ctx_omni), step_ms, 1,
-                                               valid_token_count, chunk_limit_reached,
+        omni_llm_stage_note_decode_step_timing(ctx_omni, omni_llm_stage_active_duplex_chunk_idx(ctx_omni), step_ms,
+                                               step_device_ms, 1, valid_token_count, chunk_limit_reached,
                                                ctx_omni->turn.ended_with_listen.load(), state->llm_finish, false);
         fflush(stdout);
     }

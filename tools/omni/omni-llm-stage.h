@@ -70,7 +70,8 @@ bool omni_llm_stage_eval_string_with_hidden(struct omni_context * ctx_omni,
 
 void omni_llm_stage_prefill_apply(struct omni_context *      ctx_omni,
                                   struct common_params *     params,
-                                  const struct omni_embeds & embeds);
+                                  const struct omni_embeds & embeds,
+                                  double *                   out_device_ms = nullptr);
 void omni_llm_stage_finalize_prefill(struct omni_context * ctx_omni);
 void omni_llm_stage_worker_loop(struct omni_context * ctx_omni, struct common_params * params);
 void omni_llm_stage_finalize_decode_round(struct omni_context * ctx_omni);

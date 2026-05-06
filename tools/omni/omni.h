@@ -151,6 +151,7 @@ struct OmniTTSProjectorRuntime {
 
 struct omni_duplex_decode_step_timing {
     double elapsed_ms          = -1.0;
+    double device_ms           = -1.0;
     int    sampled_token_count = 0;
     int    valid_token_count   = 0;
     bool   chunk_limit_reached = false;
@@ -160,10 +161,12 @@ struct omni_duplex_decode_step_timing {
 };
 
 struct omni_duplex_chunk_timing {
-    double vit_embedding_ms       = -1.0;
-    double audio_embedding_ms     = -1.0;
-    double llm_prefill_ms         = -1.0;
-    double llm_decode_ms          = -1.0;
+    double vit_embedding_ms         = -1.0;
+    double audio_embedding_ms       = -1.0;
+    double llm_prefill_ms           = -1.0;
+    double llm_prefill_device_ms    = -1.0;
+    double llm_decode_ms            = -1.0;
+    double llm_decode_device_ms     = -1.0;
     std::vector<omni_duplex_decode_step_timing> llm_decode_steps;
     double tts_audio_token_ms     = -1.0;
     double token2wav_ms           = -1.0;
