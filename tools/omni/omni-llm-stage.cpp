@@ -190,21 +190,23 @@ bool omni_llm_stage_backend_profile_finalize_span(OmniBackendProfileSpan & span,
 void omni_llm_stage_backend_profile_log_span(const OmniBackendProfileSpan & span,
                                              double                         device_ms,
                                              const std::string &            backend_breakdown) {
+    const double queue_wait_ms = (device_ms >= 0.0 && span.submit_ms >= 0.0) ? span.submit_ms - device_ms : -1.0;
     if (span.step_idx >= 0) {
         print_with_timestamp(
-            "%s stage=%s chunk=%d step=%d submit_ms=%.3f device_ms=%.3f token=%d n_tokens=%d n_past_before=%d "
-            "n_past_after=%d backends=%s\n",
+            "%s stage=%s chunk=%d step=%d submit_ms=%.3f device_ms=%.3f queue_wait_ms=%.3f token=%d n_tokens=%d "
+            "n_past_before=%d n_past_after=%d backends=%s\n",
             kOmniBackendProfileTag, omni_llm_stage_backend_profile_stage_name(span.stage), span.chunk_idx,
-            span.step_idx, span.submit_ms, device_ms, span.token, span.n_tokens, span.n_past_before, span.n_past_after,
-            backend_breakdown.c_str());
+            span.step_idx, span.submit_ms, device_ms, queue_wait_ms, span.token, span.n_tokens, span.n_past_before,
+            span.n_past_after, backend_breakdown.c_str());
         return;
     }
 
     print_with_timestamp(
-        "%s stage=%s chunk=%d submit_ms=%.3f device_ms=%.3f token=%d n_tokens=%d n_past_before=%d n_past_after=%d "
-        "backends=%s\n",
+        "%s stage=%s chunk=%d submit_ms=%.3f device_ms=%.3f queue_wait_ms=%.3f token=%d n_tokens=%d n_past_before=%d "
+        "n_past_after=%d backends=%s\n",
         kOmniBackendProfileTag, omni_llm_stage_backend_profile_stage_name(span.stage), span.chunk_idx, span.submit_ms,
-        device_ms, span.token, span.n_tokens, span.n_past_before, span.n_past_after, backend_breakdown.c_str());
+        device_ms, queue_wait_ms, span.token, span.n_tokens, span.n_past_before, span.n_past_after,
+        backend_breakdown.c_str());
 }
 
 void omni_llm_stage_backend_profile_enqueue_pending(struct omni_context * ctx_omni, OmniBackendProfileSpan && span) {
@@ -252,6 +254,18 @@ void omni_llm_stage_note_prefill_timing(struct omni_context * ctx_omni, int chun
         timing.llm_prefill_device_ms = timing.llm_prefill_device_ms < 0.0 ? device_ms
                                                                           : timing.llm_prefill_device_ms + device_ms;
     }
+}
+
+void omni_llm_stage_note_queue_wait(struct omni_context * ctx_omni, int chunk_idx,
+                                    int queue_depth, double wait_ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.encode_queue_depth_at_submit = queue_depth;
+    timing.llm_queue_wait_ms           = wait_ms;
 }
 
 void omni_llm_stage_note_decode_timing(struct omni_context * ctx_omni, int chunk_idx, double ms, double device_ms) {
@@ -1411,6 +1425,13 @@ bool omni_llm_stage_scheduler_apply_duplex_prefill(struct omni_context *  ctx_om
         delete embeds;
         omni_llm_stage_post_pipeline_result(ctx_omni, false, false);
         return true;
+    }
+
+    // Record queue wait time: from embeds submit to now
+    if (embeds->submit_time.time_since_epoch().count() > 0) {
+        const double wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - embeds->submit_time).count();
+        omni_llm_stage_note_queue_wait(ctx_omni, embeds->index, embeds->queue_depth_at_submit, wait_ms);
     }
 
     omni_llm_stage_set_active_duplex_chunk_idx(ctx_omni, embeds->index);

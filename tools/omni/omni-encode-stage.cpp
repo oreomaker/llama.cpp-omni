@@ -104,9 +104,10 @@ void omni_encode_backend_profile_log_span(const OmniBackendProfileSpan & span, d
         default: break;
     }
 
+    const double queue_wait_ms = (device_ms >= 0.0 && span.submit_ms >= 0.0) ? span.submit_ms - device_ms : -1.0;
     print_with_timestamp(
-        "%s stage=%s chunk=%d submit_ms=%.3f device_ms=%.3f n_tokens=%d backends=%s\n",
-        kOmniBackendProfileTag, stage_name, span.chunk_idx, span.submit_ms, device_ms, span.n_tokens,
+        "%s stage=%s chunk=%d submit_ms=%.3f device_ms=%.3f queue_wait_ms=%.3f n_tokens=%d backends=%s\n",
+        kOmniBackendProfileTag, stage_name, span.chunk_idx, span.submit_ms, device_ms, queue_wait_ms, span.n_tokens,
         backend_breakdown.c_str());
 }
 
@@ -166,6 +167,19 @@ void omni_encode_stage_note_audio(struct omni_context * ctx_omni, int chunk_idx,
     timing.audio_embedding_ms          = timing.audio_embedding_ms < 0.0 ? ms : timing.audio_embedding_ms + ms;
 }
 
+static void omni_encode_stage_note_audio_sub(struct omni_context * ctx_omni, int chunk_idx,
+                                             double file_io_ms, double preprocess_ms, double encode_ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.audio_file_io_ms    = file_io_ms;
+    timing.audio_preprocess_ms = preprocess_ms;
+    timing.audio_encode_ms     = encode_ms;
+}
+
 void omni_encode_stage_post_failure(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr || !ctx_omni->async) {
         return;
@@ -220,12 +234,16 @@ bool omni_encode_prefill_input(struct omni_context * ctx_omni,
         OmniBackendProfileSpan audio_profile_span;
         const bool             audio_profile_active = omni_encode_backend_profile_begin_span(
             audition_get_sched(ctx_omni->ctx_audio), OmniBackendProfileStage::encode_audio_embed, index, -1, audio_profile_span);
-        auto   audio_embed_start = std::chrono::high_resolution_clock::now();
+        auto                          audio_embed_start = std::chrono::high_resolution_clock::now();
+        omni_audio_sub_step_timing    sub_timing;
         auto * audio_embeds =
-            omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+            omni_audio_embed_make_with_filename_timed(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads,
+                                                      aud_fname, &sub_timing);
         const double audio_submit_ms =
             omni_encode_timing_elapsed_ms(audio_embed_start, std::chrono::high_resolution_clock::now());
         omni_encode_stage_note_audio(ctx_omni, index, audio_submit_ms);
+        omni_encode_stage_note_audio_sub(ctx_omni, index, sub_timing.file_io_ms, sub_timing.preprocess_ms,
+                                         sub_timing.encode_ms);
         if (audio_profile_active) {
             omni_encode_backend_profile_end_span(audio_profile_span, audio_submit_ms);
             omni_encode_backend_profile_finalize_and_log(audio_profile_span);
@@ -269,6 +287,9 @@ bool omni_submit_llm_prefill(struct omni_context * ctx_omni, std::unique_ptr<str
         return false;
     }
 
+    // Record queue depth and timestamp before pushing
+    encoded->submit_time          = std::chrono::steady_clock::now();
+    encoded->queue_depth_at_submit = static_cast<int>(ctx_omni->llm_thread_info->queue.size());
     ctx_omni->llm_thread_info->queue.push(encoded.release());
     lock.unlock();
     ctx_omni->llm_thread_info->cv.notify_all();

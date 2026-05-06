@@ -106,6 +106,10 @@ struct ChunkTimingReport {
     std::string generated_text;
     double      vit_embedding_ms         = -1.0;
     double      audio_embedding_ms       = -1.0;
+    // audio sub-step breakdown
+    double      audio_file_io_ms         = -1.0;
+    double      audio_preprocess_ms      = -1.0;
+    double      audio_encode_ms          = -1.0;
     double      llm_prefill_ms           = -1.0;
     double      llm_prefill_device_ms    = -1.0;
     double      llm_decode_ms            = -1.0;
@@ -115,6 +119,9 @@ struct ChunkTimingReport {
     double      token2wav_ms       = -1.0;
     bool        tts_done           = false;
     bool        token2wav_done     = false;
+    // queue depth tracking
+    int         encode_queue_depth_at_submit = -1;
+    double      llm_queue_wait_ms            = -1.0;
 };
 
 static std::string format_stage_ms(double value_ms, bool ready = true, bool allow_pending = false) {
@@ -215,6 +222,9 @@ static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTim
     }
     report.vit_embedding_ms      = timing.vit_embedding_ms;
     report.audio_embedding_ms    = timing.audio_embedding_ms;
+    report.audio_file_io_ms      = timing.audio_file_io_ms;
+    report.audio_preprocess_ms   = timing.audio_preprocess_ms;
+    report.audio_encode_ms       = timing.audio_encode_ms;
     report.llm_prefill_ms        = timing.llm_prefill_ms;
     report.llm_prefill_device_ms = timing.llm_prefill_device_ms;
     report.llm_decode_ms         = timing.llm_decode_ms;
@@ -224,6 +234,8 @@ static void refresh_chunk_timing_report(struct omni_context * ctx_omni, ChunkTim
     report.token2wav_ms          = timing.token2wav_ms;
     report.tts_done              = timing.tts_done;
     report.token2wav_done        = timing.token2wav_done;
+    report.encode_queue_depth_at_submit = timing.encode_queue_depth_at_submit;
+    report.llm_queue_wait_ms           = timing.llm_queue_wait_ms;
 }
 
 static double average_stage_ms(const std::vector<ChunkTimingReport> &                   reports,
@@ -301,12 +313,24 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
         return total;
     };
 
+    auto format_audio_with_sub = [](const ChunkTimingReport & r) -> std::string {
+        std::string result = format_stage_ms(r.audio_embedding_ms);
+        if (r.audio_file_io_ms >= 0.0 || r.audio_preprocess_ms >= 0.0 || r.audio_encode_ms >= 0.0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), " (io: %.1f | mel: %.1f | gpu: %.1f)",
+                     std::max(r.audio_file_io_ms, 0.0), std::max(r.audio_preprocess_ms, 0.0),
+                     std::max(r.audio_encode_ms, 0.0));
+            result += buf;
+        }
+        return result;
+    };
+
     printf("\n========================================\n");
     printf("  Chunk Stage Timing Summary\n");
     printf("========================================\n");
     for (const auto & report : reports) {
         printf("  chunk %04d | vit: %s | audio: %s | llm_prefill: %s | llm_decode: %s", report.chunk_idx,
-               format_stage_ms(report.vit_embedding_ms).c_str(), format_stage_ms(report.audio_embedding_ms).c_str(),
+               format_stage_ms(report.vit_embedding_ms).c_str(), format_audio_with_sub(report).c_str(),
                format_stage_ms_with_gpu(report.llm_prefill_ms, report.llm_prefill_device_ms).c_str(),
                format_stage_ms_with_gpu(report.llm_decode_ms, report.llm_decode_device_ms).c_str());
         if (!report.llm_decode_steps.empty()) {
@@ -320,6 +344,9 @@ static void print_chunk_timing_summary(const std::vector<ChunkTimingReport> & re
         printf(" | decision: %s\n", report.ended_with_listen ? "<|listen|>" : "<|speak|>");
         if (!report.llm_decode_steps.empty()) {
             printf("    decode_steps: %s\n", format_decode_step_details(report.llm_decode_steps).c_str());
+        }
+        if (report.llm_queue_wait_ms >= 0.0) {
+            printf("    queue: depth=%d wait=%.1f ms\n", report.encode_queue_depth_at_submit, report.llm_queue_wait_ms);
         }
         if (!report.ended_with_listen) {
             const std::string text = sanitize_summary_text(report.generated_text);

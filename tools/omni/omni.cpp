@@ -134,6 +134,18 @@ static void duplex_timing_note_audio(struct omni_context * ctx_omni, int chunk_i
     timing.audio_embedding_ms          = timing.audio_embedding_ms < 0.0 ? ms : timing.audio_embedding_ms + ms;
 }
 
+static void duplex_timing_note_audio_sub(struct omni_context * ctx_omni, int chunk_idx,
+                                         double file_io_ms, double preprocess_ms, double encode_ms) {
+    if (ctx_omni == nullptr || chunk_idx < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx_omni->duplex_timing_mtx);
+    auto &                      timing = ctx_omni->duplex_chunk_timings[chunk_idx];
+    timing.audio_file_io_ms    = file_io_ms;
+    timing.audio_preprocess_ms = preprocess_ms;
+    timing.audio_encode_ms     = encode_ms;
+}
+
 static void duplex_timing_note_llm_prefill(struct omni_context * ctx_omni, int chunk_idx, double ms) {
     if (ctx_omni == nullptr || chunk_idx < 0) {
         return;
@@ -599,6 +611,69 @@ struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ct
     audition_audio_u8_free(audio);
     // printf("omni_audio_embed_make_with_filename 3 :%s\n", audio_path.c_str());
     return embed;
+}
+
+struct omni_embed * omni_audio_embed_make_with_filename_timed(struct audition_ctx *              ctx_audition,
+                                                              int                                n_threads,
+                                                              const std::string &                audio_path,
+                                                              struct omni_audio_sub_step_timing * out_timing) {
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    audition_audio_u8 * audio = audition_audio_u8_init();
+    if (!audition_read_binary_file(audio_path.c_str(), &audio->buf)) {
+        LOG_ERR("%s: failed to read audio file %s\n", __func__, audio_path.c_str());
+        audition_audio_u8_free(audio);
+        return NULL;
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    // preprocess (mel spectrogram, CPU)
+    audition_audio_f32 * res_auds = audition_audio_f32_init();
+    if (!audition_audio_preprocess(ctx_audition, audio, &res_auds)) {
+        LOG_ERR("%s: failed to preprocess audio file\n", __func__);
+        audition_audio_f32_free(res_auds);
+        audition_audio_u8_free(audio);
+        return NULL;
+    }
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    // encode (whisper encoder + projector, GPU)
+    int                n_embd   = audition_n_mmproj_embd(ctx_audition);
+    int                n_tokens = audition_n_output_tokens(ctx_audition, res_auds);
+    std::vector<float> output_buffer(n_embd * n_tokens);
+
+    if (!audition_audio_encode(ctx_audition, n_threads, res_auds, output_buffer.data())) {
+        LOG_ERR("%s: cannot encode audio, aborting\n", __func__);
+        audition_audio_f32_free(res_auds);
+        audition_audio_u8_free(audio);
+        return NULL;
+    }
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+
+    auto * result = (omni_embed *) malloc(sizeof(omni_embed));
+    result->embed = (float *) malloc(output_buffer.size() * sizeof(float));
+    if (!result->embed) {
+        free(result);
+        audition_audio_f32_free(res_auds);
+        audition_audio_u8_free(audio);
+        return NULL;
+    }
+    std::memcpy(result->embed, output_buffer.data(), output_buffer.size() * sizeof(float));
+    result->n_pos = n_tokens;
+
+    audition_audio_f32_free(res_auds);
+    audition_audio_u8_free(audio);
+
+    if (out_timing != nullptr) {
+        out_timing->file_io_ms    = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        out_timing->preprocess_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        out_timing->encode_ms     = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    }
+
+    return result;
 }
 
 //

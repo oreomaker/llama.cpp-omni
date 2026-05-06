@@ -49,6 +49,9 @@ struct omni_embeds {
     int                             index    = 0;
     int                             end_flag = false;
     bool                            encode_failed = false;
+    // queue wait tracking
+    std::chrono::steady_clock::time_point submit_time{};
+    int                                   queue_depth_at_submit = -1;
 };
 
 struct PipelineDecodeResult {
@@ -163,6 +166,10 @@ struct omni_duplex_decode_step_timing {
 struct omni_duplex_chunk_timing {
     double vit_embedding_ms         = -1.0;
     double audio_embedding_ms       = -1.0;
+    // audio sub-step breakdown
+    double audio_file_io_ms         = -1.0;
+    double audio_preprocess_ms      = -1.0;
+    double audio_encode_ms          = -1.0;
     double llm_prefill_ms           = -1.0;
     double llm_prefill_device_ms    = -1.0;
     double llm_decode_ms            = -1.0;
@@ -174,6 +181,9 @@ struct omni_duplex_chunk_timing {
     int    token2wav_window_count = 0;
     bool   tts_done               = false;
     bool   token2wav_done         = false;
+    // queue depth tracking
+    int    encode_queue_depth_at_submit = -1;
+    double llm_queue_wait_ms            = -1.0;
 };
 
 enum class OmniBackendProfileStage : uint8_t {
@@ -439,6 +449,17 @@ struct omni_embed * omni_audio_embed_make_with_bytes(struct audition_ctx * ctx_a
 struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audition,
                                                         int                   n_threads,
                                                         const std::string &   audio_path);
+
+// Overloads with sub-step timing output (nullptr = skip timing)
+struct omni_audio_sub_step_timing {
+    double file_io_ms      = 0.0;
+    double preprocess_ms   = 0.0;
+    double encode_ms       = 0.0;
+};
+struct omni_embed * omni_audio_embed_make_with_filename_timed(struct audition_ctx *        ctx_audition,
+                                                              int                          n_threads,
+                                                              const std::string &          audio_path,
+                                                              struct omni_audio_sub_step_timing * out_timing);
 
 //
 // omni main
