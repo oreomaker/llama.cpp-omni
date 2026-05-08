@@ -1078,6 +1078,12 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         (all_generated_tokens == nullptr || all_generated_tokens->empty()) && (token_index_in_chunk == 0);
     const bool skip_processors = ctx_omni->duplex_mode ? token_index_in_chunk == 0 : is_first_token_overall;
 
+    // Per-step timing
+    auto step_start = std::chrono::high_resolution_clock::now();
+    auto last_ts    = step_start;
+    double t_cond_reforward = 0.0, t_get_hidden = 0.0, t_logits_compute = 0.0;
+    double t_sampling = 0.0, t_emb_lookup = 0.0, t_decode_next = 0.0;
+
     if (is_first_token_overall) {
         print_with_timestamp("TTS sample: is_first_token_overall=true, duplex_mode=%d\n", ctx_omni->duplex_mode);
     }
@@ -1117,6 +1123,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         }
 
         *n_past_tts = condition_n_past;
+        t_cond_reforward = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+        last_ts = std::chrono::high_resolution_clock::now();
     }
 
     const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
@@ -1124,6 +1132,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         LOG_ERR("TTS: failed to get hidden state from TTS model\n");
         return 0;
     }
+    t_get_hidden = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+    last_ts = std::chrono::high_resolution_clock::now();
 
     if (logits_debug_dir != nullptr) {
         const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
@@ -1159,6 +1169,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
             audio_logits[i] = sum;
         }
     });
+    t_logits_compute = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+    last_ts = std::chrono::high_resolution_clock::now();
 
     if (logits_debug_dir != nullptr) {
         omni_tts_save_logits_to_file(logits_debug_dir, audio_logits.data(), OMNI_TTS_NUM_AUDIO_TOKENS,
@@ -1242,6 +1254,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
 
     const llama_token id = OMNI_TTS_AUDIO_BOS_TOKEN_ID + selected_relative_idx;
     common_sampler_accept(smpl, id, true);
+    t_sampling = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+    last_ts = std::chrono::high_resolution_clock::now();
 
     const bool is_eos = selected_relative_idx == OMNI_TTS_AUDIO_EOS_RELATIVE_IDX;
     if (ctx_omni->duplex_mode && is_eos && !is_final_text_chunk) {
@@ -1265,19 +1279,31 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
             }
         }
 
+        t_emb_lookup = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+        last_ts = std::chrono::high_resolution_clock::now();
+
         if (!prefill_with_emb_tts(ctx_omni, params, audio_token_embedding.data(), 1, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token embedding\n");
             return 0;
         }
+        t_decode_next = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
     } else {
         LOG_ERR("TTS: emb_code not available, falling back to token IDs (may fail if token exceeds vocab)\n");
         std::vector<llama_token> tokens;
         tokens.push_back(id);
+        t_emb_lookup = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+        last_ts = std::chrono::high_resolution_clock::now();
         if (!omni_tts_eval_tokens(ctx_omni, params, tokens, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token ID (token may exceed vocab size)\n");
             return 0;
         }
+        t_decode_next = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
     }
+
+    double step_total = omni_tts_timing_elapsed_ms(step_start, std::chrono::high_resolution_clock::now());
+    print_with_timestamp("TTS step #%d | total: %.1f ms | cond_refwd: %.1f | get_hidden: %.1f | logits: %.1f | sample: %.1f | emb_lookup: %.1f | decode_next: %.1f\n",
+                         token_index_in_chunk, step_total,
+                         t_cond_reforward, t_get_hidden, t_logits_compute, t_sampling, t_emb_lookup, t_decode_next);
 
     return id;
 }
@@ -1810,12 +1836,14 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
         print_with_timestamp("TTS Local: chunk %d - keeping KV cache, n_past_tts=%d\n", chunk_idx, n_past_tts);
     }
 
+    auto prefill_start = std::chrono::high_resolution_clock::now();
     if (!prefill_with_emb_tts(ctx_omni, params, condition_with_bos.data(), n_tokens_with_bos, params->n_batch,
                               &n_past_tts)) {
         LOG_ERR("TTS Local: prefill_with_emb_tts failed\n");
         return finish_tts_stage(false);
     }
-    print_with_timestamp("TTS Local: prefill completed, n_past_tts=%d\n", n_past_tts);
+    double prefill_ms = omni_tts_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now());
+    print_with_timestamp("TTS Local: prefill completed, n_past_tts=%d, prefill: %.1f ms\n", n_past_tts, prefill_ms);
 
     common_params_sampling tts_sampling = params->sampling;
     tts_sampling.temp                   = 0.8f;
@@ -1910,6 +1938,11 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
 
     common_sampler_free(tts_sampler);
     ctx_omni->tts_n_past_accumulated = n_past_tts;
+
+    double ar_loop_ms = omni_tts_timing_elapsed_ms(prefill_start, std::chrono::high_resolution_clock::now()) - prefill_ms;
+    print_with_timestamp("TTS Local: chunk %d done | prefill: %.1f ms | ar_loop(%zu steps): %.1f ms | avg_per_step: %.1f ms\n",
+                         chunk_idx, prefill_ms, output_audio_tokens.size(), ar_loop_ms,
+                         output_audio_tokens.empty() ? 0.0 : ar_loop_ms / output_audio_tokens.size());
 
     if (!output_dir.empty() && !output_audio_tokens.empty()) {
         const std::string tokens_file = output_dir + "/audio_tokens_chunk_" + std::to_string(chunk_idx) + ".bin";
