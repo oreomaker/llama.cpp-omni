@@ -932,40 +932,51 @@ llama_token omni_tts_sample_token_simplex_internal(struct common_sampler *      
         *n_past_tts = condition_n_past;
     }
 
-    const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
-    if (hidden_state == nullptr) {
-        LOG_ERR("TTS simplex: failed to get hidden state\n");
-        return 0;
-    }
+    std::vector<float> audio_logits;
 
-    if (ctx_omni->tts_aux.head_code_weight == nullptr) {
-        LOG_ERR("TTS simplex: head_code weight not loaded\n");
-        return 0;
-    }
-
-    if (ctx_omni->tts_aux.head_code_hidden_size != 768 ||
-        ctx_omni->tts_aux.head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
-        LOG_ERR("TTS simplex: head_code dimensions mismatch\n");
-        return 0;
-    }
-
-    std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
-    const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
-    const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
-    const int          n_logits    = OMNI_TTS_NUM_AUDIO_TOKENS;
-
-    // Parallelize the 6562 dot products across threads
-    const int n_threads_max = (int)std::thread::hardware_concurrency();
-    const int n_threads_use = std::min(n_threads_max, 4);
-
-    parallel_for(n_logits, n_threads_use, [&](int start, int end) {
-        for (int i = start; i < end; ++i) {
-            float sum = 0.0f;
-            ggml_vec_dot_f32(hidden_size, &sum, 0, hidden_state, 0,
-                             head_code_w + i * hidden_size, 0, 1);
-            audio_logits[i] = sum;
+    if (ctx_omni->tts_head_code.model.initialized) {
+        // GPU path: use GPU embedding tensor directly (no GPU→CPU sync)
+        ggml_backend_t embd_backend = nullptr;
+        ggml_tensor * embd_gpu = llama_get_embeddings_ith_gpu(ctx_omni->ctx_tts_llama, -1, &embd_backend);
+        if (!embd_gpu || !embd_backend) {
+            LOG_ERR("TTS simplex: failed to get GPU embedding\n");
+            return 0;
         }
-    });
+        audio_logits = head_code_forward(ctx_omni->tts_head_code.model, embd_gpu, embd_backend);
+        if (audio_logits.empty()) {
+            LOG_ERR("TTS simplex: head_code GPU forward failed\n");
+            return 0;
+        }
+    } else if (ctx_omni->tts_aux.head_code_weight != nullptr) {
+        // CPU fallback: read hidden state from CPU buffer (triggers GPU→CPU sync)
+        const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+        if (hidden_state == nullptr) {
+            LOG_ERR("TTS simplex: failed to get hidden state\n");
+            return 0;
+        }
+        if (ctx_omni->tts_aux.head_code_hidden_size != 768 ||
+            ctx_omni->tts_aux.head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
+            LOG_ERR("TTS simplex: head_code dimensions mismatch\n");
+            return 0;
+        }
+        audio_logits.resize(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
+        const float * head_code_w = ctx_omni->tts_aux.head_code_weight;
+        const int     hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
+        const int     n_logits    = OMNI_TTS_NUM_AUDIO_TOKENS;
+        const int n_threads_max = (int)std::thread::hardware_concurrency();
+        const int n_threads_use = std::min(n_threads_max, 4);
+        parallel_for(n_logits, n_threads_use, [&](int start, int end) {
+            for (int i = start; i < end; ++i) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(hidden_size, &sum, 0, hidden_state, 0,
+                                 head_code_w + i * hidden_size, 0, 1);
+                audio_logits[i] = sum;
+            }
+        });
+    } else {
+        LOG_ERR("TTS simplex: head_code weight not loaded and GPU not initialized\n");
+        return 0;
+    }
 
     std::mt19937 * rng = omni_tts_get_sampler_rng(smpl);
     std::mt19937   local_rng;
@@ -1127,48 +1138,63 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
         last_ts = std::chrono::high_resolution_clock::now();
     }
 
-    const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
-    if (hidden_state == nullptr) {
-        LOG_ERR("TTS: failed to get hidden state from TTS model\n");
-        return 0;
-    }
-    t_get_hidden = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
-    last_ts = std::chrono::high_resolution_clock::now();
+    std::vector<float> audio_logits;
 
-    if (logits_debug_dir != nullptr) {
-        const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
-        omni_tts_save_hidden_states_to_file(logits_debug_dir, hidden_state, hidden_size, token_index_in_chunk);
-    }
-
-    if (ctx_omni->tts_aux.head_code_weight == nullptr) {
-        LOG_ERR("TTS: head_code weight not loaded\n");
-        return 0;
-    }
-
-    if (ctx_omni->tts_aux.head_code_hidden_size != 768 ||
-        ctx_omni->tts_aux.head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
-        LOG_ERR("TTS: head_code dimensions mismatch: expected (768, 6562), got (%d, %d)\n",
-                ctx_omni->tts_aux.head_code_hidden_size, ctx_omni->tts_aux.head_code_num_audio_tokens);
-        return 0;
-    }
-
-    std::vector<float> audio_logits(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
-    const float *      head_code_w = ctx_omni->tts_aux.head_code_weight;
-    const int          hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
-    const int          n_logits    = OMNI_TTS_NUM_AUDIO_TOKENS;
-
-    // Parallelize the 6562 dot products across threads
-    const int n_threads_max = (int)std::thread::hardware_concurrency();
-    const int n_threads_use = std::min(n_threads_max, 4);
-
-    parallel_for(n_logits, n_threads_use, [&](int start, int end) {
-        for (int i = start; i < end; ++i) {
-            float sum = 0.0f;
-            ggml_vec_dot_f32(hidden_size, &sum, 0, hidden_state, 0,
-                             head_code_w + i * hidden_size, 0, 1);
-            audio_logits[i] = sum;
+    if (ctx_omni->tts_head_code.model.initialized) {
+        // GPU path: use GPU embedding tensor directly (no GPU→CPU sync)
+        ggml_backend_t embd_backend = nullptr;
+        ggml_tensor * embd_gpu = llama_get_embeddings_ith_gpu(ctx_omni->ctx_tts_llama, -1, &embd_backend);
+        if (!embd_gpu || !embd_backend) {
+            LOG_ERR("TTS: failed to get GPU embedding\n");
+            return 0;
         }
-    });
+        t_get_hidden = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+        last_ts = std::chrono::high_resolution_clock::now();
+
+        audio_logits = head_code_forward(ctx_omni->tts_head_code.model, embd_gpu, embd_backend);
+        if (audio_logits.empty()) {
+            LOG_ERR("TTS: head_code GPU forward failed\n");
+            return 0;
+        }
+    } else if (ctx_omni->tts_aux.head_code_weight != nullptr) {
+        // CPU fallback: read hidden state from CPU buffer (triggers GPU→CPU sync)
+        const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+        if (hidden_state == nullptr) {
+            LOG_ERR("TTS: failed to get hidden state from TTS model\n");
+            return 0;
+        }
+        t_get_hidden = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
+        last_ts = std::chrono::high_resolution_clock::now();
+
+        if (logits_debug_dir != nullptr) {
+            const int dbg_hs = llama_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
+            omni_tts_save_hidden_states_to_file(logits_debug_dir, hidden_state, dbg_hs, token_index_in_chunk);
+        }
+
+        if (ctx_omni->tts_aux.head_code_hidden_size != 768 ||
+            ctx_omni->tts_aux.head_code_num_audio_tokens != OMNI_TTS_NUM_AUDIO_TOKENS) {
+            LOG_ERR("TTS: head_code dimensions mismatch: expected (768, 6562), got (%d, %d)\n",
+                    ctx_omni->tts_aux.head_code_hidden_size, ctx_omni->tts_aux.head_code_num_audio_tokens);
+            return 0;
+        }
+        audio_logits.resize(OMNI_TTS_NUM_AUDIO_TOKENS, 0.0f);
+        const float * head_code_w = ctx_omni->tts_aux.head_code_weight;
+        const int     hidden_size = ctx_omni->tts_aux.head_code_hidden_size;
+        const int     n_logits    = OMNI_TTS_NUM_AUDIO_TOKENS;
+        const int n_threads_max = (int)std::thread::hardware_concurrency();
+        const int n_threads_use = std::min(n_threads_max, 4);
+        parallel_for(n_logits, n_threads_use, [&](int start, int end) {
+            for (int i = start; i < end; ++i) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(hidden_size, &sum, 0, hidden_state, 0,
+                                 head_code_w + i * hidden_size, 0, 1);
+                audio_logits[i] = sum;
+            }
+        });
+    } else {
+        LOG_ERR("TTS: head_code weight not loaded and GPU not initialized\n");
+        return 0;
+    }
     t_logits_compute = omni_tts_timing_elapsed_ms(last_ts, std::chrono::high_resolution_clock::now());
     last_ts = std::chrono::high_resolution_clock::now();
 
@@ -1179,15 +1205,8 @@ llama_token omni_tts_sample_token_internal(struct common_sampler *          smpl
 
     const char * output_dir = getenv("TTS_OUTPUT_DIR");
     if (output_dir != nullptr) {
-        if (token_index_in_chunk == 0) {
-            char hidden_state_path[512];
-            snprintf(hidden_state_path, sizeof(hidden_state_path), "%s/cpp_first_hidden_state.bin", output_dir);
-            FILE * f_hidden = fopen(hidden_state_path, "wb");
-            if (f_hidden != nullptr) {
-                fwrite(hidden_state, sizeof(float), hidden_size, f_hidden);
-                fclose(f_hidden);
-            }
-        }
+        // Note: hidden_state debug dump is only available in CPU fallback path
+        // (GPU path does not read hidden state to CPU)
 
         char logits_path[512];
         snprintf(logits_path, sizeof(logits_path), "%s/cpp_logits_token_%d.bin", output_dir, token_index_in_chunk);
@@ -1436,7 +1455,8 @@ bool omni_tts_generate_audio_tokens_local_simplex(struct omni_context *      ctx
         return false;
     }
 
-    if (!ctx_omni->tts_aux.head_code_weight || !ctx_omni->tts_aux.emb_code_weight) {
+    if ((!ctx_omni->tts_head_code.model.initialized && !ctx_omni->tts_aux.head_code_weight) ||
+        !ctx_omni->tts_aux.emb_code_weight) {
         LOG_ERR("TTS Simplex: TTS weights not loaded\n");
         return false;
     }
@@ -1776,7 +1796,8 @@ bool omni_tts_generate_audio_tokens_local(struct omni_context *      ctx_omni,
         return finish_tts_stage(false);
     }
 
-    if (!ctx_omni->tts_aux.head_code_weight || !ctx_omni->tts_aux.emb_code_weight) {
+    if ((!ctx_omni->tts_head_code.model.initialized && !ctx_omni->tts_aux.head_code_weight) ||
+        !ctx_omni->tts_aux.emb_code_weight) {
         LOG_ERR("TTS Local: TTS weights not loaded (head_code or emb_code)\n");
         return finish_tts_stage(false);
     }

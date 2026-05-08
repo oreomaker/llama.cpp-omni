@@ -626,6 +626,55 @@ float * llama_context::get_embeddings_ith(int32_t i) {
     }
 }
 
+ggml_backend_t llama_context::get_gpu_backend() const {
+    for (auto * b : backend_ptrs) {
+        auto * dev = ggml_backend_get_device(b);
+        if (dev) {
+            auto dev_type = ggml_backend_dev_type(dev);
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                return b;
+            }
+        }
+    }
+    return nullptr;
+}
+
+ggml_tensor * llama_context::get_embeddings_ith_gpu(int32_t i, ggml_backend_t * out_backend) {
+    if (!cparams.embeddings) {
+        LLAMA_LOG_ERROR("%s: embeddings not enabled\n", __func__);
+        return nullptr;
+    }
+    if (!t_embd_gpu || !embd_gpu_backend) {
+        LLAMA_LOG_ERROR("%s: GPU embedding buffer not allocated\n", __func__);
+        return nullptr;
+    }
+    if (n_outputs <= 0) {
+        LLAMA_LOG_ERROR("%s: no outputs available\n", __func__);
+        return nullptr;
+    }
+
+    // For i=-1 (last token): t_embd_gpu already contains the last embedding
+    // For other indices: only -1 is supported for GPU path
+    if (i >= 0) {
+        // Positive index: validate
+        if ((size_t) i >= output_ids.size() || output_ids[i] < 0) {
+            LLAMA_LOG_ERROR("%s: invalid index %d\n", __func__, i);
+            return nullptr;
+        }
+    } else {
+        // Negative index: check range
+        if (n_outputs + i < 0) {
+            LLAMA_LOG_ERROR("%s: negative index %d out of range\n", __func__, i);
+            return nullptr;
+        }
+    }
+
+    if (out_backend) {
+        *out_backend = embd_gpu_backend;
+    }
+    return t_embd_gpu;
+}
+
 float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     auto it = embd_seq.find(seq_id);
     if (it == embd_seq.end()) {
@@ -1200,6 +1249,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // copy last embedding to persistent GPU buffer (for GPU-side head_code compute)
+        if (t_embd && t_embd_gpu && embd_gpu_backend && n_outputs > 0) {
+            if (n_outputs == 1) {
+                // single-token case (common in TTS decode): direct GPU copy
+                ggml_backend_tensor_copy(t_embd, t_embd_gpu);
+            } else {
+                // multi-token case: extract last embedding via async transfer
+                ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+                if (src_backend) {
+                    const int64_t offset = (n_outputs - 1) * n_embd * sizeof(float);
+                    std::vector<float> tmp(n_embd);
+                    ggml_backend_tensor_get_async(src_backend, t_embd, tmp.data(), offset, n_embd * sizeof(float));
+                    ggml_backend_synchronize(src_backend);
+                    ggml_backend_tensor_set(t_embd_gpu, tmp.data(), 0, n_embd * sizeof(float));
+                }
+            }
+        }
+
         n_outputs_prev += n_outputs;
     } while (mctx->next());
 
@@ -1324,6 +1391,40 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits = has_logits ? output_base               : nullptr;
     embd   = has_embd   ? output_base + logits_size : nullptr;
+
+    // allocate persistent GPU buffer for embedding (for GPU-side head_code compute)
+    if (has_embd && !buf_embd_gpu) {
+        ggml_backend_t gpu_backend = nullptr;
+        for (auto * b : backend_ptrs) {
+            auto * dev = ggml_backend_get_device(b);
+            if (dev) {
+                auto dev_type = ggml_backend_dev_type(dev);
+                if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    gpu_backend = b;
+                    break;
+                }
+            }
+        }
+        if (gpu_backend) {
+            ctx_embd_gpu.reset(ggml_init({
+                /*.mem_size   = */ ggml_tensor_overhead() * 1,
+                /*.mem_buffer = */ nullptr,
+                /*.no_alloc   = */ true,
+            }));
+            if (ctx_embd_gpu) {
+                t_embd_gpu = ggml_new_tensor_1d(ctx_embd_gpu.get(), GGML_TYPE_F32, n_embd);
+                ggml_set_input(t_embd_gpu);
+                buf_embd_gpu.reset(ggml_backend_alloc_ctx_tensors(ctx_embd_gpu.get(), gpu_backend));
+                if (buf_embd_gpu) {
+                    embd_gpu_backend = gpu_backend;
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to allocate GPU embedding buffer\n", __func__);
+                    ctx_embd_gpu = nullptr;
+                    t_embd_gpu = nullptr;
+                }
+            }
+        }
+    }
 
     // set all ids as invalid (negative)
     std::fill(output_ids.begin(), output_ids.end(), -1);
@@ -2462,6 +2563,15 @@ float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_ith(i);
+}
+
+ggml_tensor * llama_get_embeddings_ith_gpu(llama_context * ctx, int32_t i, ggml_backend_t * out_backend) {
+    // No synchronize needed: data is on GPU, copied synchronously during decode
+    return ctx->get_embeddings_ith_gpu(i, out_backend);
+}
+
+ggml_backend_t llama_get_gpu_backend(struct llama_context * ctx) {
+    return ctx->get_gpu_backend();
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {

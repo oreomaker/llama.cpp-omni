@@ -194,6 +194,28 @@ bool omni_init_tts_runtime(struct omni_context *  ctx_omni,
         print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
     }
 
+    // Initialize head_code GPU compute for logits (eliminates get_hidden GPU→CPU sync)
+    if (ctx_omni->tts_aux.head_code_weight != nullptr) {
+        ggml_backend_t gpu_backend = llama_get_gpu_backend(ctx_omni->ctx_tts_llama);
+        if (gpu_backend) {
+            print_with_timestamp("TTS head_code: initializing GPU compute for logits...\n");
+            if (head_code_init(ctx_omni->tts_head_code.model,
+                               ctx_omni->tts_aux.head_code_weight,
+                               ctx_omni->tts_aux.head_code_hidden_size,
+                               ctx_omni->tts_aux.head_code_num_audio_tokens,
+                               gpu_backend)) {
+                print_with_timestamp("TTS head_code: GPU compute initialized successfully\n");
+                // Free CPU weight data now that it's on GPU (saves ~19.2MB)
+                free(ctx_omni->tts_aux.head_code_weight);
+                ctx_omni->tts_aux.head_code_weight = nullptr;
+            } else {
+                print_with_timestamp("TTS head_code: GPU init failed, will use CPU dot product fallback\n");
+            }
+        } else {
+            print_with_timestamp("TTS head_code: no GPU backend available, will use CPU dot product\n");
+        }
+    }
+
     return true;
 }
 
@@ -521,6 +543,12 @@ static void omni_release_tts_projector_runtime(OmniTTSProjectorRuntime & tts_pro
     }
 }
 
+static void omni_release_tts_head_code_runtime(OmniTTSHeadCodeRuntime & head_code) {
+    if (head_code.model.initialized) {
+        head_code_free(head_code.model);
+    }
+}
+
 void omni_release_audio_vision_runtime(struct omni_context * ctx_omni) {
     delete ctx_omni->ctx_vision;
     ctx_omni->ctx_vision = nullptr;
@@ -536,6 +564,7 @@ void omni_release_tts_runtime(struct omni_context * ctx_omni) {
     common_sampler_free(ctx_omni->ctx_tts_sampler);
     ctx_omni->ctx_tts_sampler = nullptr;
     omni_release_tts_aux_weights(ctx_omni->tts_aux);
+    omni_release_tts_head_code_runtime(ctx_omni->tts_head_code);
 
     if (ctx_omni->token2wav_session) {
         ctx_omni->token2wav_session.reset();

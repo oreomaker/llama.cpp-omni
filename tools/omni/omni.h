@@ -152,6 +152,20 @@ struct OmniTTSProjectorRuntime {
     struct projector_model projector;
 };
 
+struct head_code_model {
+    struct ggml_tensor *       weight      = nullptr;  // [768, 6562] on GPU
+    int32_t                    hidden_size = 0;
+    int32_t                    num_tokens  = 0;
+    struct ggml_context *      ctx_w       = nullptr;
+    ggml_backend_buffer_t      buf_w       = nullptr;
+    ggml_backend_t             backend     = nullptr;  // shared with model backend
+    bool                       initialized = false;
+};
+
+struct OmniTTSHeadCodeRuntime {
+    struct head_code_model model;
+};
+
 struct omni_duplex_decode_step_timing {
     double elapsed_ms          = -1.0;
     double device_ms           = -1.0;
@@ -328,6 +342,7 @@ struct omni_context {
 
     OmniTTSAuxWeights       tts_aux;
     OmniTTSProjectorRuntime tts_projector;
+    OmniTTSHeadCodeRuntime  tts_head_code;
 
     // TTS condition embeddings (for first audio token re-forward)
     // Used to store the condition embeddings so we can re-forward them for the first audio token
@@ -516,6 +531,11 @@ bool prefill_with_emb_tts(struct omni_context * ctx_omni,
 bool               projector_init(projector_model & model, const std::string & fname, bool use_cuda);
 void               projector_free(projector_model & model);
 std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
+
+bool               head_code_init(head_code_model & model, const float * weight_data,
+                                  int hidden_size, int num_tokens, ggml_backend_t backend);
+void               head_code_free(head_code_model & model);
+std::vector<float> head_code_forward(head_code_model & model, ggml_tensor * embd_gpu, ggml_backend_t backend);
 
 // ==================== 高清模式函数声明 ====================
 // 设置 vision max_slice_nums 覆盖值，用于高清模式

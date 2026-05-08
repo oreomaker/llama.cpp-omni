@@ -938,6 +938,16 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 
+    // GPU-side embedding access: returns the embedding tensor on GPU (avoids GPU→CPU sync)
+    // Returns NULL if GPU embedding buffer is not available or index is invalid
+    // The returned tensor and backend are valid until the next llama_decode call
+    // Negative indices: -1 = last embedding
+    LLAMA_API struct ggml_tensor * llama_get_embeddings_ith_gpu(struct llama_context * ctx, int32_t i,
+                                                                ggml_backend_t * out_backend);
+
+    // Returns the first GPU backend of the context, or NULL if none
+    LLAMA_API ggml_backend_t llama_get_gpu_backend(struct llama_context * ctx);
+
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence

@@ -884,6 +884,128 @@ std::vector<float> projector_forward(projector_model & model, const float * inpu
     return result;
 }
 
+// ── head_code GPU compute (logits = hidden_state^T @ W^T) ────────────────
+
+bool head_code_init(head_code_model & model, const float * weight_data,
+                    int hidden_size, int num_tokens, ggml_backend_t backend) {
+    if (!weight_data || hidden_size <= 0 || num_tokens <= 0 || !backend) {
+        LOG_ERR("head_code_init: invalid parameters\n");
+        return false;
+    }
+
+    model.backend = backend;  // shared with model backend (not owned)
+
+    // Create context for weight tensor only
+    size_t                  ctx_size   = ggml_tensor_overhead() * 1;
+    struct ggml_init_params ctx_params = {
+        /*.mem_size   = */ ctx_size,
+        /*.mem_buffer = */ nullptr,
+        /*.no_alloc   = */ true,
+    };
+    model.ctx_w = ggml_init(ctx_params);
+    if (!model.ctx_w) {
+        LOG_ERR("head_code_init: failed to init weight context\n");
+        model.backend = nullptr;
+        return false;
+    }
+
+    // Weight tensor: [ne0=hidden_size, ne1=num_tokens] = [768, 6562]
+    // Memory layout matches row-major [6562, 768] from tts_aux.head_code_weight
+    model.weight = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, hidden_size, num_tokens);
+    ggml_set_name(model.weight, "head_code.weight");
+
+    model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, backend);
+    if (!model.buf_w) {
+        LOG_ERR("head_code_init: failed to allocate weight buffer on backend\n");
+        ggml_free(model.ctx_w);
+        model.ctx_w   = nullptr;
+        model.backend = nullptr;
+        return false;
+    }
+
+    // Upload weight data to GPU
+    size_t weight_size = (size_t) hidden_size * num_tokens * sizeof(float);
+    ggml_backend_tensor_set(model.weight, weight_data, 0, weight_size);
+
+    model.hidden_size = hidden_size;
+    model.num_tokens  = num_tokens;
+    model.initialized = true;
+    return true;
+}
+
+void head_code_free(head_code_model & model) {
+    if (model.ctx_w) {
+        ggml_free(model.ctx_w);
+        model.ctx_w = nullptr;
+    }
+    if (model.buf_w) {
+        ggml_backend_buffer_free(model.buf_w);
+        model.buf_w = nullptr;
+    }
+    // backend is shared (not owned), don't free
+    model.backend     = nullptr;
+    model.weight      = nullptr;
+    model.hidden_size = 0;
+    model.num_tokens  = 0;
+    model.initialized = false;
+}
+
+std::vector<float> head_code_forward(head_code_model & model, ggml_tensor * embd_gpu, ggml_backend_t backend) {
+    if (!model.initialized || !embd_gpu || !backend) {
+        LOG_ERR("head_code_forward: model not initialized or null input\n");
+        return {};
+    }
+
+    const int num_tokens = model.num_tokens;
+
+    // Create temporary context for output tensor and graph
+    size_t                  ctx_size = ggml_tensor_overhead() * 10 + ggml_graph_overhead();
+    struct ggml_init_params params   = {
+        /*.mem_size   = */ ctx_size,
+        /*.mem_buffer = */ nullptr,
+        /*.no_alloc   = */ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        LOG_ERR("head_code_forward: failed to init compute context\n");
+        return {};
+    }
+
+    // Build graph: logits = weight^T @ embd_gpu → [6562, 1]
+    // embd_gpu is already on GPU, no upload needed
+    struct ggml_tensor * output = ggml_mul_mat(ctx, model.weight, embd_gpu);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, output);
+
+    // Allocate compute buffer for output tensor only
+    // weight is in persistent buf_w, embd_gpu is in model's buffer
+    ggml_backend_buffer_t buf_compute = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf_compute) {
+        LOG_ERR("head_code_forward: failed to allocate compute buffer\n");
+        ggml_free(ctx);
+        return {};
+    }
+
+    // Execute on GPU (weight + embd_gpu are both on the same backend)
+    enum ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR("head_code_forward: graph compute failed with status %d\n", (int) status);
+        ggml_backend_buffer_free(buf_compute);
+        ggml_free(ctx);
+        return {};
+    }
+
+    // Read logits back to CPU
+    std::vector<float> logits(num_tokens);
+    ggml_backend_tensor_get(output, logits.data(), 0, num_tokens * sizeof(float));
+
+    ggml_backend_buffer_free(buf_compute);
+    ggml_free(ctx);
+
+    return logits;
+}
+
 // ==============================================================================
 
 // Load TTS weights from GGUF file

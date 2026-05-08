@@ -66,6 +66,13 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    // GPU embedding access: returns the embedding tensor on GPU (avoids GPU→CPU sync)
+    // The returned tensor and backend are valid until the next llama_decode call
+    struct ggml_tensor * get_embeddings_ith_gpu(int32_t i, ggml_backend_t * out_backend);
+
+    // Returns the first GPU backend, or nullptr if none
+    ggml_backend_t get_gpu_backend() const;
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);
@@ -290,6 +297,12 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // persistent GPU buffer for embedding (avoids GPU→CPU→GPU roundtrip for head_code)
+    ggml_context_ptr        ctx_embd_gpu;
+    ggml_backend_buffer_ptr buf_embd_gpu;
+    ggml_tensor *           t_embd_gpu       = nullptr;
+    ggml_backend_t          embd_gpu_backend = nullptr;
 
     bool has_evaluated_once = false;
 
