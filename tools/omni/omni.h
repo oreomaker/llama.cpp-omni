@@ -156,10 +156,13 @@ struct head_code_model {
     struct ggml_tensor *       weight      = nullptr;  // [768, 6562] on GPU
     int32_t                    hidden_size = 0;
     int32_t                    num_tokens  = 0;
-    struct ggml_context *      ctx_w       = nullptr;
+    struct ggml_context *      ctx_w       = nullptr;   // persistent: weight tensor
     ggml_backend_buffer_t      buf_w       = nullptr;
-    ggml_backend_t             backend     = nullptr;  // shared with model backend
+    ggml_backend_t             backend     = nullptr;    // shared with model backend
     bool                       initialized = false;
+
+    // Persistent graph allocator (reuses compute buffer across calls)
+    ggml_gallocr_t             galloc      = nullptr;
 };
 
 struct OmniTTSHeadCodeRuntime {
