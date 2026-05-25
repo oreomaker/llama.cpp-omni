@@ -145,7 +145,30 @@ set_target_properties  (${TARGET_VIT_BENCH} PROPERTIES OUTPUT_NAME llama-omni-te
 target_link_libraries  (${TARGET_VIT_BENCH} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET_VIT_BENCH} PRIVATE cxx_std_17)
 
-# # Token2Wav 测试程序 - 完整 C++ 语音合成
-# add_executable(token2wav-example token2wav/token2wav-example.cpp)
-# target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
-# target_compile_features(token2wav-example PRIVATE cxx_std_17)
+# LLM SM partitioning benchmark (analytical + prefill + decode + SM scaling)
+set(TARGET_LLM_SM_BENCH llama-omni-bench-llm)
+add_executable         (${TARGET_LLM_SM_BENCH} test/bench-llm.cpp)
+set_target_properties  (${TARGET_LLM_SM_BENCH} PROPERTIES OUTPUT_NAME llama-omni-bench-llm)
+target_link_libraries  (${TARGET_LLM_SM_BENCH} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_LLM_SM_BENCH} PRIVATE cxx_std_17)
+
+# TTS memory-bound验证 + SM scaling benchmark
+set(TARGET_TTS_BENCH llama-omni-bench-tts)
+add_executable         (${TARGET_TTS_BENCH} test/bench-tts.cpp)
+set_target_properties  (${TARGET_TTS_BENCH} PROPERTIES OUTPUT_NAME llama-omni-bench-tts)
+target_link_libraries  (${TARGET_TTS_BENCH} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_TTS_BENCH} PRIVATE cxx_std_17)
+
+# Token2Wav SM scaling benchmark
+set(TARGET_T2W_BENCH llama-omni-bench-t2w)
+add_executable         (${TARGET_T2W_BENCH} test/bench-t2w.cpp)
+set_target_properties  (${TARGET_T2W_BENCH} PROPERTIES OUTPUT_NAME llama-omni-bench-t2w)
+target_link_libraries  (${TARGET_T2W_BENCH} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_T2W_BENCH} PRIVATE cxx_std_17)
+
+# Vision encoder SM scaling benchmark
+set(TARGET_VISION_BENCH llama-omni-bench-vision)
+add_executable         (${TARGET_VISION_BENCH} test/bench-vision.cpp)
+set_target_properties  (${TARGET_VISION_BENCH} PROPERTIES OUTPUT_NAME llama-omni-bench-vision)
+target_link_libraries  (${TARGET_VISION_BENCH} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_VISION_BENCH} PRIVATE cxx_std_17)
