@@ -835,10 +835,8 @@ int main(int argc, char ** argv) {
                       << "\n";
         }
 
-        llama_free(ctx);
-        llama_model_free(model);
         llama_backend_free();
-        return 0;
+        return 0;  // init_result destructor handles model/ctx cleanup
     }
 
     // --- E2: Prefill + Decode (normal mode) ---
@@ -910,8 +908,8 @@ int main(int argc, char ** argv) {
             // Free GPU resources BEFORE spawning MPS children.
             // On Jetson (unified memory), holding the model while children
             // also load it causes OOM. On desktop, avoids CUDA context conflicts.
-            llama_free(ctx);
-            llama_model_free(model);
+            init_result.context.reset();
+            init_result.model.reset();
             ctx   = nullptr;
             model = nullptr;
 
@@ -1015,9 +1013,9 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Cleanup
-    llama_free(ctx);
-    llama_model_free(model);
+    // Cleanup — free context before model (order matters)
+    init_result.context.reset();
+    init_result.model.reset();
     llama_backend_free();
 
     return 0;
