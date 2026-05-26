@@ -823,6 +823,12 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "[INFO] MPS detected. Running SM scaling via re-exec...\n");
             fprintf(stderr, "[INFO] Each fraction will re-exec the benchmark with CUDA_MPS_ACTIVE_THREAD_PERCENTAGE set.\n");
 
+            // Free GPU resources BEFORE spawning MPS children
+            llama_free(ctx);
+            llama_free_model(model);
+            ctx   = nullptr;
+            model = nullptr;
+
             std::string self_path = argv[0];
             std::string base_args;
             for (int i = 1; i < argc; i++) {
@@ -844,7 +850,7 @@ int main(int argc, char ** argv) {
                     " " + self_path + base_args +
                     " --batch-sizes 1 --steps " + std::to_string(n_steps) +
                     " --warmup " + std::to_string(n_warmup) +
-                    " 2>/dev/null";
+                    " 2>&1";
 
                 FILE * pipe = popen(cmd.c_str(), "r");
                 if (pipe) {

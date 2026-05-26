@@ -907,6 +907,14 @@ int main(int argc, char ** argv) {
         if (mps_binary_ok && mps_running) {
             fprintf(stderr, "[INFO] MPS detected. Running SM scaling via re-exec...\n");
 
+            // Free GPU resources BEFORE spawning MPS children.
+            // On Jetson (unified memory), holding the model while children
+            // also load it causes OOM. On desktop, avoids CUDA context conflicts.
+            llama_free(ctx);
+            llama_model_free(model);
+            ctx   = nullptr;
+            model = nullptr;
+
             std::string self_path = argv[0];
             std::string base_args;
             for (int i = 1; i < argc; i++) {
@@ -929,7 +937,7 @@ int main(int argc, char ** argv) {
                     "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=" + std::to_string(pct) +
                     " CUDA_VISIBLE_DEVICES=0" +
                     " " + self_path + base_args +
-                    " 2>/dev/null";
+                    " 2>&1";
 
                 FILE * pipe = popen(cmd.c_str(), "r");
                 if (!pipe) {
