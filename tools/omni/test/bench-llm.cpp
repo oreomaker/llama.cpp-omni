@@ -259,6 +259,7 @@ struct SMScaledResult {
     double prefill_ms_mean;
     double decode_ms_mean;
     double decode_ms_p95;
+    double decode_tokens_per_sec;
     double eff_bw_gb_s;
     double bw_util_pct;
 };
@@ -575,9 +576,10 @@ static void print_sm_scaling(const std::vector<SMScaledResult> & results,
                   << std::setw(16) << "Prefill(ms)"
                   << std::setw(14) << "Decode(ms)"
                   << std::setw(14) << "Dec P95(ms)"
+                  << std::setw(12) << "Dec Tok/s"
                   << std::setw(18) << "Eff BW(GB/s)"
                   << std::setw(14) << "BW Util%"
-                  << "\n" << std::string(96, '-') << "\n";
+                  << "\n" << std::string(112, '-') << "\n";
 
         double best_decode = 1e9;
         for (auto & r : results)
@@ -596,10 +598,41 @@ static void print_sm_scaling(const std::vector<SMScaledResult> & results,
                       << std::setw(16) << std::setprecision(3) << r.prefill_ms_mean
                       << std::setw(14) << std::setprecision(3) << r.decode_ms_mean
                       << std::setw(14) << std::setprecision(3) << r.decode_ms_p95
+                      << std::setw(12) << std::setprecision(1) << r.decode_tokens_per_sec
                       << std::setw(18) << std::setprecision(2) << eff_bw
                       << std::setw(14) << std::setprecision(1) << bw_util;
             if (r.decode_ms_mean <= best_decode * 1.05)
                 std::cout << "  <-- near-optimal";
+            std::cout << "\n";
+        }
+        std::cout << "\n";
+
+        // --- Decode latency vs SM fraction (focused view) ---
+        std::cout << "  Decode Latency Scaling (prefill=" << plen << "):\n";
+        std::cout << "  " << std::setw(10) << "SM Frac"
+                  << std::setw(10) << "~SMs"
+                  << std::setw(14) << "Decode(ms)"
+                  << std::setw(12) << "Tok/s"
+                  << std::setw(12) << "Slowdown"
+                  << std::setw(12) << "BW Util%"
+                  << "\n  " << std::string(70, '-') << "\n";
+
+        for (auto & r : results) {
+            if (r.prefill_len != plen) continue;
+
+            double eff_bw  = model_bytes / (r.decode_ms_mean / 1000.0) / 1e9;
+            double bw_util = (peak_bw_gb_s > 0) ? eff_bw / peak_bw_gb_s * 100.0 : 0.0;
+            double slowdown = best_decode > 0 ? r.decode_ms_mean / best_decode : 1.0;
+
+            std::cout << "  " << std::fixed;
+            std::cout << std::setw(10) << std::setprecision(2) << r.sm_fraction
+                      << std::setw(10) << r.approx_sms
+                      << std::setw(14) << std::setprecision(3) << r.decode_ms_mean
+                      << std::setw(12) << std::setprecision(1) << r.decode_tokens_per_sec
+                      << std::setw(10) << std::setprecision(2) << slowdown << "x"
+                      << std::setw(12) << std::setprecision(1) << bw_util;
+            if (slowdown < 1.05)
+                std::cout << "  <-- baseline";
             std::cout << "\n";
         }
         std::cout << "\n";
@@ -609,7 +642,7 @@ static void print_sm_scaling(const std::vector<SMScaledResult> & results,
             if (r.prefill_len != plen) continue;
             double deg = (r.decode_ms_mean - best_decode) / best_decode;
             if (deg < 0.05) {
-                std::cout << "--- Saturation (prefill=" << plen << ") ---\n";
+                std::cout << "  --- Saturation (prefill=" << plen << ") ---\n";
                 std::cout << "  SM fraction: " << r.sm_fraction * 100.0
                           << "% (~" << r.approx_sms << " SMs)\n";
                 std::cout << "  Beyond this, adding SMs gives <5% decode improvement\n\n";
@@ -831,7 +864,8 @@ int main(int argc, char ** argv) {
                       << pr.time_ms_mean << " "
                       << dr.time_ms_mean << " "
                       << dr.time_ms_p95 << " "
-                      << (analytical.bytes_per_step / (dr.time_ms_mean / 1000.0) / 1e9)
+                      << (analytical.bytes_per_step / (dr.time_ms_mean / 1000.0) / 1e9) << " "
+                      << dr.tokens_per_sec
                       << "\n";
         }
 
@@ -950,12 +984,15 @@ int main(int argc, char ** argv) {
                         double f;
                         int plen;
                         SMScaledResult r;
-                        if (sscanf(line.c_str(), "LLM_DATA: %lf %d %lf %lf %lf %lf",
-                                   &f, &plen,
-                                   &r.prefill_ms_mean,
-                                   &r.decode_ms_mean,
-                                   &r.decode_ms_p95,
-                                   &r.eff_bw_gb_s) >= 6) {
+                        int parsed = sscanf(line.c_str(), "LLM_DATA: %lf %d %lf %lf %lf %lf %lf",
+                                           &f, &plen,
+                                           &r.prefill_ms_mean,
+                                           &r.decode_ms_mean,
+                                           &r.decode_ms_p95,
+                                           &r.eff_bw_gb_s,
+                                           &r.decode_tokens_per_sec);
+                        if (parsed >= 6) {
+                            if (parsed < 7) r.decode_tokens_per_sec = 0.0;
                             r.sm_fraction = frac;
                             r.approx_sms  = std::max(1, (int)std::round(analytical.sm_count * frac));
                             r.prefill_len = plen;
@@ -1005,7 +1042,8 @@ int main(int argc, char ** argv) {
             for (auto & r : sm_results) {
                 f << "sm_scaling," << r.prefill_len << "," << r.sm_fraction
                   << "," << r.approx_sms << ",,"
-                  << r.decode_ms_mean << "," << r.decode_ms_p95 << ",,"
+                  << r.decode_ms_mean << "," << r.decode_ms_p95 << ","
+                  << r.decode_tokens_per_sec << ","
                   << r.eff_bw_gb_s << "," << r.bw_util_pct << "\n";
             }
             f.close();
