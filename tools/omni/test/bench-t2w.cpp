@@ -90,6 +90,7 @@ static GpuSpec detect_gpu() {
         else if (gpu.name.find("H100") != std::string::npos) gpu.sm_count = 132;
         else if (gpu.name.find("A100") != std::string::npos) gpu.sm_count = 108;
         else if (gpu.name.find("L40") != std::string::npos)  gpu.sm_count = 142;
+        else if (gpu.name.find("Orin") != std::string::npos) gpu.sm_count = 16;
     }
 
     // Get bandwidth
@@ -107,11 +108,17 @@ static GpuSpec detect_gpu() {
             else if (gpu.name.find("4090") != std::string::npos) bus_width = 384;
             else if (gpu.name.find("4080") != std::string::npos) bus_width = 256;
             else if (gpu.name.find("3090") != std::string::npos) bus_width = 384;
+            else if (gpu.name.find("Orin") != std::string::npos) { gpu.bandwidth_gb_s = 200.0; bus_width = 0; }
 
-            gpu.bandwidth_gb_s = mem_clock_mhz * 1e6 * (bus_width / 8) * 2.0 / 1e9;
+            if (bus_width > 0)
+                gpu.bandwidth_gb_s = mem_clock_mhz * 1e6 * (bus_width / 8) * 2.0 / 1e9;
         }
         pclose(pipe);
     }
+
+    // Fallback for Jetson Orin (nvidia-smi may not return memory clocks)
+    if (gpu.bandwidth_gb_s <= 0 && gpu.name.find("Orin") != std::string::npos)
+        gpu.bandwidth_gb_s = 200.0;
 
     return gpu;
 }

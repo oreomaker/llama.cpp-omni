@@ -87,8 +87,11 @@ static bool parse_nvidia_smi(GpuSpec & gpu, int device_id = 0) {
             else if (gpu.name.find("L20") != std::string::npos)  { gpu.sm_count = 92;  gpu.mem_bus_width = 384; }
             else if (gpu.name.find("3090") != std::string::npos) { gpu.sm_count = 82;  gpu.mem_bus_width = 384; }
             else if (gpu.name.find("3080") != std::string::npos) { gpu.sm_count = 68;  gpu.mem_bus_width = 320; }
+            else if (gpu.name.find("Orin") != std::string::npos) { gpu.sm_count = 16;  gpu.mem_bus_width = 128; }
 
-            if (gpu.mem_bus_width > 0) {
+            if (gpu.name.find("Orin") != std::string::npos) {
+                gpu.bandwidth_gb_s = 200.0;
+            } else if (gpu.mem_bus_width > 0) {
                 gpu.bandwidth_gb_s = gpu.mem_clock_mhz * 1e6 * (gpu.mem_bus_width / 8) * 2.0 / 1e9;
             }
         }
@@ -897,7 +900,7 @@ int main(int argc, char ** argv) {
     std::vector<SMScaledResult> sm_results;
 
     if (!sm_fractions_str.empty()) {
-        bool mps_binary_ok = (system("nvidia-cuda-mps-control --version > /dev/null 2>&1") == 0);
+        bool mps_binary_ok = (system("command -v nvidia-cuda-mps-control > /dev/null 2>&1") == 0);
         bool mps_running   = (system("pgrep -x nvidia-cuda-mps > /dev/null 2>&1") == 0 ||
                               system("pgrep -x nvidia-cuda-mps-c > /dev/null 2>&1") == 0);
 

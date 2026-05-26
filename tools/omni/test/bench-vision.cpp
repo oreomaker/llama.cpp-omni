@@ -68,6 +68,7 @@ static GpuSpec detect_gpu() {
     else if (gpu.name.find("H200") != std::string::npos) { gpu.sm_count = 132; gpu.bandwidth_gb_s = 4800.0; }
     else if (gpu.name.find("A100") != std::string::npos) { gpu.sm_count = 108; gpu.bandwidth_gb_s = 2039.0; }
     else if (gpu.name.find("L40") != std::string::npos)  { gpu.sm_count = 142; gpu.bandwidth_gb_s = 864.0; }
+    else if (gpu.name.find("Orin") != std::string::npos) { gpu.sm_count = 16;  gpu.bandwidth_gb_s = 200.0; }
 
     return gpu;
 }
