@@ -833,7 +833,9 @@ int main(int argc, char ** argv) {
 
                 // Re-exec with MPS and capture output
                 // Look for "ms/token" in batch=1 output
+                const char * mps_pipe = getenv("CUDA_MPS_PIPE_DIRECTORY");
                 std::string cmd =
+                    (mps_pipe ? "CUDA_MPS_PIPE_DIRECTORY=" + std::string(mps_pipe) + " " : "") +
                     "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=" + std::to_string(pct) +
                     " CUDA_VISIBLE_DEVICES=0" +
                     " " + self_path + base_args +
