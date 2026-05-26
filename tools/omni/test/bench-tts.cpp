@@ -461,6 +461,61 @@ static std::vector<SMScaledResult> run_sm_scaling(
 }
 
 // ============================================================================
+// Simple decode benchmark (batch=1) — used by MPS child mode
+// ============================================================================
+
+static double bench_decode_batch1(
+    llama_context * ctx,
+    int n_embd,
+    int n_steps_to_run,
+    int n_warmup_steps)
+{
+    srand(42);
+
+    std::vector<float> emb(n_embd);
+    for (int i = 0; i < n_embd; i++) {
+        emb[i] = ((float)rand() / (float)RAND_MAX - 0.5f) * 2.0f;
+    }
+
+    // Warmup
+    for (int w = 0; w < n_warmup_steps; w++) {
+        llama_batch batch = {};
+        batch.n_tokens = 1;
+        batch.embd     = emb.data();
+        llama_pos p     = (llama_pos)w;
+        batch.pos       = &p;
+        llama_set_embeddings(ctx, true);
+        llama_memory_t mem = llama_get_memory(ctx);
+        if (mem) llama_memory_seq_rm(mem, 0, 0, -1);
+        llama_decode(ctx, batch);
+    }
+
+    // Benchmark
+    std::vector<double> times_ms;
+    times_ms.reserve(n_steps_to_run);
+    for (int s = 0; s < n_steps_to_run; s++) {
+        llama_batch batch = {};
+        batch.n_tokens = 1;
+        batch.embd     = emb.data();
+        llama_pos p     = (llama_pos)s;
+        batch.pos       = &p;
+        llama_set_embeddings(ctx, true);
+        llama_memory_t mem = llama_get_memory(ctx);
+        if (mem) llama_memory_seq_rm(mem, 0, 0, -1);
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        llama_decode(ctx, batch);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        double dt = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        times_ms.push_back(dt);
+    }
+    llama_set_embeddings(ctx, false);
+
+    return vec_mean(times_ms);
+}
+
+// ============================================================================
 // Output
 // ============================================================================
 
@@ -755,184 +810,241 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "[INFO] GPU: %s\n", g_gpu_spec.name.c_str());
     fprintf(stderr, "[INFO]   SMs=%d, BW=%.0f GB/s\n", g_gpu_spec.sm_count, g_gpu_spec.bandwidth_gb_s);
 
-    // Init llama
-    llama_backend_init();
-    llama_numa_init(params.numa);
+    // Check MPS environment (same protocol as bench-vision)
+    const char * mps_env = getenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE");
+    bool mps_active = (mps_env != nullptr);
 
-    // Load model
-    fprintf(stderr, "[INFO] Loading TTS model: %s\n", model_path.c_str());
-    llama_model_params model_params = common_model_params_to_llama(params);
-    llama_model * model = llama_load_model_from_file(model_path.c_str(), model_params);
-    if (!model) {
-        fprintf(stderr, "Error: Failed to load model: %s\n", model_path.c_str());
-        return 1;
-    }
+    // ========================================================================
+    // Branch 1: Full analysis mode (no SM scaling, no MPS)
+    // ========================================================================
+    if (!mps_active && sm_fractions_str.empty()) {
+        // Init llama
+        llama_backend_init();
+        llama_numa_init(params.numa);
 
-    llama_context_params ctx_params = common_context_params_to_llama(params);
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
-    if (!ctx) {
-        fprintf(stderr, "Error: Failed to create context\n");
-        llama_free_model(model);
-        return 1;
-    }
-
-    int n_embd = llama_model_n_embd(model);
-    fprintf(stderr, "[INFO] Model loaded: n_embd=%d, n_layer=%d, n_head=%d\n",
-            n_embd, llama_model_n_layer(model), llama_model_n_head(model));
-
-    // ==== Experiment 1: Analytical ====
-    TTSAnalytical analytical;
-    analytical.compute(model);
-    print_analytical(analytical);
-
-    // ==== Experiment 2: Batch-size scaling ====
-    std::vector<int> batch_sizes;
-    {
-        std::stringstream ss(batch_sizes_str);
-        std::string item;
-        while (std::getline(ss, item, ',')) {
-            int bs = std::stoi(item);
-            if (bs > 0) batch_sizes.push_back(bs);
+        // Load model
+        fprintf(stderr, "[INFO] Loading TTS model: %s\n", model_path.c_str());
+        llama_model_params model_params = common_model_params_to_llama(params);
+        llama_model * model = llama_load_model_from_file(model_path.c_str(), model_params);
+        if (!model) {
+            fprintf(stderr, "Error: Failed to load model: %s\n", model_path.c_str());
+            return 1;
         }
-    }
-    auto batch_results = run_batch_scaling(ctx, n_embd,
-                                           analytical.backbone_bytes,
-                                           analytical.peak_bw_gb_s,
-                                           batch_sizes);
-    print_batch_scaling(batch_results, analytical);
 
-    // ==== Experiment 3: SM scaling ====
-    std::vector<SMScaledResult> sm_results;
+        llama_context_params ctx_params = common_context_params_to_llama(params);
+        llama_context * ctx = llama_init_from_model(model, ctx_params);
+        if (!ctx) {
+            fprintf(stderr, "Error: Failed to create context\n");
+            llama_free_model(model);
+            return 1;
+        }
 
-    if (!sm_fractions_str.empty()) {
-        std::vector<double> fractions;
+        int n_embd = llama_model_n_embd(model);
+        fprintf(stderr, "[INFO] Model loaded: n_embd=%d, n_layer=%d, n_head=%d\n",
+                n_embd, llama_model_n_layer(model), llama_model_n_head(model));
+
+        // Experiment 1: Analytical
+        TTSAnalytical analytical;
+        analytical.compute(model);
+        print_analytical(analytical);
+
+        // Experiment 2: Batch-size scaling
+        std::vector<int> batch_sizes;
         {
-            std::stringstream ss(sm_fractions_str);
+            std::stringstream ss(batch_sizes_str);
             std::string item;
             while (std::getline(ss, item, ',')) {
-                fractions.push_back(std::stod(item));
+                int bs = std::stoi(item);
+                if (bs > 0) batch_sizes.push_back(bs);
+            }
+        }
+        auto batch_results = run_batch_scaling(ctx, n_embd,
+                                               analytical.backbone_bytes,
+                                               analytical.peak_bw_gb_s,
+                                               batch_sizes);
+        print_batch_scaling(batch_results, analytical);
+
+        // Summary
+        std::vector<SMScaledResult> empty_sm;
+        print_summary(analytical, batch_results, empty_sm);
+
+        // CSV export
+        if (!output_csv.empty()) {
+            std::ofstream f(output_csv);
+            if (f) {
+                f << "experiment,batch_size,time_total_ms,time_per_token_ms,"
+                  << "tokens_per_sec,eff_bw_gb_s,bw_util_pct\n";
+                for (const auto & r : batch_results) {
+                    f << "batch_scaling," << r.batch_size << ","
+                      << r.time_total_ms << "," << r.time_per_token_ms << ","
+                      << r.tokens_per_sec << "," << r.eff_bw_gb_s << ","
+                      << r.bw_util_pct << "\n";
+                }
+                f.close();
+                fprintf(stderr, "[INFO] Results written to %s\n", output_csv.c_str());
             }
         }
 
-        // Check if MPS is functional (binary exists AND daemon is running)
-        bool mps_binary_ok = (system("command -v nvidia-cuda-mps-control > /dev/null 2>&1") == 0);
-        bool mps_running    = (system("pgrep -x nvidia-cuda-mps > /dev/null 2>&1") == 0 ||
-                               system("pgrep -x nvidia-cuda-mps-c > /dev/null 2>&1") == 0);
+        // Cleanup
+        llama_free(ctx);
+        llama_free_model(model);
+        llama_backend_free();
+        return 0;
+    }
 
-        if (mps_binary_ok && mps_running) {
-            fprintf(stderr, "[INFO] MPS detected. Running SM scaling via re-exec...\n");
-            fprintf(stderr, "[INFO] Each fraction will re-exec the benchmark with CUDA_MPS_ACTIVE_THREAD_PERCENTAGE set.\n");
+    // ========================================================================
+    // Branch 2: Child mode (MPS active) — single fraction benchmark
+    // ========================================================================
+    if (mps_active) {
+        double current_frac = std::stod(mps_env) / 100.0;
+        fprintf(stderr, "[INFO] MPS active: %.0f%% SMs (fraction=%.2f)\n",
+                std::stod(mps_env), current_frac);
 
-            // Free GPU resources BEFORE spawning MPS children
-            llama_free(ctx);
+        // Init llama
+        llama_backend_init();
+        llama_numa_init(params.numa);
+
+        // Load model
+        llama_model_params model_params = common_model_params_to_llama(params);
+        llama_model * model = llama_load_model_from_file(model_path.c_str(), model_params);
+        if (!model) {
+            fprintf(stderr, "Error: Failed to load model\n");
+            return 1;
+        }
+
+        llama_context_params ctx_params = common_context_params_to_llama(params);
+        llama_context * ctx = llama_init_from_model(model, ctx_params);
+        if (!ctx) {
+            fprintf(stderr, "Error: Failed to create context\n");
             llama_free_model(model);
-            ctx   = nullptr;
-            model = nullptr;
+            return 1;
+        }
 
-            std::string self_path = argv[0];
-            std::string base_args;
-            for (int i = 1; i < argc; i++) {
-                if (strcmp(argv[i], "--sm-fractions") == 0) { i++; continue; }
-                base_args += " " + std::string(argv[i]);
+        int n_embd = llama_model_n_embd(model);
+
+        // Compute analytical for backbone_bytes (needed for eff_bw calculation)
+        TTSAnalytical analytical;
+        analytical.compute(model);
+
+        // Run decode bench at batch=1
+        double time_per_token_ms = bench_decode_batch1(ctx, n_embd, n_steps, n_warmup);
+        double eff_bw_gb_s = analytical.backbone_bytes / (time_per_token_ms / 1000.0) / 1e9;
+        double bw_util_pct = (analytical.peak_bw_gb_s > 0) ?
+                             eff_bw_gb_s / analytical.peak_bw_gb_s * 100.0 : 0.0;
+
+        // Structured output for parent to parse
+        std::cout << "TTS_DATA: " << current_frac << " "
+                  << time_per_token_ms << " " << eff_bw_gb_s << " "
+                  << bw_util_pct << "\n";
+
+        // Cleanup
+        llama_free(ctx);
+        llama_free_model(model);
+        llama_backend_free();
+        return 0;
+    }
+
+    // ========================================================================
+    // Branch 3: Parent mode — SM scaling via MPS re-exec
+    // ========================================================================
+
+    // Parse fractions
+    std::vector<double> fractions;
+    {
+        std::stringstream ss(sm_fractions_str);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            fractions.push_back(std::stod(item));
+        }
+    }
+
+    // Check MPS daemon
+    bool mps_daemon = (system("pgrep -x nvidia-cuda-mps > /dev/null 2>&1") == 0 ||
+                       system("pgrep -x nvidia-cuda-mps-c > /dev/null 2>&1") == 0);
+    if (!mps_daemon) {
+        fprintf(stderr, "[ERR] MPS daemon not running.\n");
+        fprintf(stderr, "[ERR] Start: sudo nvidia-cuda-mps-control -d\n");
+        return 1;
+    }
+
+    fprintf(stderr, "[INFO] SM scaling via MPS re-exec...\n");
+
+    int total_sms = (user_sm_count > 0) ? user_sm_count : g_gpu_spec.sm_count;
+
+    std::vector<SMScaledResult> sm_results;
+    std::string self_path = argv[0];
+
+    // Build base args (exclude --sm-fractions, child re-runs with MPS env)
+    std::string base_args;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--sm-fractions") == 0) { i++; continue; }
+        base_args += " \"" + std::string(argv[i]) + "\"";
+    }
+
+    for (double frac : fractions) {
+        int pct = std::max(1, (int)(frac * 100.0));
+        fprintf(stderr, "[INFO]   Testing SM fraction=%.2f (%d%%)...\n", frac, pct);
+
+        const char * mps_pipe = getenv("CUDA_MPS_PIPE_DIRECTORY");
+        std::string cmd =
+            (mps_pipe ? "CUDA_MPS_PIPE_DIRECTORY=" + std::string(mps_pipe) + " " : "") +
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=" + std::to_string(pct) +
+            " CUDA_VISIBLE_DEVICES=0" +
+            " " + self_path + base_args + " 2>&1";
+
+        FILE * pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            fprintf(stderr, "[WARN] Failed to execute child for fraction %.2f\n", frac);
+            continue;
+        }
+
+        char buf[1024];
+        SMScaledResult r = {};
+        r.sm_fraction = frac;
+        while (fgets(buf, sizeof(buf), pipe)) {
+            std::string line(buf);
+            if (line.find("TTS_DATA:") != std::string::npos) {
+                double f;
+                sscanf(line.c_str(), "TTS_DATA: %lf %lf %lf %lf",
+                       &f, &r.time_per_token_ms, &r.eff_bw_gb_s, &r.bw_util_pct);
+                r.approx_sms = std::max(1, (int)std::round(total_sms * frac));
             }
+        }
+        pclose(pipe);
 
-            for (double frac : fractions) {
-                int pct = std::max(1, (int)(frac * 100.0));
-                fprintf(stderr, "[INFO]   Testing SM fraction=%.2f (%d%%)...\n", frac, pct);
-
-                // Re-exec with MPS and capture output
-                // Look for "ms/token" in batch=1 output
-                const char * mps_pipe = getenv("CUDA_MPS_PIPE_DIRECTORY");
-                std::string cmd =
-                    (mps_pipe ? "CUDA_MPS_PIPE_DIRECTORY=" + std::string(mps_pipe) + " " : "") +
-                    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=" + std::to_string(pct) +
-                    " CUDA_VISIBLE_DEVICES=0" +
-                    " " + self_path + base_args +
-                    " --batch-sizes 1 --steps " + std::to_string(n_steps) +
-                    " --warmup " + std::to_string(n_warmup) +
-                    " 2>&1";
-
-                FILE * pipe = popen(cmd.c_str(), "r");
-                if (pipe) {
-                    char buf[1024];
-                    double ms_per_token = 0.0;
-                    while (fgets(buf, sizeof(buf), pipe)) {
-                        // Parse "1         xxx.xxx        y.yyyy" line from batch output
-                        // This is the batch_size=1 line with time_per_token
-                        std::string line(buf);
-                        // Look for the data line after the header
-                        if (line.find("Batch") == std::string::npos &&
-                            line.find("---") == std::string::npos &&
-                            line[0] >= '0' && line[0] <= '9') {
-                            // Parse: "         1        xxx.xxx        y.yyyy       ..."
-                            double bs_val, time_total, ms_per_tok;
-                            if (sscanf(line.c_str(), "%lf %lf %lf", &bs_val, &time_total, &ms_per_tok) >= 3
-                                && (int)bs_val == 1) {
-                                ms_per_token = ms_per_tok;
-                            }
-                        }
-                    }
-                    pclose(pipe);
-
-                    if (ms_per_token > 0) {
-                        SMScaledResult r;
-                        r.sm_fraction       = frac;
-                        r.approx_sms        = std::max(1, (int)std::round(analytical.sm_count * frac));
-                        r.time_per_token_ms = ms_per_token;
-                        r.eff_bw_gb_s       = (analytical.backbone_bytes) / (ms_per_token / 1000.0) / 1e9;
-                        r.bw_util_pct       = (analytical.peak_bw_gb_s > 0) ?
-                                               r.eff_bw_gb_s / analytical.peak_bw_gb_s * 100.0 : 0.0;
-                        sm_results.push_back(r);
-                    }
-                }
-            }
-        } else if (!mps_binary_ok) {
-            fprintf(stderr, "[WARN] nvidia-cuda-mps-control not found. SM scaling skipped.\n");
-            fprintf(stderr, "[WARN] Install CUDA MPS tools to enable SM scaling.\n");
+        if (r.time_per_token_ms > 0) {
+            sm_results.push_back(r);
         } else {
-            fprintf(stderr, "[WARN] MPS binary found but daemon is NOT running.\n");
-            fprintf(stderr, "[WARN] Start it with:  sudo nvidia-cuda-mps-control -d\n");
-            fprintf(stderr, "[WARN] Falling back to in-process measurement (no SM limiting).\n");
-            sm_results = run_sm_scaling(ctx, n_embd,
-                                        analytical.backbone_bytes,
-                                        analytical.peak_bw_gb_s,
-                                        analytical.sm_count,
-                                        fractions);
+            fprintf(stderr, "[WARN] Failed to parse result for fraction %.2f\n", frac);
         }
     }
 
     print_sm_scaling(sm_results);
 
-    // ==== Summary ====
-    print_summary(analytical, batch_results, sm_results);
+    // Summary
+    if (!sm_results.empty()) {
+        print_sep("SUMMARY");
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "  SM scaling tested " << sm_results.size() << " fractions on "
+                  << total_sms << " SMs\n";
+        std::cout << "  Results above show time/token vs SM fraction\n";
+        std::cout << "  Lower is better; saturation indicates memory-bound behavior\n\n";
+    }
 
     // CSV export
     if (!output_csv.empty()) {
         std::ofstream f(output_csv);
         if (f) {
-            f << "experiment,batch_size,sm_fraction,approx_sms,"
-              << "time_total_ms,time_per_token_ms,tokens_per_sec,"
-              << "eff_bw_gb_s,bw_util_pct\n";
-            for (const auto & r : batch_results) {
-                f << "batch_scaling," << r.batch_size << ",,,"
-                  << r.time_total_ms << "," << r.time_per_token_ms << ","
-                  << r.tokens_per_sec << "," << r.eff_bw_gb_s << ","
-                  << r.bw_util_pct << "\n";
-            }
+            f << "sm_fraction,approx_sms,time_per_token_ms,eff_bw_gb_s,bw_util_pct\n";
             for (const auto & r : sm_results) {
-                f << "sm_scaling,1," << r.sm_fraction << "," << r.approx_sms << ",,"
-                  << r.time_per_token_ms << ",," << r.eff_bw_gb_s << ","
+                f << r.sm_fraction << "," << r.approx_sms << ","
+                  << r.time_per_token_ms << "," << r.eff_bw_gb_s << ","
                   << r.bw_util_pct << "\n";
             }
             f.close();
             fprintf(stderr, "[INFO] Results written to %s\n", output_csv.c_str());
         }
     }
-
-    // Cleanup
-    llama_free(ctx);
-    llama_free_model(model);
-    llama_backend_free();
 
     return 0;
 }
