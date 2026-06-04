@@ -10,6 +10,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "omni.h"
+#include "voxcpm2_runtime.h"
 
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
@@ -2338,6 +2339,10 @@ struct server_context {
     omni_context * octx = nullptr;
     std::mutex octx_mutex;
 
+    // VoxCPM2 TTS
+    VoxCPM2Runtime * voxcpm2_runtime = nullptr;
+    std::mutex voxcpm2_mutex;
+
     const llama_vocab * vocab = nullptr;
     bool vocab_dft_compatible = true;
 
@@ -2372,6 +2377,12 @@ struct server_context {
 
     ~server_context() {
         mtmd_free(mctx);
+
+        if (voxcpm2_runtime) {
+            voxcpm2_runtime->free();
+            delete voxcpm2_runtime;
+            voxcpm2_runtime = nullptr;
+        }
 
         // Clear any sampling context
         for (server_slot & slot : slots) {
@@ -6248,6 +6259,331 @@ int main(int argc, char ** argv) {
         handle_stream_update_session_config_impl(body, res);
     };
 
+    // ==================== VoxCPM2 TTS API ====================
+
+    // WAV encoding utility (from voxcpm2_cli.cpp)
+    auto voxcpm2_encode_wav = [](const std::vector<float> & pcm, int sample_rate) -> std::string {
+        const int32_t n_samples = static_cast<int32_t>(pcm.size());
+        const int32_t byte_rate = sample_rate * 2;
+        const int32_t data_size = n_samples * 2;
+        const int32_t chunk_size = 36 + data_size;
+
+        std::string buf;
+        buf.resize(44 + data_size);
+        auto * p = buf.data();
+
+        auto w32 = [&](int32_t v) { memcpy(p, &v, 4); p += 4; };
+        auto w16 = [&](int16_t v) { memcpy(p, &v, 2); p += 2; };
+
+        memcpy(p, "RIFF", 4); p += 4; w32(chunk_size); memcpy(p, "WAVE", 4); p += 4;
+        memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sample_rate); w32(byte_rate); w16(2); w16(16);
+        memcpy(p, "data", 4); p += 4; w32(data_size);
+
+        auto * dst = reinterpret_cast<int16_t *>(p);
+        for (int32_t i = 0; i < n_samples; ++i) {
+            float v = std::max(-1.0f, std::min(1.0f, pcm[i]));
+            dst[i] = static_cast<int16_t>(v * 32767.0f);
+        }
+        return buf;
+    };
+
+    // Helper: load WAV from memory buffer (base64-decoded)
+    auto voxcpm2_load_wav_from_memory = [&res_error](const std::vector<uint8_t> & data, int & out_sr) -> std::vector<float> {
+        if (data.size() < 44) return {};
+        const auto * p = data.data();
+        if (memcmp(p, "RIFF", 4) != 0 || memcmp(p + 8, "WAVE", 4) != 0) return {};
+
+        int16_t audio_format = 0, num_channels = 0, bits_per_sample = 0;
+        int32_t sample_rate = 0, data_size = 0;
+        size_t offset = 12;
+        while (offset + 8 <= data.size()) {
+            char id[4]; int32_t size;
+            memcpy(id, p + offset, 4); offset += 4;
+            memcpy(&size, p + offset, 4); offset += 4;
+            if (memcmp(id, "fmt ", 4) == 0) {
+                if (offset + 16 > data.size()) return {};
+                memcpy(&audio_format, p + offset, 2);
+                memcpy(&num_channels, p + offset + 2, 2);
+                memcpy(&sample_rate, p + offset + 4, 4);
+                memcpy(&bits_per_sample, p + offset + 14, 2);
+                offset += size;
+            } else if (memcmp(id, "data", 4) == 0) {
+                data_size = size;
+                break;
+            } else {
+                offset += size;
+            }
+        }
+        if (audio_format != 1 || data_size <= 0 || num_channels < 1) return {};
+
+        out_sr = sample_rate;
+        int n_samples = data_size / (bits_per_sample / 8);
+        const auto * raw = reinterpret_cast<const int16_t *>(p + offset);
+        std::vector<float> pcm(n_samples / num_channels);
+        for (int i = 0; i < n_samples / num_channels; ++i) {
+            float sum = 0.0f;
+            for (int ch = 0; ch < num_channels; ++ch) {
+                sum += static_cast<float>(raw[i * num_channels + ch]) / 32768.0f;
+            }
+            pcm[i] = sum / static_cast<float>(num_channels);
+        }
+        return pcm;
+    };
+
+    // POST /v1/voxcpm2/init — Load/reload VoxCPM2 runtime
+    const auto handle_voxcpm2_init_impl = [&ctx_server, &res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+        std::string base_lm = json_value(data, "base_lm", std::string(""));
+        std::string acoustic = json_value(data, "acoustic", std::string(""));
+        int n_gpu_layers = json_value(data, "n_gpu_layers", -1);
+
+        if (base_lm.empty() || acoustic.empty()) {
+            res_error(res, format_error_response("\"base_lm\" and \"acoustic\" are required", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.voxcpm2_mutex);
+            if (ctx_server.voxcpm2_runtime) {
+                ctx_server.voxcpm2_runtime->free();
+                delete ctx_server.voxcpm2_runtime;
+                ctx_server.voxcpm2_runtime = nullptr;
+            }
+
+            auto * rt = new VoxCPM2Runtime();
+            if (!rt->init(base_lm, acoustic, n_gpu_layers, /*use_gpu_backend=*/true)) {
+                std::string err = rt->last_error();
+                rt->free();
+                delete rt;
+                res_error(res, format_error_response("VoxCPM2 init failed: " + err, ERROR_TYPE_SERVER));
+                return;
+            }
+            ctx_server.voxcpm2_runtime = rt;
+        }
+
+        json ack = {
+            {"success", true},
+            {"base_lm", base_lm},
+            {"acoustic", acoustic},
+            {"sample_rate", ctx_server.voxcpm2_runtime->sample_rate()}
+        };
+        res_ok(res, ack);
+    };
+
+    const auto handle_voxcpm2_init = [&handle_voxcpm2_init_impl](const httplib::Request & req, httplib::Response & res) {
+        SRV_INF("%s: handle_voxcpm2_init\n", __func__);
+        json body = json::parse(req.body);
+        handle_voxcpm2_init_impl(body, res);
+    };
+
+    // POST /v1/audio/speech — OpenAI-compatible TTS endpoint
+    const auto handle_audio_speech_impl = [&ctx_server, &res_error, &voxcpm2_encode_wav, &voxcpm2_load_wav_from_memory](const json & data, httplib::Response & res) -> void {
+        // Parse request
+        std::string input = json_value(data, "input", std::string(""));
+        if (input.empty()) {
+            res_error(res, format_error_response("\"input\" is required", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::string model = json_value(data, "model", std::string(""));
+        if (!model.empty() && model != "voxcpm" && model != "voxcpm2") {
+            res_error(res, format_error_response("unknown model: \"" + model + "\", expected \"voxcpm\"", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::string response_format = json_value(data, "response_format", std::string("wav"));
+        if (response_format != "wav" && response_format != "pcm") {
+            res_error(res, format_error_response("supported response_format: wav, pcm", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Build generation params
+        VoxCPM2GenerateParams params;
+        params.seed                = json_value(data, "seed", 42);
+        params.cfg_value           = json_value(data, "cfg_value", 2.0f);
+        params.inference_timesteps = json_value(data, "inference_timesteps", 10);
+        params.max_steps           = json_value(data, "max_steps", 200);
+        params.temperature         = json_value(data, "temperature", 1.0f);
+
+        VoxCPM2Runtime * rt = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.voxcpm2_mutex);
+            rt = ctx_server.voxcpm2_runtime;
+        }
+        if (!rt || !rt->initialized()) {
+            res_error(res, format_error_response("VoxCPM2 not initialized. Call /v1/voxcpm2/init first or provide --voxcpm2-base-lm at startup.", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::vector<float> wav;
+        // Check for voice cloning (reference_audio as base64)
+        if (data.contains("reference_audio") && data.at("reference_audio").is_string()) {
+            std::string ref_b64 = data.at("reference_audio").get<std::string>();
+            if (!ref_b64.empty()) {
+                std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
+                int ref_sr = 0;
+                std::vector<float> ref_pcm = voxcpm2_load_wav_from_memory(ref_bytes, ref_sr);
+                if (ref_pcm.empty()) {
+                    res_error(res, format_error_response("Invalid reference_audio WAV data", ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                params.reference_sample_rate = ref_sr;
+                wav = rt->generate_with_clone(input, ref_pcm, params);
+            } else {
+                wav = rt->generate(input, params);
+            }
+        } else {
+            wav = rt->generate(input, params);
+        }
+
+        if (wav.empty()) {
+            res_error(res, format_error_response("VoxCPM2 generation failed: " + rt->last_error(), ERROR_TYPE_SERVER));
+            return;
+        }
+
+        int sr = rt->sample_rate();
+        if (response_format == "wav") {
+            std::string wav_data = voxcpm2_encode_wav(wav, sr);
+            res.set_content(wav_data, "audio/wav");
+        } else {
+            // PCM f32le
+            std::string pcm_data(wav.size() * sizeof(float), '\0');
+            memcpy(pcm_data.data(), wav.data(), wav.size() * sizeof(float));
+            res.set_content(pcm_data, "audio/pcm");
+        }
+    };
+
+    const auto handle_audio_speech = [&handle_audio_speech_impl](const httplib::Request & req, httplib::Response & res) {
+        SRV_INF("%s: handle_audio_speech\n", __func__);
+        json body = json::parse(req.body);
+        handle_audio_speech_impl(body, res);
+    };
+
+    // POST /v1/audio/speech/stream — Streaming TTS endpoint
+    const auto handle_audio_speech_stream_impl = [&ctx_server, &res_error, &voxcpm2_load_wav_from_memory](const json & data, httplib::Response & res) -> void {
+        std::string input = json_value(data, "input", std::string(""));
+        if (input.empty()) {
+            res_error(res, format_error_response("\"input\" is required", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        std::string model = json_value(data, "model", std::string(""));
+        if (!model.empty() && model != "voxcpm" && model != "voxcpm2") {
+            res_error(res, format_error_response("unknown model: \"" + model + "\", expected \"voxcpm\"", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        VoxCPM2GenerateParams params;
+        params.seed                = json_value(data, "seed", 42);
+        params.cfg_value           = json_value(data, "cfg_value", 2.0f);
+        params.inference_timesteps = json_value(data, "inference_timesteps", 10);
+        params.max_steps           = json_value(data, "max_steps", 200);
+        params.temperature         = json_value(data, "temperature", 1.0f);
+
+        VoxCPM2Runtime * rt = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.voxcpm2_mutex);
+            rt = ctx_server.voxcpm2_runtime;
+        }
+        if (!rt || !rt->initialized()) {
+            res_error(res, format_error_response("VoxCPM2 not initialized. Call /v1/voxcpm2/init first or provide --voxcpm2-base-lm at startup.", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        int sr = rt->sample_rate();
+
+        // Streaming response with chunked transfer
+        res.set_chunked_content_provider(
+            "audio/wav",
+            [rt, input, params, sr, &voxcpm2_load_wav_from_memory, &data]
+            (size_t /*offset*/, httplib::DataSink & sink) -> bool {
+                // Write WAV header first (with unknown data size)
+                {
+                    std::string header;
+                    header.resize(44);
+                    auto * p = header.data();
+                    auto w32 = [&](int32_t v) { memcpy(p, &v, 4); p += 4; };
+                    auto w16 = [&](int16_t v) { memcpy(p, &v, 2); p += 2; };
+                    memcpy(p, "RIFF", 4); p += 4; w32(0x7FFFFFFF); memcpy(p, "WAVE", 4); p += 4;
+                    memcpy(p, "fmt ", 4); p += 4; w32(16); w16(1); w16(1); w32(sr); w32(sr * 2); w16(2); w16(16);
+                    memcpy(p, "data", 4); p += 4; w32(0x7FFFFFFF);
+                    sink.write(header.data(), header.size());
+                }
+
+                // Use streaming generation with callback for voice cloning or standard
+                bool has_clone = data.contains("reference_audio") && data.at("reference_audio").is_string()
+                                 && !data.at("reference_audio").get<std::string>().empty();
+
+                auto chunk_callback = [&sink](const std::vector<float> & chunk, bool /*is_final*/) {
+                    if (chunk.empty()) return;
+                    // Convert float to int16 and send
+                    std::string buf(chunk.size() * 2, '\0');
+                    auto * dst = reinterpret_cast<int16_t *>(buf.data());
+                    for (size_t i = 0; i < chunk.size(); ++i) {
+                        float v = std::max(-1.0f, std::min(1.0f, chunk[i]));
+                        dst[i] = static_cast<int16_t>(v * 32767.0f);
+                    }
+                    sink.write(buf.data(), buf.size());
+                };
+
+                if (has_clone) {
+                    std::string ref_b64 = data.at("reference_audio").get<std::string>();
+                    std::vector<uint8_t> ref_bytes = base64_decode(ref_b64);
+                    int ref_sr = 0;
+                    std::vector<float> ref_pcm = voxcpm2_load_wav_from_memory(ref_bytes, ref_sr);
+                    if (ref_pcm.empty()) {
+                        return false;
+                    }
+                    auto p = params;
+                    p.reference_sample_rate = ref_sr;
+                    // generate_with_clone doesn't support streaming directly, so generate full then send chunks
+                    VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
+                    std::vector<float> wav = mutable_rt->generate_with_clone(input, ref_pcm, p);
+                    if (wav.empty()) return false;
+                    // Send in chunks
+                    const size_t chunk_size = sr / 10; // 100ms chunks
+                    for (size_t i = 0; i < wav.size(); i += chunk_size) {
+                        size_t len = std::min(chunk_size, wav.size() - i);
+                        std::vector<float> chunk(wav.begin() + i, wav.begin() + i + len);
+                        chunk_callback(chunk, false);
+                    }
+                } else {
+                    VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
+                    mutable_rt->generate_streaming(input, chunk_callback, params);
+                }
+
+                sink.done();
+                return true;
+            }
+        );
+    };
+
+    const auto handle_audio_speech_stream = [&handle_audio_speech_stream_impl](const httplib::Request & req, httplib::Response & res) {
+        SRV_INF("%s: handle_audio_speech_stream\n", __func__);
+        json body = json::parse(req.body);
+        handle_audio_speech_stream_impl(body, res);
+    };
+
+    // GET /v1/audio/speech/models — List available VoxCPM2 model info
+    const auto handle_audio_speech_models = [&ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
+        json models = json::array();
+        VoxCPM2Runtime * rt = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.voxcpm2_mutex);
+            rt = ctx_server.voxcpm2_runtime;
+        }
+        if (rt && rt->initialized()) {
+            models.push_back({
+                {"id", "voxcpm"},
+                {"object", "model"},
+                {"sample_rate", rt->sample_rate()},
+                {"feat_dim", rt->feat_dim()},
+                {"patch_size", rt->patch_size()}
+            });
+        }
+        json resp = {{"object", "list"}, {"data", models}};
+        res_ok(res, resp);
+    };
+
     //
     // Router
     //
@@ -6317,6 +6653,11 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/v1/stream/break",     handle_stream_break);
     svr->Post(params.api_prefix + "/v1/stream/reset",     handle_stream_reset);
     svr->Post(params.api_prefix + "/v1/stream/update_session_config", handle_stream_update_session_config);
+    // VoxCPM2 TTS
+    svr->Post(params.api_prefix + "/v1/voxcpm2/init",         handle_voxcpm2_init);
+    svr->Post(params.api_prefix + "/v1/audio/speech",         handle_audio_speech);
+    svr->Post(params.api_prefix + "/v1/audio/speech/stream",  handle_audio_speech_stream);
+    svr->Get (params.api_prefix + "/v1/audio/speech/models",  handle_audio_speech_models);
     // Save & load slots
     svr->Get (params.api_prefix + "/slots",               handle_slots);
     svr->Post(params.api_prefix + "/slots/:id_slot",      handle_slots_action);
@@ -6374,32 +6715,80 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: HTTP server is listening, hostname: %s, port: %d, http threads: %d\n", __func__, params.hostname.c_str(), params.port, params.n_threads_http);
 
     // load the model
-    LOG_INF("%s: loading model\n", __func__);
+    // Check if a real model was specified (not just the default path)
+    bool has_main_model = !params.model.path.empty();
+    if (has_main_model) {
+        // Verify the model file actually exists (the default path may not)
+        std::ifstream model_check(params.model.path, std::ios::binary);
+        if (!model_check.good()) {
+            if (!params.voxcpm2_base_lm.empty() && !params.voxcpm2_acoustic.empty()) {
+                has_main_model = false;  // VoxCPM2-only mode, skip missing default model
+            }
+        }
+    }
+    bool has_voxcpm2 = !params.voxcpm2_base_lm.empty() && !params.voxcpm2_acoustic.empty();
 
-    if (!ctx_server.load_model(params)) {
+    if (has_main_model) {
+        LOG_INF("%s: loading model\n", __func__);
+
+        if (!ctx_server.load_model(params)) {
+            clean_up();
+            t.join();
+            LOG_ERR("%s: exiting due to model loading error\n", __func__);
+            return 1;
+        }
+
+        ctx_server.init();
+
+        LOG_INF("%s: model loaded\n", __func__);
+
+        // print sample chat example to make it clear which template is used
+        LOG_INF("%s: chat template, chat_template: %s, example_format: '%s'\n", __func__,
+            common_chat_templates_source(ctx_server.chat_templates.get()),
+            common_chat_format_example(ctx_server.chat_templates.get(), ctx_server.params_base.use_jinja, ctx_server.params_base.default_template_kwargs).c_str());
+    } else if (has_voxcpm2) {
+        LOG_INF("%s: no main LLM model provided, starting in VoxCPM2-only mode\n", __func__);
+    } else {
+        LOG_ERR("%s: no model specified. Provide --model for LLM or --voxcpm2-base-lm + --voxcpm2-acoustic for TTS\n", __func__);
         clean_up();
         t.join();
-        LOG_ERR("%s: exiting due to model loading error\n", __func__);
         return 1;
     }
 
-    ctx_server.init();
+    // Pre-load VoxCPM2 if CLI args provided
+    if (has_voxcpm2) {
+        LOG_INF("%s: loading VoxCPM2 runtime\n", __func__);
+        LOG_INF("%s:   BaseLM:   %s\n", __func__, params.voxcpm2_base_lm.c_str());
+        LOG_INF("%s:   Acoustic: %s\n", __func__, params.voxcpm2_acoustic.c_str());
+
+        auto * rt = new VoxCPM2Runtime();
+        if (!rt->init(params.voxcpm2_base_lm, params.voxcpm2_acoustic, params.voxcpm2_n_gpu_layers, true)) {
+            LOG_ERR("%s: VoxCPM2 init failed: %s\n", __func__, rt->last_error().c_str());
+            rt->free();
+            delete rt;
+            if (!has_main_model) {
+                clean_up();
+                t.join();
+                return 1;
+            }
+            // Continue without VoxCPM2 if main model is loaded
+        } else {
+            ctx_server.voxcpm2_runtime = rt;
+            LOG_INF("%s: VoxCPM2 loaded, sample_rate=%d\n", __func__, rt->sample_rate());
+        }
+    }
+
     state.store(SERVER_STATE_READY);
 
-    LOG_INF("%s: model loaded\n", __func__);
+    if (has_main_model) {
+        ctx_server.queue_tasks.on_new_task([&ctx_server](server_task && task) {
+            ctx_server.process_single_task(std::move(task));
+        });
 
-    // print sample chat example to make it clear which template is used
-    LOG_INF("%s: chat template, chat_template: %s, example_format: '%s'\n", __func__,
-        common_chat_templates_source(ctx_server.chat_templates.get()),
-        common_chat_format_example(ctx_server.chat_templates.get(), ctx_server.params_base.use_jinja, ctx_server.params_base.default_template_kwargs).c_str());
-
-    ctx_server.queue_tasks.on_new_task([&ctx_server](server_task && task) {
-        ctx_server.process_single_task(std::move(task));
-    });
-
-    ctx_server.queue_tasks.on_update_slots([&ctx_server]() {
-        ctx_server.update_slots();
-    });
+        ctx_server.queue_tasks.on_update_slots([&ctx_server]() {
+            ctx_server.update_slots();
+        });
+    }
 
     shutdown_handler = [&](int) {
         // this will unblock start_loop()
@@ -6424,8 +6813,16 @@ int main(int argc, char ** argv) {
             is_sock ? string_format("unix://%s",    params.hostname.c_str()).c_str() :
                       string_format("http://%s:%d", params.hostname.c_str(), params.port).c_str());
 
-    // this call blocks the main thread until queue_tasks.terminate() is called
-    ctx_server.queue_tasks.start_loop();
+    if (has_main_model) {
+        // this call blocks the main thread until queue_tasks.terminate() is called
+        ctx_server.queue_tasks.start_loop();
+    } else {
+        // VoxCPM2-only mode: block until shutdown signal
+        LOG_INF("%s: VoxCPM2-only mode, waiting for shutdown signal\n", __func__);
+        while (ctx_server.queue_tasks.running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
 
     clean_up();
     t.join();
