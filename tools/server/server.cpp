@@ -2029,7 +2029,7 @@ struct server_metrics {
 
 struct server_queue {
     int id = 0;
-    bool running;
+    bool running = true;
 
     // queues
     std::deque<server_task> queue_tasks;
@@ -6495,7 +6495,7 @@ int main(int argc, char ** argv) {
         res.set_chunked_content_provider(
             "audio/wav",
             [rt, input, params, sr, &voxcpm2_load_wav_from_memory, &data]
-            (size_t /*offset*/, httplib::DataSink & sink) -> bool {
+            (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                 // Write WAV header first (with unknown data size)
                 {
                     std::string header;
@@ -6536,8 +6536,7 @@ int main(int argc, char ** argv) {
                     auto p = params;
                     p.reference_sample_rate = ref_sr;
                     // generate_with_clone doesn't support streaming directly, so generate full then send chunks
-                    VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
-                    std::vector<float> wav = mutable_rt->generate_with_clone(input, ref_pcm, p);
+                    std::vector<float> wav = rt->generate_with_clone(input, ref_pcm, p);
                     if (wav.empty()) return false;
                     // Send in chunks
                     const size_t chunk_size = sr / 10; // 100ms chunks
@@ -6547,8 +6546,7 @@ int main(int argc, char ** argv) {
                         chunk_callback(chunk, false);
                     }
                 } else {
-                    VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
-                    mutable_rt->generate_streaming(input, chunk_callback, params);
+                    rt->generate_streaming(input, chunk_callback, params);
                 }
 
                 sink.done();
