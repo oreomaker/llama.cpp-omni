@@ -33,6 +33,8 @@ if(ENABLE_COREML)
         coreml/omni_coreml.mm
         coreml/coreml_minicpmo45_vit_all_f16.h
         coreml/coreml_minicpmo45_vit_all_f16.m
+        coreml/coreml_t2w_dit.h
+        coreml/coreml_t2w_dit.mm
     )
     # Define compile-time macro for code guards
     target_compile_definitions(omni PRIVATE ENABLE_COREML)
@@ -40,9 +42,10 @@ if(ENABLE_COREML)
     # Enable ARC for Objective-C files
     set_source_files_properties(coreml/omni_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     set_source_files_properties(coreml/coreml_minicpmo45_vit_all_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(coreml/coreml_t2w_dit.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
-target_link_libraries     (omni PUBLIC ggml llama common)
+target_link_libraries     (omni PUBLIC ggml llama llama-common)
 target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
@@ -79,7 +82,7 @@ set(OMNI_PUBLIC_HEADERS
 
 set_target_properties(omni
     PROPERTIES
-    PUBLIC_HEADER "${MTMD_PUBLIC_HEADERS}")
+    PUBLIC_HEADER "${OMNI_PUBLIC_HEADERS}")
 
 install(TARGETS omni LIBRARY PUBLIC_HEADER)
 
@@ -98,21 +101,21 @@ set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-omni-cli)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
-target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
+target_link_libraries  (${TARGET} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 # 单工模式 - 纯音频测试（批量 prefill + 单次 decode）
 set(TARGET_SINGLE_TEST_AUDIO llama-omni-single-test-audio)
 add_executable         (${TARGET_SINGLE_TEST_AUDIO} test/single_test_audio.cpp)
 set_target_properties  (${TARGET_SINGLE_TEST_AUDIO} PROPERTIES OUTPUT_NAME llama-omni-single-test-audio)
-target_link_libraries  (${TARGET_SINGLE_TEST_AUDIO} PRIVATE common omni Threads::Threads)
+target_link_libraries  (${TARGET_SINGLE_TEST_AUDIO} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_SINGLE_TEST_AUDIO} PRIVATE cxx_std_17)
 
 # 单工模式 - Omni (audio+vision) 测试
 set(TARGET_SINGLE_TEST_OMNI llama-omni-single-test-omni)
 add_executable         (${TARGET_SINGLE_TEST_OMNI} test/single_test_omni.cpp)
 set_target_properties  (${TARGET_SINGLE_TEST_OMNI} PROPERTIES OUTPUT_NAME llama-omni-single-test-omni)
-target_link_libraries  (${TARGET_SINGLE_TEST_OMNI} PRIVATE common omni Threads::Threads)
+target_link_libraries  (${TARGET_SINGLE_TEST_OMNI} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_SINGLE_TEST_OMNI} PRIVATE cxx_std_17)
 
 # VoxCPM2 MiniCPMLM wrapper (shared with omni and test)
@@ -120,7 +123,7 @@ add_library(voxcpm2_llm STATIC
     voxcpm2/voxcpm2_llm.cpp
     voxcpm2/voxcpm2_llm.h
 )
-target_link_libraries     (voxcpm2_llm PUBLIC llama common)
+target_link_libraries     (voxcpm2_llm PUBLIC llama llama-common)
 target_include_directories(voxcpm2_llm PUBLIC  . voxcpm2)
 target_include_directories(voxcpm2_llm PRIVATE ../..)
 target_compile_features   (voxcpm2_llm PRIVATE cxx_std_17)
@@ -130,7 +133,7 @@ add_library(voxcpm2_fsq STATIC
     voxcpm2/voxcpm2_fsq.cpp
     voxcpm2/voxcpm2_fsq.h
 )
-target_link_libraries     (voxcpm2_fsq PUBLIC ggml common)
+target_link_libraries     (voxcpm2_fsq PUBLIC ggml llama-common)
 target_include_directories(voxcpm2_fsq PUBLIC  . voxcpm2)
 target_include_directories(voxcpm2_fsq PRIVATE ../..)
 target_compile_features   (voxcpm2_fsq PRIVATE cxx_std_17)
@@ -150,7 +153,7 @@ add_library(voxcpm2_acoustic STATIC
     voxcpm2/voxcpm2_audiovae.cpp
     voxcpm2/voxcpm2_audiovae.h
 )
-target_link_libraries     (voxcpm2_acoustic PUBLIC ggml common)
+target_link_libraries     (voxcpm2_acoustic PUBLIC ggml llama-common)
 target_include_directories(voxcpm2_acoustic PUBLIC  . voxcpm2)
 target_include_directories(voxcpm2_acoustic PRIVATE ../..)
 target_compile_features   (voxcpm2_acoustic PRIVATE cxx_std_17)
@@ -160,7 +163,7 @@ add_library(voxcpm2_runtime STATIC
     voxcpm2/voxcpm2_runtime.cpp
     voxcpm2/voxcpm2_runtime.h
 )
-target_link_libraries     (voxcpm2_runtime PUBLIC voxcpm2_llm voxcpm2_fsq voxcpm2_acoustic llama ggml common)
+target_link_libraries     (voxcpm2_runtime PUBLIC voxcpm2_llm voxcpm2_fsq voxcpm2_acoustic llama ggml llama-common)
 target_include_directories(voxcpm2_runtime PUBLIC  . voxcpm2)
 target_include_directories(voxcpm2_runtime PRIVATE ../..)
 target_compile_features   (voxcpm2_runtime PRIVATE cxx_std_17)
@@ -169,21 +172,37 @@ target_compile_features   (voxcpm2_runtime PRIVATE cxx_std_17)
 set(TARGET_DUPLEX_TEST llama-omni-test-duplex)
 add_executable         (${TARGET_DUPLEX_TEST} test/test-duplex.cpp)
 set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-duplex)
-target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
+target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
 # Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
 add_executable(token2wav-example token2wav/token2wav-example.cpp)
-target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
+target_link_libraries(token2wav-example PRIVATE llama-common omni Threads::Threads)
 target_compile_features(token2wav-example PRIVATE cxx_std_17)
 
 # VoxCPM2 CLI demo
 set(TARGET_VOXCPM2_CLI voxcpm2-cli)
 add_executable         (${TARGET_VOXCPM2_CLI} voxcpm2/voxcpm2_cli.cpp)
 set_target_properties  (${TARGET_VOXCPM2_CLI} PROPERTIES OUTPUT_NAME voxcpm2-cli)
-target_link_libraries  (${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2_runtime common ggml Threads::Threads)
+target_link_libraries  (${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2_runtime llama-common ggml Threads::Threads)
 target_include_directories(${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2)
 target_compile_features(${TARGET_VOXCPM2_CLI} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET_VOXCPM2_CLI} RUNTIME)
+endif()
+
+# Token2Mel-DiT CoreML 单元测试（仅 macOS + CoreML enable 时有效）
+if(ENABLE_COREML)
+    set(TARGET_T2W_DIT_ANE_TEST llama-omni-test-t2w-dit-ane)
+    add_executable         (${TARGET_T2W_DIT_ANE_TEST} test/test_t2w_dit_ane.cpp)
+    set_target_properties  (${TARGET_T2W_DIT_ANE_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-dit-ane)
+    target_link_libraries  (${TARGET_T2W_DIT_ANE_TEST} PRIVATE llama-common omni Threads::Threads)
+    target_compile_features(${TARGET_T2W_DIT_ANE_TEST} PRIVATE cxx_std_17)
+
+    # CoreML 端到端 test：用真实 prompt + 真实 mu 跑完整 5-step ODE × N chunks
+    set(TARGET_T2W_ANE_E2E llama-omni-test-t2w-ane-end2end)
+    add_executable         (${TARGET_T2W_ANE_E2E} test/test_t2w_ane_end2end.cpp)
+    set_target_properties  (${TARGET_T2W_ANE_E2E} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-ane-end2end)
+    target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE llama-common omni Threads::Threads)
+    target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
 endif()

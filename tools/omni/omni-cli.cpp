@@ -1,5 +1,6 @@
 #include "omni-impl.h"
 #include "omni.h"
+#include "vision.h"
 
 #include "arg.h"
 #include "log.h"
@@ -11,6 +12,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <thread>
 #include <vector>
 #include <limits.h>
 #include <cinttypes>
@@ -65,7 +67,12 @@ static void show_usage(const char * prog_name) {
         "  --omni              Enable omni mode (audio + vision, media_type=2)\n"
         "  --vision-backend <mode>  Vision compute backend: 'metal' (default) or 'coreml' (ANE)\n"
         "  --vision-coreml <path>   Path to CoreML model (.mlmodelc), required when backend=coreml\n"
+        "  --t2w-coreml <path>  Enable token2wav CoreML backend (DiT on CoreML, encoder on GPU)\n"
+        "                        Use 'auto' to auto-discover CoreML model in model dir\n"
+        "  --vision-batch-encode  Enable batched encoding of same-size vision slices\n"
+        "                          (off by default; helps large / high-res / high-refresh images)\n"
         "  --test <prefix> <n> Run test case with data prefix and count\n"
+        "  --bench-vision <img> Benchmark serial vs batched vision encoding\n"
         "  -h, --help          Show this help message\n\n"
         "Example:\n"
         "  %s -m ./models/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf\n"
@@ -206,12 +213,15 @@ int main(int argc, char ** argv) {
     std::string projector_path_override;
     std::string vision_backend = "metal";  // vision backend: "metal" (default) or "coreml"
     std::string vision_coreml_model_path;  // CoreML model path (required when vision_backend=coreml)
+    std::string token2wav_coreml_model_path; // CoreML model path for token2wav DiT (empty = GPU only)
     std::string ref_audio_path = "tools/omni/assets/default_ref_audio/default_ref_audio.wav";
+    std::string bench_vision_image;
     int n_ctx = 4096;
     int n_gpu_layers = 99;  // GPU 层数，默认 99
     int media_type = 1;     // 1=audio only, 2=omni (audio+vision)
     bool use_tts = true;
     bool run_test = false;
+    bool vision_batch_encode = false;  // 多 slice 批量编码优化（默认关闭）
     std::string test_audio_prefix;
     int test_count = 0;
     
@@ -263,10 +273,19 @@ int main(int argc, char ** argv) {
         else if (arg == "--vision-coreml" && i + 1 < argc) {
             vision_coreml_model_path = argv[++i];
         }
+        else if (arg == "--t2w-coreml" && i + 1 < argc) {
+            token2wav_coreml_model_path = argv[++i];
+        }
+        else if (arg == "--vision-batch-encode") {
+            vision_batch_encode = true;
+        }
         else if (arg == "--test" && i + 2 < argc) {
             run_test = true;
             test_audio_prefix = argv[++i];
             test_count = std::atoi(argv[++i]);
+        }
+        else if (arg == "--bench-vision" && i + 1 < argc) {
+            bench_vision_image = argv[++i];
         }
         else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -275,6 +294,31 @@ int main(int argc, char ** argv) {
         }
     }
     
+    // vision-only benchmark: only needs vision model, skip full init
+    if (!bench_vision_image.empty()) {
+        if (llm_path.empty()) {
+            fprintf(stderr, "Error: -m <llm_model_path> is required (for auto-detecting vision model path)\n");
+            return 1;
+        }
+        OmniModelPaths paths = resolve_model_paths(llm_path);
+        if (!vision_path_override.empty()) paths.vision = vision_path_override;
+        printf("Vision model: %s\n", paths.vision.c_str());
+        printf("Benchmark image: %s\n", bench_vision_image.c_str());
+
+        vision_context_params vparams;
+        vparams.use_gpu = true;
+        vparams.verbosity = GGML_LOG_LEVEL_INFO;
+        vparams.coreml_model_path = nullptr;
+        struct vision_ctx * ctx_v = vision_init(paths.vision.c_str(), vparams);
+        if (!ctx_v) {
+            fprintf(stderr, "Error: failed to init vision model\n");
+            return 1;
+        }
+        omni_bench_vision(ctx_v, 4, bench_vision_image.c_str());
+        vision_free(ctx_v);
+        return 0;
+    }
+
     // 检查必需参数
     if (llm_path.empty()) {
         fprintf(stderr, "Error: -m <llm_model_path> is required\n\n");
@@ -321,6 +365,8 @@ int main(int argc, char ** argv) {
         }
         params.vision_coreml_model_path = vision_coreml_model_path;
     }
+    params.token2wav_coreml_model_path = token2wav_coreml_model_path;
+    params.vpm_batch_encode = vision_batch_encode;
     params.n_ctx = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
     
@@ -340,11 +386,15 @@ int main(int argc, char ** argv) {
     printf("  Context size: %d\n", n_ctx);
     printf("  GPU layers: %d\n", n_gpu_layers);
     printf("  Vision backend: %s\n", vision_backend.c_str());
+    printf("  Vision batch encode: %s\n", vision_batch_encode ? "enabled" : "disabled");
     if (vision_backend == "coreml") {
         printf("  Vision CoreML: %s\n", vision_coreml_model_path.c_str());
     }
     printf("  TTS bin dir: %s\n", tts_bin_dir.c_str());
     printf("  Ref audio: %s\n", ref_audio_path.c_str());
+    if (!params.token2wav_coreml_model_path.empty()) {
+        printf("  T2W CoreML: %s\n", params.token2wav_coreml_model_path.c_str());
+    }
     
     // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
@@ -372,7 +422,7 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < 1200; ++i) {  // 最多等 120 秒
             FILE * f = fopen(done_flag.c_str(), "r");
             if (f) { fclose(f); fprintf(stderr, "Audio generation completed.\n"); break; }
-            usleep(100000);  // 100ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 
