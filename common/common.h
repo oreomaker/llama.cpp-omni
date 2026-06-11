@@ -578,7 +578,6 @@ struct common_params {
     std::string vpm_model                = ""; // vision encoder GGUF
     std::string projector_model          = ""; // projector GGUF
     bool vpm_batch_encode                = false; // batch-encode same-size vision slices (off by default; helps large/high-res images)
-
     // VoxCPM2 TTS
     std::string voxcpm2_base_lm      = ""; // VoxCPM2 BaseLM GGUF path
     std::string voxcpm2_acoustic     = ""; // VoxCPM2 Acoustic GGUF path
