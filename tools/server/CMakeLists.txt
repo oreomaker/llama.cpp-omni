@@ -79,13 +79,13 @@ target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
 target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
 
-# llama-voxcpm2-server executable (standalone VoxCPM2 TTS HTTP API)
+# llama-tts-server executable (standalone VoxCPM2 TTS HTTP API)
 
 if (LLAMA_OPENSSL)
     find_package(OpenSSL)
 endif()
 
-set(TARGET_VOXCPM2 llama-voxcpm2-server)
+set(TARGET_VOXCPM2 llama-tts-server)
 
 add_executable(${TARGET_VOXCPM2} server-voxcpm2.cpp)
 install(TARGETS ${TARGET_VOXCPM2} RUNTIME)

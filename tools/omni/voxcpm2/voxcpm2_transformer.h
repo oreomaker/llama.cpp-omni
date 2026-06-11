@@ -173,6 +173,15 @@ ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                   
                                                int                               position,
                                                VoxCPM2KVCache &                  kv_cache);
 
+// Same as forward_step but accepts a pre-built positions input tensor (for graph caching).
+// positions must be a 1-element I32 tensor set as a graph input (ggml_set_input).
+ggml_tensor * voxcpm2_transformer_forward_step_cached(ggml_context *                    ctx,
+                                                      const VoxCPM2TransformerConfig &  cfg,
+                                                      const VoxCPM2TransformerWeights & weights,
+                                                      ggml_tensor *                     input,
+                                                      ggml_tensor *                     positions,
+                                                      VoxCPM2KVCache &                  kv_cache);
+
 // Multi-token prefill with KV cache (populates cache positions 0..n_tokens-1).
 ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                    ctx,
                                                   const VoxCPM2TransformerConfig &  cfg,

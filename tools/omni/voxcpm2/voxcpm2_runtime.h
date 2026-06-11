@@ -93,6 +93,18 @@ struct VoxCPM2ResidualLM {
     std::vector<float> forward_step(const std::vector<float> & input_1d, int position);
     void               clear_kv();
     void               free();
+
+private:
+    // Cached graph for forward_step (single-token decode, fixed shape)
+    struct CachedStepGraph {
+        ggml_context * ctx    = nullptr;
+        ggml_cgraph *  graph  = nullptr;
+        ggml_gallocr_t galloc = nullptr;
+        ggml_tensor *  input  = nullptr;
+        ggml_tensor *  output = nullptr;
+
+        void free_graph();
+    } cached_step_graph;
 };
 
 struct VoxCPM2Runtime {
@@ -208,6 +220,21 @@ struct VoxCPM2Runtime {
 
         void free_graph();
     } cached_front_half;
+
+    // Cached graphs for per-decode-step operations (single-token, fixed shape).
+    // Reused across decode steps to avoid repeated CUDA graph capture.
+    struct CachedStepGraph {
+        ggml_context * ctx       = nullptr;
+        ggml_cgraph *  graph     = nullptr;
+        ggml_gallocr_t galloc    = nullptr;
+        ggml_tensor *  input_a   = nullptr;
+        ggml_tensor *  input_b   = nullptr;  // optional second input (residual fusion)
+        ggml_tensor *  output   = nullptr;
+
+        void free_graph();
+    };
+    CachedStepGraph cached_fsq_graph;
+    CachedStepGraph cached_fusion_graph;
 
     bool fail(const std::string & message);
     void clear_error();

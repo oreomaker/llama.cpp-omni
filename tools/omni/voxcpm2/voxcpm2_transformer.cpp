@@ -896,6 +896,44 @@ static ggml_tensor * attention_forward_kv(ggml_context *                        
 
 }  // namespace
 
+ggml_tensor * voxcpm2_transformer_forward_step_cached(ggml_context *                    ctx,
+                                                      const VoxCPM2TransformerConfig &  cfg,
+                                                      const VoxCPM2TransformerWeights & weights,
+                                                      ggml_tensor *                     input,
+                                                      ggml_tensor *                     positions,
+                                                      VoxCPM2KVCache &                  kv_cache) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(input != nullptr);
+    GGML_ASSERT(positions != nullptr);
+    GGML_ASSERT(positions->flags & GGML_TENSOR_FLAG_INPUT);
+
+    ggml_tensor * hidden = input;
+    if (ggml_n_dims(hidden) == 1) {
+        hidden = ggml_reshape_2d(ctx, hidden, hidden->ne[0], 1);
+    }
+
+    // Use a dummy n_past value for graph structure (>=1 triggers KV cache concat path).
+    // The actual KV cache contents are set at compute time; n_past only affects graph topology.
+    const int dummy_n_past = 1;
+
+    for (int i = 0; i < cfg.n_layer; ++i) {
+        const VoxCPM2TransformerLayerWeights & lw = weights.layers[static_cast<size_t>(i)];
+
+        ggml_tensor * residual = hidden;
+        ggml_tensor * normed   = rms_norm(ctx, hidden, lw.attn_norm, cfg.rms_norm_eps);
+        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, 1, dummy_n_past, kv_cache);
+        hidden                 = ggml_add(ctx, residual, attn_out);
+
+        residual              = hidden;
+        normed                = rms_norm(ctx, hidden, lw.ffn_norm, cfg.rms_norm_eps);
+        ggml_tensor * mlp_out = mlp_forward(ctx, normed, lw);
+        hidden                = ggml_add(ctx, residual, mlp_out);
+    }
+
+    hidden = rms_norm(ctx, hidden, weights.norm, cfg.rms_norm_eps);
+    return ggml_reshape_1d(ctx, hidden, hidden->ne[0]);
+}
+
 ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                    ctx,
                                                const VoxCPM2TransformerConfig &  cfg,
                                                const VoxCPM2TransformerWeights & weights,

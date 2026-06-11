@@ -572,11 +572,26 @@ void VoxCPM2ResidualLM::clear_kv() {
 }
 
 void VoxCPM2ResidualLM::free() {
+    cached_step_graph.free_graph();
     kv_cache.free();
     store.reset();
     weights = {};
     config  = {};
     backend = nullptr;
+}
+
+void VoxCPM2ResidualLM::CachedStepGraph::free_graph() {
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+        galloc = nullptr;
+    }
+    if (ctx) {
+        ggml_free(ctx);
+        ctx = nullptr;
+    }
+    graph  = nullptr;
+    input  = nullptr;
+    output = nullptr;
 }
 
 void VoxCPM2Runtime::CachedDecodeFrontHalfGraph::free_graph() {
@@ -598,6 +613,21 @@ void VoxCPM2Runtime::CachedDecodeFrontHalfGraph::free_graph() {
     stop_output      = nullptr;
     cached_timesteps = 0;
     cached_cfg       = 0.0f;
+}
+
+void VoxCPM2Runtime::CachedStepGraph::free_graph() {
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+        galloc = nullptr;
+    }
+    if (ctx) {
+        ggml_free(ctx);
+        ctx = nullptr;
+    }
+    graph   = nullptr;
+    input_a = nullptr;
+    input_b = nullptr;
+    output  = nullptr;
 }
 
 VoxCPM2Runtime::VoxCPM2Runtime() : rng(0) {}
@@ -1007,6 +1037,43 @@ std::vector<float> VoxCPM2Runtime::run_enc_to_lm(const std::vector<float> & loce
 }
 
 std::vector<float> VoxCPM2Runtime::run_fsq(const std::vector<float> & input_vec, int seq_len) {
+    // For single-token decode (seq_len=1), use cached graph to avoid repeated CUDA graph capture
+    if (seq_len == 1) {
+        if (!cached_fsq_graph.graph) {
+            ggml_init_params ctx_params{};
+            ctx_params.mem_size   = kSmallGraphMem;
+            ctx_params.mem_buffer = nullptr;
+            ctx_params.no_alloc   = true;
+            cached_fsq_graph.ctx = ggml_init(ctx_params);
+            if (!cached_fsq_graph.ctx) {
+                return {};
+            }
+
+            ggml_context * ctx       = cached_fsq_graph.ctx;
+            cached_fsq_graph.input_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, fsq.config.hidden_size, 1);
+            ggml_set_input(cached_fsq_graph.input_a);
+            cached_fsq_graph.output  = fsq.forward(ctx, cached_fsq_graph.input_a);
+            cached_fsq_graph.graph   = ggml_new_graph_custom(ctx, kMediumGraphNodes, false);
+            ggml_set_output(cached_fsq_graph.output);
+            ggml_build_forward_expand(cached_fsq_graph.graph, cached_fsq_graph.output);
+
+            cached_fsq_graph.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!cached_fsq_graph.galloc || !ggml_gallocr_reserve(cached_fsq_graph.galloc, cached_fsq_graph.graph)) {
+                cached_fsq_graph.free_graph();
+                return {};
+            }
+        }
+
+        if (!ggml_gallocr_alloc_graph(cached_fsq_graph.galloc, cached_fsq_graph.graph)) {
+            return {};
+        }
+        ggml_backend_tensor_set(cached_fsq_graph.input_a, input_vec.data(), 0, input_vec.size() * sizeof(float));
+        if (ggml_backend_graph_compute(backend, cached_fsq_graph.graph) != GGML_STATUS_SUCCESS) {
+            return {};
+        }
+        return tensor_to_vector(cached_fsq_graph.output);
+    }
+
     GgmlContextGuard ctx_guard(kSmallGraphMem, true);
     ggml_context *   ctx = ctx_guard.get();
     if (!ctx) {
@@ -1036,6 +1103,47 @@ std::vector<float> VoxCPM2Runtime::run_fsq(const std::vector<float> & input_vec,
 std::vector<float> VoxCPM2Runtime::run_residual_fusion(const std::vector<float> & blended,
                                                        const std::vector<float> & feat_embed,
                                                        int                        seq_len) {
+    // For single-token decode (seq_len=1), use cached graph to avoid repeated CUDA graph capture
+    if (seq_len == 1) {
+        if (!cached_fusion_graph.graph) {
+            ggml_init_params ctx_params{};
+            ctx_params.mem_size   = kSmallGraphMem;
+            ctx_params.mem_buffer = nullptr;
+            ctx_params.no_alloc   = true;
+            cached_fusion_graph.ctx = ggml_init(ctx_params);
+            if (!cached_fusion_graph.ctx) {
+                return {};
+            }
+
+            ggml_context * ctx          = cached_fusion_graph.ctx;
+            cached_fusion_graph.input_a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projections.config.lm_hidden_size, 1);
+            cached_fusion_graph.input_b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projections.config.lm_hidden_size, 1);
+            ggml_set_input(cached_fusion_graph.input_a);
+            ggml_set_input(cached_fusion_graph.input_b);
+            cached_fusion_graph.output   = projections.build_residual_fusion(ctx, cached_fusion_graph.input_a,
+                                                                             cached_fusion_graph.input_b);
+            cached_fusion_graph.graph    = ggml_new_graph_custom(ctx, kSmallGraphNodes, false);
+            ggml_set_output(cached_fusion_graph.output);
+            ggml_build_forward_expand(cached_fusion_graph.graph, cached_fusion_graph.output);
+
+            cached_fusion_graph.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!cached_fusion_graph.galloc || !ggml_gallocr_reserve(cached_fusion_graph.galloc, cached_fusion_graph.graph)) {
+                cached_fusion_graph.free_graph();
+                return {};
+            }
+        }
+
+        if (!ggml_gallocr_alloc_graph(cached_fusion_graph.galloc, cached_fusion_graph.graph)) {
+            return {};
+        }
+        ggml_backend_tensor_set(cached_fusion_graph.input_a, blended.data(), 0, blended.size() * sizeof(float));
+        ggml_backend_tensor_set(cached_fusion_graph.input_b, feat_embed.data(), 0, feat_embed.size() * sizeof(float));
+        if (ggml_backend_graph_compute(backend, cached_fusion_graph.graph) != GGML_STATUS_SUCCESS) {
+            return {};
+        }
+        return tensor_to_vector(cached_fusion_graph.output);
+    }
+
     GgmlContextGuard ctx_guard(kSmallGraphMem, true);
     ggml_context *   ctx = ctx_guard.get();
     if (!ctx) {
@@ -1714,6 +1822,8 @@ bool VoxCPM2Runtime::generate_streaming(const std::string &               text,
 
 void VoxCPM2Runtime::free() {
     cached_front_half.free_graph();
+    cached_fsq_graph.free_graph();
+    cached_fusion_graph.free_graph();
     reset_state();
     audio_vae.free();
     stop_predictor.free();
