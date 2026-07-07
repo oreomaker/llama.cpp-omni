@@ -247,7 +247,8 @@ static OmniTokenType get_token_type(struct omni_context * ctx, llama_token token
 }
 
 // 检查是否是会话/轮次结束 token
-static bool is_end_token(struct omni_context * ctx, llama_token token) {
+// [think-speak] 非 static：think_speak.cpp 复用（声明在 omni.h）。
+bool is_end_token(struct omni_context * ctx, llama_token token) {
     OmniTokenType type = get_token_type(ctx, token);
     
     if (ctx->duplex_mode) {
@@ -1276,7 +1277,14 @@ static bool eval_id_with_hidden(struct omni_context * ctx_omni, common_params* p
     return eval_tokens_with_hidden(ctx_omni, params, tokens, 1, n_past, hidden_states);
 }
 
-static bool eval_string(struct omni_context * ctx_omni, common_params* params, const char* str, int n_batch, int * n_past, bool add_bos, bool get_emb = false) {
+// [think-speak] 定义保留在 omni.cpp（去 static，声明在 omni.h）；此处 get_emb 默认实参已移至头文件。
+bool eval_string(struct omni_context * ctx_omni,
+                 common_params *       params,
+                 const char *          str,
+                 int                   n_batch,
+                 int *                 n_past,
+                 bool                  add_bos,
+                 bool                  get_emb) {
     std::string              str2     = str;
     std::vector<llama_token> embd_inp = common_tokenize(ctx_omni->ctx_llama, str2, add_bos, true);
     return eval_tokens(ctx_omni, params, embd_inp, n_batch, n_past, get_emb);
@@ -1396,7 +1404,13 @@ static const char * llama_loop_with_hidden(struct omni_context * ctx_omni, commo
 }
 
 // 新增：返回token ID的版本
-static const char * llama_loop_with_hidden_and_token(struct omni_context * ctx_omni, common_params *params, struct common_sampler * smpl, int &n_past, float *& hidden_states, llama_token & token_id) {
+// [think-speak] 非 static：think_speak.cpp 复用采样原语（声明在 omni.h）。
+const char * llama_loop_with_hidden_and_token(struct omni_context *   ctx_omni,
+                                              common_params *         params,
+                                              struct common_sampler * smpl,
+                                              int &                   n_past,
+                                              float *&                hidden_states,
+                                              llama_token &           token_id) {
     const char * tmp = sample_with_hidden_and_token(smpl, ctx_omni, params, &n_past, hidden_states, token_id);
     return tmp;
 }
@@ -4012,10 +4026,34 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     return model;
 }
 
-struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
-                                int tts_gpu_layers, const std::string & token2wav_device, bool duplex_mode,
-                                llama_model * existing_model, llama_context * existing_ctx,
-                                const std::string & base_output_dir) {
+// 🔧 [think-speak / M1] 安装纯文本 system prompt 变体（无声纹音频段）。
+// index=0 prefill 的 no-audio 分支（stream_prefill）会顺序注入 voice_clone_prompt + assistant_prompt，拼成：
+//   <|im_start|>system\n{TRAIN_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n
+// 之后 user 问题（index>=1, stream_prefill(text=...)）与 assistant think-bos 前缀（decode 侧, P3）续接。
+// 对齐 CTRL build_system_content 的 TRAIN_SYSTEM_PROMPT（system_prompt_prefix="" 且无 ref audio 的退化配置）。
+// TODO(M2/P5 统一整理): 这是 M1 临时形态。最终按 ctx->use_tts 分叉，与 omni_init 其它路径保持一致：
+//   use_tts 时改用声纹槽变体（<|im_start|>system\n{SYSTEM_VOICE_CLONE_PREFIX}<|audio_start|>...<|audio_end|>{SYSTEM_VOICE_CLONE_SUFFIX}<|im_end|>\n<|im_start|>user\n），
+//   复用 simplex 同款 <|audio_start|>/<|audio_end|> 约定 → 流经 stream_prefill 同一 audio-embed 分支（仅扩展、不重写）。
+static void apply_think_speak_prompts(struct omni_context * ctx_omni) {
+    const std::string sys_prefix       = std::string("<|im_start|>system\n") + think_speak::TRAIN_SYSTEM_PROMPT;
+    const std::string sys_suffix       = "<|im_end|>\n<|im_start|>user\n";
+    ctx_omni->audio_voice_clone_prompt = sys_prefix;
+    ctx_omni->audio_assistant_prompt   = sys_suffix;
+    ctx_omni->omni_voice_clone_prompt  = sys_prefix;
+    ctx_omni->omni_assistant_prompt    = sys_suffix;
+}
+
+struct omni_context * omni_init(struct common_params * params,
+                                int                    media_type,
+                                bool                   use_tts,
+                                std::string            tts_bin_dir,
+                                int                    tts_gpu_layers,
+                                const std::string &    token2wav_device,
+                                bool                   duplex_mode,
+                                llama_model *          existing_model,
+                                llama_context *        existing_ctx,
+                                const std::string &    base_output_dir,
+                                bool                   enable_thinking) {
     // process the prompt
     print_with_timestamp("=== omni_init start\n");
     // if (params->prompt.empty() && params->interactive == false) {
@@ -4029,8 +4067,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->media_type = media_type;
     ctx_omni->use_tts = use_tts;
     ctx_omni->duplex_mode = duplex_mode;
+    ctx_omni->enable_thinking = enable_thinking;  // 🔧 [think-speak] 分发/prompt 变体开关
     ctx_omni->base_output_dir = base_output_dir;  // 🔧 [多实例支持] 设置可配置的输出目录
-    print_with_timestamp("media_type = %d, duplex_mode = %d, base_output_dir = %s\n", media_type, duplex_mode, base_output_dir.c_str());
+    print_with_timestamp("media_type = %d, duplex_mode = %d, enable_thinking = %d, base_output_dir = %s\n", media_type,
+                         duplex_mode, enable_thinking, base_output_dir.c_str());
     // 🔧 [对齐 Python MiniCPM-o-4_5-latest] prompt 格式
     // Python default_tts_chat_template:
     //   {% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}
@@ -4058,7 +4098,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     // 
     // 注意: voice_clone_prompt 是 system prompt 的 prefix，assistant_prompt 是 system prompt 的 suffix
     //       stream_decode 会添加实际的 assistant generation prompt
-    if (duplex_mode) {
+    if (enable_thinking) {
+        // 🔧 [think-speak] 纯文本 system prompt 变体（见 apply_think_speak_prompts）。
+        // 与 simplex/duplex 互斥：think-speak M1 恒 simplex 文本。
+        apply_think_speak_prompts(ctx_omni);
+    } else if (duplex_mode) {
         // 🔧 [与 Python 对齐] Audio 双工模式：嵌入参考音频
         // 双工模式不需要 <|im_start|>user\n，用 <unit> 标记用户输入
         ctx_omni->audio_voice_clone_prompt = "<|im_start|>system\nStreaming Duplex Conversation! You are a helpful assistant.\n<|audio_start|>";
@@ -4587,6 +4631,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // 🔧 [双工模式] 初始化 <|tts_pad|> token（双工模式下禁止采样此 token）
         // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
         ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
+
+        // 🔧 [think-speak] 解析 <think>/</think>（单 token：151667/151668）。
+        // 状态机主要靠解码字符串子串匹配 <endofthink>/<pad>（多 token）来定界，
+        // 这两个单 token id 供记录/校验用；enable_thinking=false 时不影响任何路径。
+        ctx_omni->special_token_think     = find_token("<think>");
+        ctx_omni->special_token_think_end = find_token("</think>");
     }
         
     // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
@@ -4864,8 +4914,12 @@ void omni_set_language(struct omni_context * ctx_omni, const std::string & lang)
     
     ctx_omni->language = lang;
     print_with_timestamp("omni_set_language: setting language to '%s'\n", lang.c_str());
-    
-    if (ctx_omni->duplex_mode) {
+
+    if (ctx_omni->enable_thinking) {
+        // 🔧 [think-speak] 纯文本 system prompt 变体，语言无关（TRAIN_SYSTEM_PROMPT 为英文）。
+        // 放在语言分支之前：enable_thinking 时忽略 lang，始终用 think-speak 文本 prompt。
+        apply_think_speak_prompts(ctx_omni);
+    } else if (ctx_omni->duplex_mode) {
         // 双工模式：prompt 固定使用英文（与 Python 对齐）
         ctx_omni->audio_voice_clone_prompt = "<|im_start|>system\nStreaming Duplex Conversation! You are a helpful assistant.\n<|audio_start|>";
         ctx_omni->audio_assistant_prompt = "<|audio_end|><|im_end|>\n";
@@ -4889,7 +4943,7 @@ void omni_set_language(struct omni_context * ctx_omni, const std::string & lang)
             ctx_omni->omni_assistant_prompt = "<|audio_end|>你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。请用高自然度的方式和用户聊天。<|im_end|>\n<|im_start|>user\n";
         }
     }
-    
+
     // 🔧 [关键] 重置 system_prompt_initialized，让下次 stream_prefill(index=0) 重新 prefill system prompt
     ctx_omni->system_prompt_initialized = false;
     
@@ -5167,7 +5221,7 @@ static const std::set<llama_token> g_known_empty_token_ids = {
 
 // Helper function to check if a token should be filtered out
 // Returns true if the token is valid for TTS, false if it should be skipped
-static bool is_valid_tts_token(llama_token tid) {
+bool is_valid_tts_token(llama_token tid) {
     // Skip special tokens
     for (llama_token sid : g_special_token_ids) {
         if (tid == sid) {
@@ -5276,7 +5330,26 @@ static bool generate_audio_tokens_local_simplex(
     // 🔧 [与 Python 对齐] Python: max_new_token=500，每个 LLM condition 生成直到 EOS
     // 然后每 25 个 tokens yield 一次
     const int max_audio_tokens = 500;
-    
+
+    // 🔧 [babble guard —— 对齐 Python utils.py generate_with_buffer + modeling streaming_generate
+    //    的 TTS_MAX_AUDIO_TOKENS_PER_TEXT=25]
+    // 某些短/孤立文本 chunk 可能不吐 audio-EOS 而 free-run（Python 注释原话：
+    // "an isolated short text chunk can fail to emit audio-EOS and free-run
+    //  (e.g. 4 text tokens -> 325 audio tokens)"；think-speak 的分块尤其容易触发）。
+    // Python 用 per-text-token 上限兜底：每个 condition chunk 的音频 token 数 ≤ K * 文本token数。
+    // C++ 原本只有平铺 500 的上限，缺这一层，故 think 模型不吐 eos 时一路跑满 500。
+    // 这里把 Phase 1 的上限收紧为 min(500, K * n_tokens)。K 可用环境变量覆盖（0/未设=25）。
+    int babble_k = 25;
+    if (const char * env = getenv("TTS_MAX_AUDIO_TOKENS_PER_TEXT")) {
+        int v = atoi(env);
+        if (v > 0) {
+            babble_k = v;
+        }
+    }
+    const int phase1_cap = std::min(max_audio_tokens, babble_k * std::max(1, n_tokens));
+    print_with_timestamp("TTS Simplex: babble guard phase1_cap=%d (K=%d * n_tokens=%d, hard=%d)\n", phase1_cap,
+                         babble_k, n_tokens, max_audio_tokens);
+
     if (!ctx_omni->ctx_tts_llama || !ctx_omni->model_tts) {
         LOG_ERR("TTS Simplex: TTS model not loaded\n");
         return false;
@@ -5326,12 +5399,16 @@ static bool generate_audio_tokens_local_simplex(
     ctx_omni->tts_condition_saved = true;
     
     int n_past_tts = 0;
-    if (chunk_idx == 0) {
+    // [诊断] TTS_FORCE_FRESH_KV：把每个 chunk 都当作全新 chunk（清 KV），用于隔离
+    // "续接 KV 状态坏" vs "条件值坏"。默认关闭，行为不变。
+    const bool force_fresh = (getenv("TTS_FORCE_FRESH_KV") != nullptr);
+    if (chunk_idx == 0 || force_fresh) {
         // 第一个 chunk：清空 KV cache
         llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
         if (mem) {
             llama_memory_seq_rm(mem, 0, 0, -1);
-            print_with_timestamp("TTS Simplex: first chunk - cleared KV cache\n");
+            print_with_timestamp("TTS Simplex: %s - cleared KV cache\n",
+                                 chunk_idx == 0 ? "first chunk" : "FORCE_FRESH");
         }
         ctx_omni->tts_n_past_accumulated = 0;
         ctx_omni->tts_all_generated_tokens.clear();
@@ -5341,7 +5418,7 @@ static bool generate_audio_tokens_local_simplex(
         n_past_tts = ctx_omni->tts_n_past_accumulated;
         print_with_timestamp("TTS Simplex: chunk %d - keeping KV cache, n_past_tts=%d\n", chunk_idx, n_past_tts);
     }
-    
+
     // 使用包含 audio_bos 的 condition 进行 prefill
     if (!prefill_with_emb_tts(ctx_omni, params, 
                               condition_with_bos.data(),
@@ -5384,7 +5461,7 @@ static bool generate_audio_tokens_local_simplex(
     bool need_phase2 = false;  // 是否需要第二阶段生成
     
     // ===== Phase 1: 正常生成（不带 text_eos_embed） =====
-    for (int t = 0; t < max_audio_tokens; ++t) {
+    for (int t = 0; t < phase1_cap; ++t) {
         // 🔧 [P0-立即打断] 检测 break_event，立即停止 TTS 生成
         if (ctx_omni->break_event.load()) {
             print_with_timestamp("TTS Simplex: break_event detected at step %d, stopping immediately\n", t);
@@ -5465,7 +5542,7 @@ static bool generate_audio_tokens_local_simplex(
             break;
         }
     }
-    
+
     // ===== Phase 2: 注入 text_eos_embed，生成最后一批 audio tokens =====
     // 仅在 is_final_text_chunk 且 Phase 1 正常结束（EOS）时执行
     if (need_phase2 && !ctx_omni->break_event.load()) {
@@ -10620,6 +10697,117 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     return true;
 }
 
+void think_speak_decode_begin(struct omni_context * ctx, int round_idx) {
+    if (round_idx >= 0 && ctx->simplex_round_idx != round_idx) {
+        ctx->simplex_round_idx = round_idx;
+        ctx->wav_turn_base     = round_idx * 1000;
+    }
+    ctx->stream_decode_start_time = std::chrono::high_resolution_clock::now();
+
+    ctx->llm_generation_done.store(false);
+    ctx->ended_with_listen = false;
+
+    {
+        std::lock_guard<std::mutex> tl(ctx->text_mtx);
+        ctx->text_queue.clear();
+        ctx->text_done_flag = false;
+        ctx->text_streaming = true;
+    }
+
+    if (ctx->async && ctx->use_tts) {
+        ctx->speek_done = false;
+        if (!ctx->tts_thread.joinable()) {
+            tts_thread_running = true;
+            ctx->tts_thread    = std::thread(tts_thread_func, ctx, ctx->params);
+            print_with_timestamp("[think-speak] create tts thread\n");
+        }
+        if (!ctx->t2w_thread.joinable() && ctx->t2w_thread_info) {
+            t2w_thread_running = true;
+            ctx->t2w_thread    = std::thread(t2w_thread_func, ctx, ctx->params);
+            print_with_timestamp("[think-speak] create t2w thread\n");
+        }
+        ctx->need_speek = true;
+    }
+}
+
+void think_speak_tts_chunk_flush(struct omni_context *      ctx,
+                                 std::string &              text,
+                                 std::vector<llama_token> & ids,
+                                 std::vector<float> &       hidden,
+                                 bool                       is_final) {
+    if (!(ctx->async && ctx->use_tts && ctx->tts_thread_info)) {
+        text.clear();
+        ids.clear();
+        hidden.clear();
+        return;
+    }
+    if (!is_final && ids.empty()) {
+        return;
+    }
+
+    LLMOut * llm_out        = new LLMOut();
+    llm_out->text           = (!text.empty() || is_final) ? text : std::string(" ");
+    llm_out->n_past         = ctx->n_past;
+    llm_out->llm_finish     = is_final;
+    llm_out->is_end_of_turn = is_final;
+    llm_out->debug_dir      = ctx->base_output_dir;
+    llm_out->token_ids      = ids;
+    llm_out->hidden_states  = hidden;
+    llm_out->n_embd         = llama_n_embd(llama_get_model(ctx->ctx_llama));
+
+    if (is_final) {
+        ctx->llm_generation_done.store(true);
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(ctx->tts_thread_info->mtx);
+        ctx->tts_thread_info->cv.wait(
+            lock, [&] { return ctx->tts_thread_info->queue.size() < (size_t) ctx->tts_thread_info->MAX_QUEUE_SIZE; });
+        if (!ctx->speek_done) {
+            ctx->tts_thread_info->queue.push(llm_out);
+            ctx->tts_thread_info->cv.notify_all();
+        } else {
+            delete llm_out;
+        }
+    }
+
+    text.clear();
+    ids.clear();
+    hidden.clear();
+}
+
+void think_speak_decode_finalize(struct omni_context * ctx) {
+    {
+        std::lock_guard<std::mutex> tl(ctx->text_mtx);
+        ctx->text_queue.push_back("__END_OF_TURN__");
+        ctx->text_done_flag = true;
+        ctx->text_streaming = false;
+        ctx->text_cv.notify_all();
+    }
+
+    ctx->round_start_positions.push_back(ctx->n_past);
+    ctx->current_turn_id++;
+    eval_string(ctx, ctx->params, "<|im_end|>\n<|im_start|>user\n", ctx->params->n_batch, &ctx->n_past,
+                /*add_bos=*/false);
+}
+
+void push_think_speak_user_text(struct omni_context * ctx, const std::string & raw) {
+    static const std::vector<std::string> markers = { "<endofthink>", "<pad>", "<think>", "</think>" };
+    std::string                           s       = raw;
+    for (const auto & m : markers) {
+        size_t pos;
+        while ((pos = s.find(m)) != std::string::npos) {
+            s.erase(pos, m.size());
+        }
+    }
+    if (s.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> tl(ctx->text_mtx);
+    ctx->text_queue.push_back(s);
+    ctx->text_cv.notify_all();
+}
+
 bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
     // 🔧 [Duplex Pipeline Stage 1] 路由：
     //   duplex_mode && async && system prompt 已初始化时，走新 duplex 路径。
@@ -10629,6 +10817,22 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     if (ctx_omni->duplex_mode && ctx_omni->async
         && ctx_omni->system_prompt_initialized && ctx_omni->duplex != nullptr) {
         return duplex_decode(ctx_omni, debug_dir, round_idx);
+    }
+
+    // 🔧 [think-speak] 第三条分发：enable_thinking 时走独立的块/相位状态机。
+    // think_speak_decode 做纯 LLM 逻辑；TTS 通过 hook 回调流式传输 answer 的 hidden states。
+    if (ctx_omni->enable_thinking) {
+        think_speak_decode_begin(ctx_omni, round_idx);
+        ThinkSpeakTTSHook   hook;
+        ThinkSpeakTTSHook * hook_ptr = nullptr;
+        if (ctx_omni->async && ctx_omni->use_tts && ctx_omni->tts_thread_info) {
+            hook.chunk_size = 10;
+            hook.flush      = think_speak_tts_chunk_flush;
+            hook_ptr        = &hook;
+        }
+        bool ok = think_speak_decode(ctx_omni, ctx_omni->think_speak_config, round_idx, hook_ptr);
+        think_speak_decode_finalize(ctx_omni);
+        return ok;
     }
 
     // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
@@ -11107,6 +11311,9 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 "<|speak|>",
                 "<think>",
                 "</think>",
+                // [think-speak] 边想边说的多 token 控制串
+                "<endofthink>",
+                "<pad>",
             };
             for (const auto & token : inline_token_strings) {
                 size_t pos = response.find(token);

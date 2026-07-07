@@ -1,17 +1,18 @@
 #include "ggml.h"
 #include "llama.h"
+#include "think_speak.h"
 #include "tts-condition-graph.h"
 
-#include <thread>
-#include <memory>
-#include <vector>
-#include <string>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <chrono>
-#include <functional>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -316,7 +317,14 @@ struct omni_context {
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
     // duplex: 双工模式，模型可以在任意时刻决定听/说切换
     bool duplex_mode = false;
-    
+
+    // 🔧 [think-speak / 边想边说] 是否启用「边想边说」推理路径
+    bool               enable_thinking = false;
+    ThinkSpeakConfig   think_speak_config;  // 缺省构造即 §3 生效值
+    // [think-speak] think_speak_decode 把每块 think/answer 写入此指针（非空时）。
+    // omni_think_speak_generate 在调用前设为调用者的 ThinkSpeakResult；dispatch 产品路径可留空。
+    ThinkSpeakResult * think_speak_out = nullptr;
+
     // 系统 prompt 是否已初始化（防止 stream_prefill index=0 被重复调用导致 prompt 重复）
     bool system_prompt_initialized = false;
     
@@ -467,6 +475,9 @@ struct omni_context {
     llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
     llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
     llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
+
+    llama_token special_token_think     = -1;          // <think>
+    llama_token special_token_think_end = -1;          // </think>
 };
 
 //
@@ -481,14 +492,44 @@ struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_
 struct omni_embed * omni_audio_embed_make_with_bytes(struct audition_ctx * ctx_audition, int n_threads, audition_audio_f32 * audio);
 struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audition, int n_threads, std::string audio_path);
 
+// Decode helpers (defined in omni.cpp, used by think_speak.cpp).
+bool         is_end_token(struct omni_context * ctx, llama_token token);
+bool         eval_string(struct omni_context * ctx_omni,
+                         common_params *       params,
+                         const char *          str,
+                         int                   n_batch,
+                         int *                 n_past,
+                         bool                  add_bos,
+                         bool                  get_emb = false);
+const char * llama_loop_with_hidden_and_token(struct omni_context *   ctx_omni,
+                                              common_params *         params,
+                                              struct common_sampler * smpl,
+                                              int &                   n_past,
+                                              float *&                hidden_states,
+                                              llama_token &           token_id);
+bool is_valid_tts_token(llama_token tid);
+
+// Think-speak scaffolding (defined in omni.cpp).
+void think_speak_decode_begin(struct omni_context * ctx, int round_idx);
+void think_speak_decode_finalize(struct omni_context * ctx);
+void push_think_speak_user_text(struct omni_context * ctx, const std::string & raw);
+void think_speak_tts_chunk_flush(struct omni_context * ctx, std::string & text,
+                                 std::vector<llama_token> & ids, std::vector<float> & hidden, bool is_final);
+
 //
 // omni main
 //
-struct omni_context * omni_init(struct common_params * params, int media_type, bool use_tts, std::string tts_bin_dir,
-                                int tts_gpu_layers = -1, const std::string & token2wav_device = "gpu:0",
-                                bool duplex_mode = false,
-                                llama_model * existing_model = nullptr, llama_context * existing_ctx = nullptr,
-                                const std::string & base_output_dir = "./tools/omni/output");
+struct omni_context * omni_init(struct common_params * params,
+                                int                    media_type,
+                                bool                   use_tts,
+                                std::string            tts_bin_dir,
+                                int                    tts_gpu_layers   = -1,
+                                const std::string &    token2wav_device = "gpu:0",
+                                bool                   duplex_mode      = false,
+                                llama_model *          existing_model   = nullptr,
+                                llama_context *        existing_ctx     = nullptr,
+                                const std::string &    base_output_dir  = "./tools/omni/output",
+                                bool                   enable_thinking  = false);
 
 void omni_free(struct omni_context * ctx_omni);
 // Stop/join inference threads and clear queues so the same context can serve a

@@ -12,6 +12,8 @@ endif()
 add_library(omni
             omni.cpp
             omni.h
+            think_speak.cpp
+            think_speak.h
             tts-condition-graph.cpp
             tts-condition-graph.h
             audition.cpp
@@ -174,6 +176,12 @@ add_executable         (${TARGET_DUPLEX_TEST} test/test-duplex.cpp)
 set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-duplex)
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
+
+set(TARGET_THINK_SPEAK_TEST llama-omni-test-think-speak)
+add_executable         (${TARGET_THINK_SPEAK_TEST} test/test-think-speak.cpp)
+set_target_properties  (${TARGET_THINK_SPEAK_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-think-speak)
+target_link_libraries  (${TARGET_THINK_SPEAK_TEST} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_THINK_SPEAK_TEST} PRIVATE cxx_std_17)
 
 # Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
 add_executable(token2wav-example token2wav/token2wav-example.cpp)
