@@ -205,6 +205,7 @@ static void show_usage(const char * prog) {
     printf("用法: %s [选项]\n\n", prog);
     printf("  -m <path>                 think LLM GGUF (默认 /cache/zhanghao/model/o45-think-gguf/MiniCPM-o-4_5-think-F16.gguf)\n");
     printf("  --text-question <str>     题面 (默认: 黄金样例 multi_step_reasoning-000000)\n");
+    printf("  --audio-question <path>   音频问题 WAV 文件路径 (与 --text-question 互斥)\n");
     printf("  --tts                     M2 出声模式 (use_tts=true, async=true, 落 WAV)；默认关=M1 纯文本\n");
     printf("  -c, --ctx-size <n>        上下文大小 (默认 4096)\n");
     printf("  -ngl <n>                  n_gpu_layers (默认 99)\n");
@@ -226,6 +227,7 @@ int main(int argc, char ** argv) {
     std::string question =
         "Paige raised 7 goldfish and 12 catfish in the pond but stray cats loved eating them. "
         "Now she has 15 left. How many fishes disappeared?";
+    std::string audio_question;  // --audio-question: WAV path for audio input mode
     std::string output_dir = "./tools/omni/output";
     int n_ctx        = 4096;
     int n_gpu_layers = 99;
@@ -238,6 +240,7 @@ int main(int argc, char ** argv) {
         if (arg == "-h" || arg == "--help") { show_usage(argv[0]); return 0; }
         else if (arg == "-m" && i + 1 < argc) { llm_path = argv[++i]; }
         else if (arg == "--text-question" && i + 1 < argc) { question = argv[++i]; }
+        else if (arg == "--audio-question" && i + 1 < argc) { audio_question = argv[++i]; }
         else if (arg == "--tts") { use_tts = true; }
         else if ((arg == "-c" || arg == "--ctx-size") && i + 1 < argc) { n_ctx = std::atoi(argv[++i]); }
         else if (arg == "-ngl" && i + 1 < argc) { n_gpu_layers = std::atoi(argv[++i]); }
@@ -253,20 +256,27 @@ int main(int argc, char ** argv) {
         else { fprintf(stderr, "未知参数: %s\n", arg.c_str()); show_usage(argv[0]); return 1; }
     }
 
+    const bool audio_input = !audio_question.empty();
+
     TestModelPaths paths = resolve_model_paths(llm_path);
     printf("=== Think-speak %s test ===\n", use_tts ? "M2 spoken (--tts)" : "M1 pure-text");
     printf("  LLM:    %s\n", paths.llm.c_str());
-    printf("  Audio:  %s\n", paths.audio.c_str());
+    printf("  Audio encoder: %s\n", paths.audio.c_str());
     printf("  TTS:    %s (%s)\n", paths.tts.c_str(), use_tts ? "enabled" : "disabled");
-    printf("  Question: %s\n", question.c_str());
+    if (audio_input) {
+        printf("  Audio question: %s\n", audio_question.c_str());
+    } else {
+        printf("  Text question: %s\n", question.c_str());
+    }
     printf("  cfg: think_budget=%d answer_budget=%d lookahead=%d final_max=%d "
            "think_hard=%d answer_hard=%d final_hard=%d max_blocks=%d\n",
            cfg.think_budget, cfg.answer_budget, cfg.endofthink_lookahead, cfg.final_answer_max_new_tokens,
            cfg.think_hard_limit, cfg.answer_hard_limit, cfg.final_answer_hard_limit, cfg.max_auto_blocks);
 
     if (!file_exists(paths.llm))   { fprintf(stderr, "Error: LLM not found: %s\n", paths.llm.c_str());   return 1; }
-    if (!file_exists(paths.audio)) { fprintf(stderr, "Error: Audio not found: %s\n", paths.audio.c_str()); return 1; }
+    if (!file_exists(paths.audio)) { fprintf(stderr, "Error: Audio encoder not found: %s\n", paths.audio.c_str()); return 1; }
     if (use_tts && !file_exists(paths.tts)) { fprintf(stderr, "Error: TTS not found: %s\n", paths.tts.c_str()); return 1; }
+    if (audio_input && !file_exists(audio_question)) { fprintf(stderr, "Error: Audio question not found: %s\n", audio_question.c_str()); return 1; }
 
     common_params params;
     params.model.path   = paths.llm;
@@ -300,7 +310,7 @@ int main(int argc, char ** argv) {
     ctx_omni->async = use_tts;
 
     ThinkSpeakResult result;
-    const bool ok = omni_think_speak_generate(ctx_omni, cfg, question, &result);
+    const bool ok = omni_think_speak_generate(ctx_omni, cfg, question, &result, audio_question);
     if (!ok) {
         fprintf(stderr, "Error: omni_think_speak_generate failed\n");
         omni_free(ctx_omni);

@@ -281,7 +281,14 @@ std::string TempMediaFiles::write_temp_file(const std::string & temp_dir, const 
 }
 
 std::string TempMediaFiles::write_audio_wav(const std::string & b64, const std::string & temp_dir, int counter) {
-    // Decode base64 → float32 PCM samples
+    // First decode raw bytes to check if this is already a complete WAV file.
+    auto raw = b64_decode(b64);
+    if (raw.size() >= 12 && memcmp(raw.data(), "RIFF", 4) == 0 && memcmp(raw.data() + 8, "WAVE", 4) == 0) {
+        return write_temp_file(temp_dir, "audio_", "." + std::to_string(counter) + ".wav",
+                               raw.data(), raw.size());
+    }
+
+    // Decode base64 → float32 PCM samples (legacy path for raw float32 payloads).
     auto pcm = b64_to_float32_pcm(b64);
     if (pcm.empty()) return "";
 
@@ -579,7 +586,13 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         llama_context * ctx,
                         omni_context *& shared_octx,
                         std::mutex & octx_mutex) {
-    const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
+    fs::path base_tmp = fs::temp_directory_path() / "omni_ws";
+    try { fs::create_directories(base_tmp); } catch (...) {}
+    if (!fs::exists(base_tmp) || access(base_tmp.c_str(), W_OK) != 0) {
+        base_tmp = fs::path(getenv("HOME") ? getenv("HOME") : ".") / ".cache" / "omni_ws";
+        fs::create_directories(base_tmp);
+    }
+    const std::string temp_dir = base_tmp.string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
@@ -915,20 +928,38 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 }
                 int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
                 if (parsed_input.enable_thinking) {
-                    // Thinking mode: stream_prefill only for audio/image;
-                    // inject user text directly via eval_string with question template
-                    if (!tmp_files.audio_path.empty() || !tmp_files.image_path.empty()) {
-                        if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
-                                            input_index, parsed_input.max_slice_nums, "")) {
-                            octx->use_tts = prev_use_tts;
-                            tmp_files.cleanup();
-                            for (const auto & path : extra_image_paths) fs::remove(path);
-                            for (const auto & path : turn_temp_paths) fs::remove(path);
-                            fail_fast(session_id, "prefill_failed");
-                            return;
+                    // Thinking mode: inject audio embedding synchronously into KV
+                    // (stream_prefill async path enqueues to LLM thread which thinking
+                    // doesn't use — audio would never reach the KV cache).
+                    const bool has_audio = !tmp_files.audio_path.empty();
+                    if (has_audio) {
+                        auto * embeds = omni_audio_embed_make_with_filename(
+                            octx->ctx_audio, octx->params->cpuparams.n_threads,
+                            tmp_files.audio_path);
+                        if (embeds && embeds->n_pos > 0) {
+                            eval_string(octx, octx->params, "<|audio_start|>",
+                                        octx->params->n_batch, &octx->n_past, false);
+                            prefill_with_emb(octx, octx->params, embeds->embed,
+                                             embeds->n_pos, octx->params->n_batch,
+                                             &octx->n_past);
+                            eval_string(octx, octx->params, "<|audio_end|>",
+                                        octx->params->n_batch, &octx->n_past, false);
+                            omni_embed_free(embeds);
+                        } else {
+                            LOG_ERR("WS thinking: audio encode failed: %s\n",
+                                    tmp_files.audio_path.c_str());
                         }
-                    }
-                    if (!prompt.empty()) {
+                        const char * instr = prompt.empty()
+                            ? think_speak::TRAIN_USER_TEXT : nullptr;
+                        if (instr) {
+                            eval_string(octx, octx->params, instr,
+                                        octx->params->n_batch, &octx->n_past, false);
+                        } else {
+                            const std::string user_text = think_speak::make_text_question(prompt);
+                            eval_string(octx, octx->params, user_text.c_str(),
+                                        octx->params->n_batch, &octx->n_past, false);
+                        }
+                    } else if (!prompt.empty()) {
                         const std::string user_text = think_speak::make_text_question(prompt);
                         eval_string(octx, octx->params, user_text.c_str(),
                                     octx->params->n_batch, &octx->n_past, false);

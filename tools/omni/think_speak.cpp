@@ -215,7 +215,7 @@ bool think_speak_decode(omni_context * ctx, const ThinkSpeakConfig & cfg, int /*
             if (out) {
                 out->blocks.push_back(blk);
             }
-            push_think_speak_user_text(ctx, blk.answer);
+            push_think_speak_user_text(ctx, blk.answer);  // final answer → text stream
 
             if (fs == ThinkSpeakStop::StopToken) {
                 stopped_reason = "endofthink_answer_finished";
@@ -275,7 +275,8 @@ bool think_speak_decode(omni_context * ctx, const ThinkSpeakConfig & cfg, int /*
 }
 
 bool omni_think_speak_generate(omni_context * ctx, const ThinkSpeakConfig & cfg,
-                               const std::string & question, ThinkSpeakResult * out) {
+                               const std::string & question, ThinkSpeakResult * out,
+                               const std::string & audio_path) {
     if (ctx == nullptr || ctx->ctx_llama == nullptr || ctx->params == nullptr) {
         return false;
     }
@@ -286,8 +287,27 @@ bool omni_think_speak_generate(omni_context * ctx, const ThinkSpeakConfig & cfg,
         }
     }
 
-    const std::string user_text = think_speak::make_text_question(question);
-    eval_string(ctx, ctx->params, user_text.c_str(), ctx->params->n_batch, &ctx->n_past, /*add_bos=*/false);
+    if (!audio_path.empty()) {
+        auto * embeds = omni_audio_embed_make_with_filename(
+            ctx->ctx_audio, ctx->params->cpuparams.n_threads, audio_path);
+        if (embeds == nullptr || embeds->n_pos <= 0) {
+            fprintf(stderr, "[think-speak] failed to encode audio: %s\n", audio_path.c_str());
+            return false;
+        }
+        eval_string(ctx, ctx->params, "<|audio_start|>",
+                    ctx->params->n_batch, &ctx->n_past, /*add_bos=*/false);
+        prefill_with_emb(ctx, ctx->params, embeds->embed, embeds->n_pos,
+                         ctx->params->n_batch, &ctx->n_past);
+        eval_string(ctx, ctx->params, "<|audio_end|>",
+                    ctx->params->n_batch, &ctx->n_past, /*add_bos=*/false);
+        omni_embed_free(embeds);
+        eval_string(ctx, ctx->params, think_speak::TRAIN_USER_TEXT,
+                    ctx->params->n_batch, &ctx->n_past, /*add_bos=*/false);
+        fprintf(stderr, "[think-speak] audio user turn injected: %s\n", audio_path.c_str());
+    } else {
+        const std::string user_text = think_speak::make_text_question(question);
+        eval_string(ctx, ctx->params, user_text.c_str(), ctx->params->n_batch, &ctx->n_past, /*add_bos=*/false);
+    }
 
     think_speak_decode_begin(ctx, /*round_idx=*/0);
 

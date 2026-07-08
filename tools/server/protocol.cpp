@@ -482,6 +482,12 @@ ParsedMessage parse_one_message(const json & msg) {
                     if (!audio.empty()) {
                         out.audio_b64s.push_back(audio);
                     }
+                } else if (ptype == "input_audio") {
+                    const json & ia = part.contains("input_audio") ? part.at("input_audio") : part;
+                    std::string audio = extract_audio_b64(ia);
+                    if (!audio.empty()) {
+                        out.audio_b64s.push_back(audio);
+                    }
                 } else if (ptype == "video") {
                     // base64 MP4 container (schema §4.4); decoded into frames +
                     // audio later. stack_frames = frames stacked per sample point.

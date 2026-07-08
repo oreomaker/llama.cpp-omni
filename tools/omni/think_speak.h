@@ -48,7 +48,8 @@ struct ThinkSpeakTTSHook {
 };
 
 bool omni_think_speak_generate(struct omni_context * ctx, const ThinkSpeakConfig & cfg,
-                               const std::string & question, ThinkSpeakResult * out);
+                               const std::string & question, ThinkSpeakResult * out,
+                               const std::string & audio_path = "");
 bool think_speak_decode(struct omni_context * ctx, const ThinkSpeakConfig & cfg, int round_idx,
                         ThinkSpeakTTSHook * tts_hook = nullptr);
 
