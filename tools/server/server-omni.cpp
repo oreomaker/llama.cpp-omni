@@ -147,6 +147,7 @@ int main(int argc, char ** argv) {
         int media_type = data.value("msg_type", data.value("media_type", 2));
         bool use_tts   = data.value("use_tts", true);
         bool duplex_mode = data.value("duplex_mode", false);
+        bool        enable_thinking  = data.value("enable_thinking", false);
         int tts_gpu_layers = data.value("tts_gpu_layers", 100);
         std::string token2wav_device = data.value("token2wav_device", "gpu:0");
         std::string output_dir = data.value("output_dir", "./tools/omni/output");
@@ -186,9 +187,9 @@ int main(int argc, char ** argv) {
             }
         }
 
-        omni_context * octx = omni_init(&params, media_type, use_tts, params.tts_bin_dir, tts_gpu_layers,
-                                         token2wav_device, duplex_mode,
-                                         /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir);
+        omni_context * octx =
+            omni_init(&params, media_type, use_tts, params.tts_bin_dir, tts_gpu_layers, token2wav_device, duplex_mode,
+                      /*existing_model=*/nullptr, /*existing_ctx=*/nullptr, output_dir, enable_thinking);
         if (!octx) {
             res_error(res, format_error_response("omni_init failed"));
             return;
@@ -236,7 +237,20 @@ int main(int argc, char ** argv) {
         bool ok = false;
         {
             std::lock_guard<std::mutex> lock(state.octx_mutex);
-            ok = stream_prefill(state.octx, audio_path, img_path, cnt, max_slice_nums, text);
+            if (state.octx && state.octx->enable_thinking && cnt == 0 && !text.empty()) {
+                ok = stream_prefill(state.octx, audio_path, img_path, cnt, max_slice_nums, "");
+                if (ok) {
+                    const std::string user_text = think_speak::make_text_question(text);
+                    eval_string(state.octx, state.octx->params, user_text.c_str(), state.octx->params->n_batch,
+                                &state.octx->n_past, false);
+                }
+            } else if (state.octx && state.octx->enable_thinking && cnt > 0 && !text.empty()) {
+                const std::string user_text = think_speak::make_text_question(text);
+                ok = eval_string(state.octx, state.octx->params, user_text.c_str(), state.octx->params->n_batch,
+                                 &state.octx->n_past, false);
+            } else {
+                ok = stream_prefill(state.octx, audio_path, img_path, cnt, max_slice_nums, text);
+            }
         }
 
         if (!ok) {
@@ -304,6 +318,7 @@ int main(int argc, char ** argv) {
                 }, debug_dir, round_idx);
 
                 // poll text queue
+                bool in_thinking = false;
                 while (true) {
                     std::unique_lock<std::mutex> lk(state.octx->text_mtx);
                     state.octx->text_cv.wait_for(lk, std::chrono::milliseconds(200), [&]{
@@ -316,27 +331,54 @@ int main(int argc, char ** argv) {
                         lk.unlock();
 
                         json ev;
-                        if (frag == "__IS_LISTEN__") {
+                        if (frag == "__THINK_START__") {
+                            in_thinking = true;
+                            ev          = {
+                                         { "content",        ""      },
+                                         { "stop",           false   },
+                                         { "thinking",       true    },
+                                         { "thinking_event", "start" }
+                            };
+                        } else if (frag == "__THINK_END__") {
+                            in_thinking = false;
+                            ev          = {
+                                         { "content",        ""    },
+                                         { "stop",           false },
+                                         { "thinking",       false },
+                                         { "thinking_event", "end" }
+                            };
+                        } else if (frag == "__IS_LISTEN__") {
                             ev = {{"content", ""}, {"stop", false}, {"is_listen", true}, {"end_of_turn", true}};
                         } else if (frag == "__END_OF_TURN__") {
                             ev = {{"content", ""}, {"stop", true}, {"is_listen", false}, {"end_of_turn", true}};
                         } else {
-                            ev = {{"content", frag}, {"stop", false}, {"is_listen", false}, {"end_of_turn", false}};
+                            ev = {
+                                { "content",     frag        },
+                                { "stop",        false       },
+                                { "is_listen",   false       },
+                                { "end_of_turn", false       },
+                                { "thinking",    in_thinking }
+                            };
                         }
 
                         if (!server_sent_event(sink, ev)) {
-                            if (worker.joinable()) worker.join();
+                            if (worker.joinable()) {
+                                worker.join();
+                            }
                             return false;
                         }
                         lk.lock();
                     }
 
-                    if (state.octx->text_done_flag) break;
+                    if (state.octx->text_done_flag) {
+                        break;
+                    }
                 }
 
-                if (worker.joinable()) worker.join();
+                if (worker.joinable()) {
+                    worker.join();
+                }
 
-                // send done
                 static const std::string ev_done = "data: [DONE]\n\n";
                 sink.write(ev_done.data(), ev_done.size());
                 return true;
@@ -377,8 +419,12 @@ int main(int argc, char ** argv) {
 
         auto * session = state.session_mgr.get(session_id);
         if (!session || session->state != SessionState::ACTIVE) {
-            res_error(res, format_error_response("session not found", "not_found"));
-            res.status = 404;
+            // Idempotent: session already closed or not found — return success
+            json resp;
+            resp["ok"] = true;
+            resp["session_id"] = session_id;
+            resp["closed"] = true;
+            res_ok(res, resp);
             return;
         }
 

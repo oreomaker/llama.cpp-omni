@@ -58,6 +58,13 @@ json make_listen_delta(const std::string & session_id,
                        const std::string & response_id = "",
                        const ProtocolMetrics & metrics = {});
 
+// response.output.delta kind=thinking — thinking block text
+json make_thinking_delta(const std::string & session_id,
+                         const std::string & response_id,
+                         const std::string & text,
+                         const std::string & event = "",
+                         const ProtocolMetrics & metrics = {});
+
 // response.done — semantic response complete
 // full_text: complete generated text (accumulated from deltas)
 // audio_base64: full audio if TTS enabled, empty/absent if not

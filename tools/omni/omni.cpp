@@ -4034,7 +4034,7 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
 // TODO(M2/P5 统一整理): 这是 M1 临时形态。最终按 ctx->use_tts 分叉，与 omni_init 其它路径保持一致：
 //   use_tts 时改用声纹槽变体（<|im_start|>system\n{SYSTEM_VOICE_CLONE_PREFIX}<|audio_start|>...<|audio_end|>{SYSTEM_VOICE_CLONE_SUFFIX}<|im_end|>\n<|im_start|>user\n），
 //   复用 simplex 同款 <|audio_start|>/<|audio_end|> 约定 → 流经 stream_prefill 同一 audio-embed 分支（仅扩展、不重写）。
-static void apply_think_speak_prompts(struct omni_context * ctx_omni) {
+void apply_think_speak_prompts(struct omni_context * ctx_omni) {
     const std::string sys_prefix       = std::string("<|im_start|>system\n") + think_speak::TRAIN_SYSTEM_PROMPT;
     const std::string sys_suffix       = "<|im_end|>\n<|im_start|>user\n";
     ctx_omni->audio_voice_clone_prompt = sys_prefix;
@@ -10781,7 +10781,6 @@ void think_speak_decode_finalize(struct omni_context * ctx) {
         std::lock_guard<std::mutex> tl(ctx->text_mtx);
         ctx->text_queue.push_back("__END_OF_TURN__");
         ctx->text_done_flag = true;
-        ctx->text_streaming = false;
         ctx->text_cv.notify_all();
     }
 
@@ -10805,6 +10804,27 @@ void push_think_speak_user_text(struct omni_context * ctx, const std::string & r
     }
     std::lock_guard<std::mutex> tl(ctx->text_mtx);
     ctx->text_queue.push_back(s);
+    ctx->text_cv.notify_all();
+}
+
+void push_think_start(struct omni_context * ctx) {
+    if (!ctx->text_streaming) return;
+    std::lock_guard<std::mutex> lk(ctx->text_mtx);
+    ctx->text_queue.push_back("__THINK_START__");
+    ctx->text_cv.notify_all();
+}
+
+void push_think_end(struct omni_context * ctx) {
+    if (!ctx->text_streaming) return;
+    std::lock_guard<std::mutex> lk(ctx->text_mtx);
+    ctx->text_queue.push_back("__THINK_END__");
+    ctx->text_cv.notify_all();
+}
+
+void push_think_text_fragment(struct omni_context * ctx, const std::string & frag) {
+    if (!ctx->text_streaming || frag.empty()) return;
+    std::lock_guard<std::mutex> lk(ctx->text_mtx);
+    ctx->text_queue.push_back(frag);
     ctx->text_cv.notify_all();
 }
 

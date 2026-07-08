@@ -895,7 +895,14 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 octx->length_penalty = parsed_input.length_penalty;
                 const bool prev_use_tts = octx->use_tts;
                 octx->use_tts = parsed_input.use_tts_template;
-                configure_turn_based_prompt(octx, parsed_input.use_tts_template, system_text);
+
+                if (parsed_input.enable_thinking) {
+                    octx->enable_thinking = true;
+                    apply_think_speak_prompts(octx);
+                } else {
+                    octx->enable_thinking = false;
+                    configure_turn_based_prompt(octx, parsed_input.use_tts_template, system_text);
+                }
                 if (!octx->system_prompt_initialized) {
                     if (!stream_prefill(octx, /*aud*/"", /*img*/"", /*index*/0)) {
                         octx->use_tts = prev_use_tts;
@@ -907,7 +914,26 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                     }
                 }
                 int input_index = msg_counter > 0 ? msg_counter : ++msg_counter;
-                if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                if (parsed_input.enable_thinking) {
+                    // Thinking mode: stream_prefill only for audio/image;
+                    // inject user text directly via eval_string with question template
+                    if (!tmp_files.audio_path.empty() || !tmp_files.image_path.empty()) {
+                        if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
+                                            input_index, parsed_input.max_slice_nums, "")) {
+                            octx->use_tts = prev_use_tts;
+                            tmp_files.cleanup();
+                            for (const auto & path : extra_image_paths) fs::remove(path);
+                            for (const auto & path : turn_temp_paths) fs::remove(path);
+                            fail_fast(session_id, "prefill_failed");
+                            return;
+                        }
+                    }
+                    if (!prompt.empty()) {
+                        const std::string user_text = think_speak::make_text_question(prompt);
+                        eval_string(octx, octx->params, user_text.c_str(),
+                                    octx->params->n_batch, &octx->n_past, false);
+                    }
+                } else if (!stream_prefill(octx, tmp_files.audio_path, tmp_files.image_path,
                                     input_index, parsed_input.max_slice_nums, prompt)) {
                     octx->use_tts = prev_use_tts;
                     tmp_files.cleanup();
@@ -987,7 +1013,15 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                 }
 
                 if (!frag.empty()) {
-                    if (frag == "__IS_LISTEN__") {
+                    if (frag == "__THINK_START__") {
+                        if (streaming) {
+                            send_event(make_thinking_delta(session_id, response_id, "", "start"));
+                        }
+                    } else if (frag == "__THINK_END__") {
+                        if (streaming) {
+                            send_event(make_thinking_delta(session_id, response_id, "", "end"));
+                        }
+                    } else if (frag == "__IS_LISTEN__") {
                         // Express listen via the kind=listen delta channel
                         // (schema §5.1 / network §6.3) in both streaming and
                         // non-streaming (non-streaming deltas allowed per

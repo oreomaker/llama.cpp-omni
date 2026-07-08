@@ -133,6 +133,33 @@ json make_listen_delta(const std::string & session_id,
     return ev;
 }
 
+json make_thinking_delta(const std::string & session_id,
+                          const std::string & response_id,
+                          const std::string & text,
+                          const std::string & event,
+                          const ProtocolMetrics & metrics) {
+    json ev;
+    ev["type"] = "response.output.delta";
+    ev["kind"] = "thinking";
+    ev["session_id"] = session_id;
+    if (!response_id.empty()) {
+        ev["response_id"] = response_id;
+    }
+    if (!text.empty()) {
+        ev["text"] = text;
+    }
+    if (!event.empty()) {
+        ev["thinking_event"] = event;
+    }
+    ev["server_send_ts"] = server_timestamp();
+
+    json m = metrics.to_json();
+    if (!m.empty()) {
+        ev["metrics"] = m;
+    }
+    return ev;
+}
+
 json make_response_done(const std::string & session_id,
                          const std::string & response_id,
                          const std::string & full_text,

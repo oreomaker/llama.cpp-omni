@@ -516,6 +516,15 @@ void push_think_speak_user_text(struct omni_context * ctx, const std::string & r
 void think_speak_tts_chunk_flush(struct omni_context * ctx, std::string & text,
                                  std::vector<llama_token> & ids, std::vector<float> & hidden, bool is_final);
 
+// Think-speak streaming: push think-phase text to text_queue with markers.
+// Only effective when ctx->text_streaming is true (SSE / WS consumers).
+void push_think_start(struct omni_context * ctx);
+void push_think_end(struct omni_context * ctx);
+void push_think_text_fragment(struct omni_context * ctx, const std::string & frag);
+
+// Apply think-speak system prompts to the context.
+void apply_think_speak_prompts(struct omni_context * ctx_omni);
+
 //
 // omni main
 //

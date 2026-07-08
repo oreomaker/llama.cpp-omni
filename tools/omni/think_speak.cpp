@@ -150,6 +150,8 @@ bool think_speak_decode(omni_context * ctx, const ThinkSpeakConfig & cfg, int /*
 
     for (int b = 0; b < cfg.max_auto_blocks; ++b) {
         // ---- THINK (silent) --------------------------------------------------
+        push_think_start(ctx);
+
         const char * think_bos = (b == 0)
             ? (tts_tpl ? think_speak::ASSISTANT_THINK_BOS : think_speak::ASSISTANT_THINK_BOS_NOTTS)
             : think_speak::THINK_OPEN;
@@ -178,6 +180,10 @@ bool think_speak_decode(omni_context * ctx, const ThinkSpeakConfig & cfg, int /*
             eval_string(ctx, ctx->params, think_speak::THINK_CLOSE, n_batch, &ctx->n_past, /*add_bos=*/false);
         }
         blk.think = think_text;
+
+        push_think_text_fragment(ctx, think_text);
+        push_think_end(ctx);
+
         fprintf(stderr, "[think-speak] block %d think(%zu chars, stop=%d)\n", b, think_text.size(), (int) think_stop);
 
         if (think_stop == ThinkSpeakStop::HardLimit) {
