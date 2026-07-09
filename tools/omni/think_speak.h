@@ -11,7 +11,7 @@
 struct omni_context;
 
 struct ThinkSpeakConfig {
-    int  think_budget                = 25;   // token budget per think block
+    int  think_budget                = 50;   // token budget per think block
     int  answer_budget               = 4;    // token budget per (non-final) answer block
     int  endofthink_lookahead        = 12;   // extra probe steps to confirm <endofthink> after budget
     int  final_answer_max_new_tokens = 3000; // free-run budget for the final answer

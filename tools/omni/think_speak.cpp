@@ -215,7 +215,12 @@ bool think_speak_decode(omni_context * ctx, const ThinkSpeakConfig & cfg, int /*
             if (out) {
                 out->blocks.push_back(blk);
             }
-            push_think_speak_user_text(ctx, blk.answer);  // final answer → text stream
+            push_think_speak_user_text(ctx, blk.answer);
+
+            // Flush any remaining TTS tokens from the final answer block.
+            if (tts_hook && tts_hook->flush && !tts_ids.empty()) {
+                tts_hook->flush(ctx, tts_text, tts_ids, tts_hidden, /*is_final=*/false);
+            }
 
             if (fs == ThinkSpeakStop::StopToken) {
                 stopped_reason = "endofthink_answer_finished";
@@ -245,6 +250,13 @@ bool think_speak_decode(omni_context * ctx, const ThinkSpeakConfig & cfg, int /*
         all_answers += ans;
         if (out) out->blocks.push_back(blk);
         push_think_speak_user_text(ctx, ans);
+
+        // Flush accumulated TTS tokens at answer block boundary (aligned with
+        // Python: each answer block independently streams its audio).
+        if (tts_hook && tts_hook->flush && !tts_ids.empty()) {
+            tts_hook->flush(ctx, tts_text, tts_ids, tts_hidden, /*is_final=*/false);
+        }
+
         fprintf(stderr, "[think-speak] block %d answer(%zu chars, stop=%d)\n", b, ans.size(), (int) answer_stop);
 
         if (answer_stop == ThinkSpeakStop::StopToken) {
