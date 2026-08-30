@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -77,6 +78,25 @@ struct vision_context_params {
     const char * coreml_model_path; // path to CoreML model (.mlmodelc) for ANE acceleration
 };
 
+struct vision_block_group_timing {
+    int first_layer = 0;
+    int last_layer  = 0;
+    double elapsed_ms = 0.0;
+};
+
+struct vision_block_group_profile {
+    int n_layers        = 0;
+    int block_group_size = 0;
+    int graph_nodes     = 0;
+    std::vector<vision_block_group_timing> segments;
+};
+
+// Called after a grouped graph range has completed and the scheduler has
+// synchronized the range's backend.  The callback is optional and must not
+// mutate the graph or its tensors.
+using vision_segment_callback_t = void (*)(int segment_id, int segment_count,
+                                           void * user_data);
+
 
 //
 // vision functions
@@ -85,6 +105,9 @@ struct vision_context_params {
 // vision layers
 struct vision_ctx * vision_init(const char * fname, struct vision_context_params ctx_params);
 void vision_free(struct vision_ctx * ctx);
+
+// 返回 VPM 的 CUDA/GPU 计算 backend（无则 NULL）。当前无调用方，预留给调度层。
+ggml_backend_t vision_get_backend(struct vision_ctx * ctx);
 
 // vision processor
 void vision_image_u8_free(struct vision_image_u8  * img);
@@ -99,6 +122,7 @@ bool vision_image_load_from_bytes(const unsigned char * bytes, size_t bytes_leng
 // vision query
 int vision_n_output_tokens(const struct vision_ctx * ctx);
 int vision_n_mmproj_embd(const struct vision_ctx * ctx);
+int vision_n_layers(const struct vision_ctx * ctx);
 
 // vision preprocess
 bool vision_image_preprocess(struct vision_ctx * ctx, const struct vision_image_u8 * img, struct vision_image_f32_batch * res_imgs );
@@ -106,6 +130,40 @@ bool vision_image_preprocess(struct vision_ctx * ctx, const struct vision_image_
 // vision forward
 bool vision_image_encode      (struct vision_ctx * ctx, int n_threads, struct vision_image_f32 * img, float * vec);
 bool vision_image_batch_encode(struct vision_ctx * ctx, int n_threads, const struct vision_image_f32_batch * imgs, float * vec);
+
+// Benchmark-only execution mode: dispatches the existing ViT graph in views
+// ending after every block_group_size transformer blocks.  The logical graph,
+// tensor allocation and final output are unchanged; block_group_size <= 0 is
+// equivalent to vision_image_batch_encode().
+bool vision_image_batch_encode_block_groups(
+    struct vision_ctx * ctx,
+    int n_threads,
+    const struct vision_image_f32_batch * imgs,
+    int block_group_size,
+    float * vec,
+    struct vision_block_group_profile * profile);
+
+// Runtime variant with an optional cooperative-yield callback.  The original
+// benchmark-only entry point remains unchanged for callers that only need
+// timing/profile data.
+bool vision_image_batch_encode_block_groups_with_callback(
+    struct vision_ctx * ctx,
+    int n_threads,
+    const struct vision_image_f32_batch * imgs,
+    int block_group_size,
+    float * vec,
+    struct vision_block_group_profile * profile,
+    vision_segment_callback_t callback,
+    void * callback_user_data);
+
+bool vision_image_encode_with_callback(
+    struct vision_ctx * ctx,
+    int n_threads,
+    struct vision_image_f32 * img,
+    float * vec,
+    int block_group_size,
+    vision_segment_callback_t callback,
+    void * callback_user_data);
 
 // batch encode 开关：是否对多个尺寸相同的 slice 启用批量编码优化
 // 默认关闭；只有大图/高清高刷等 slice 数较多的场景才建议开启

@@ -134,6 +134,9 @@ typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 typedef struct ggml_backend *        ggml_backend_t;
 namespace omni {
 namespace flow {
+
+using token2wav_segment_callback_t = void (*)(int segment_id, int segment_count,
+                                               void * user_data);
 class flowExtraModelLoaderGGUF {
   public:
     flowExtraModelLoaderGGUF();
@@ -1647,6 +1650,23 @@ struct flowStreamCacheHost {
                estimator_att_cache.empty();
     }
 };
+
+// Graph/cache accounting for a stream session. The same timestep ranges are
+// used by the standalone benchmark and by cooperative runtime dispatch.
+struct flowDispatchDiagnostics {
+    int    n_timesteps = 0;
+    int    nonlast_nodes = 0;
+    int    last_nodes = 0;
+    int    nonlast_segments = 0;
+    int    last_segments = 0;
+    size_t compute_buffer_bytes = 0;
+    size_t conformer_cache_bytes = 0;
+    size_t estimator_cnn_cache_bytes = 0;
+    size_t estimator_att_cache_bytes = 0;
+    uint64_t cache_pack_concat_ops = 0;
+    size_t cache_pack_bytes_estimate = 0;
+};
+
 class flowGGUFModelRunner {
   public:
     flowGGUFModelRunner();
@@ -1660,6 +1680,8 @@ class flowGGUFModelRunner {
                         const std::string & device);
     void set_num_threads(int n_threads);
     const std::string & backend_name() const { return loader_.backend_name(); }
+    // 返回 flow(token2mel) 子模型的 GPU backend
+    ggml_backend_t backend() const { return loader_.backend(); }
     void set_export_caches_to_host(bool enable) { export_caches_to_host_ = enable; }
     void reset_stream();
     bool setup_cache(const int32_t *       token_bt,
@@ -1683,12 +1705,19 @@ class flowGGUFModelRunner {
                          int                         n_timesteps,
                          float                       temperature,
                          std::vector<float> &        mel_bct_out,
-                         flowStreamCacheHost &       cache_out);
+                         flowStreamCacheHost &       cache_out,
+                         token2wav_segment_callback_t segment_callback = nullptr,
+                         void *                       segment_callback_user_data = nullptr);
     bool init_from_host_caches(const flowStreamCacheHost & cache_host,
                                const float *               spk_bc,
                                int64_t                     B,
                                int                         n_timesteps,
                                float                       temperature);
+    bool get_dispatch_diagnostics(flowDispatchDiagnostics & diagnostics) const;
+
+    // Reset the deterministic benchmark noise stream. Runtime callers should
+    // never use this: the stream is intentionally continuous across chunks.
+    static void reset_noise_sequence_for_benchmark();
 
     // ============== ANE 路径专用：encoder-only inference ==============
     // 与 inference_chunk 共享 conformer cache（cache_in/out 中只用 conformer 部分），
@@ -2066,7 +2095,15 @@ class Token2Mel {
                                              int                 n_timesteps = -1,
                                              float               temperature = -1.0f);
 
-    bool push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out);
+    bool push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final,
+                     std::vector<float> & mel_bct_out,
+                     token2wav_segment_callback_t segment_callback = nullptr,
+                     void * segment_callback_user_data = nullptr);
+
+    // Number of token2mel graph ranges available for cooperative runtime
+    // boundaries.  Zero means the backend does not expose the GGUF split
+    // graph (for example the ANE path).
+    int cooperative_segment_count(bool last_chunk) const;
 
     bool push_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & mel_bct_out) {
         return push_tokens(tokens.data(), (int64_t) tokens.size(), is_final, mel_bct_out);
@@ -2075,6 +2112,13 @@ class Token2Mel {
     void reset_stream();
 
     bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
+
+    // 返回 flow(GGUF) runner 的 GPU backend（ANE/CPU 模式下可能为 NULL）
+    ggml_backend_t backend() const { return runner_.backend(); }
+    bool get_dispatch_diagnostics(flowDispatchDiagnostics & diagnostics) const {
+        return runner_.get_dispatch_diagnostics(diagnostics);
+    }
+    void copy_last_mel(std::vector<float> & mel_bct_out) const { mel_bct_out = last_mel_bct_; }
 
     static constexpr int32_t kMelChannels  = 80;
     static constexpr int32_t kSpkDim       = 192;
@@ -2101,7 +2145,10 @@ class Token2Mel {
     enum class Backend { GGUF, ANE };
 
     bool ensure_ready_for_infer() const;
-    bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct);
+    bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk,
+                         std::vector<float> & mel_bct,
+                         token2wav_segment_callback_t segment_callback = nullptr,
+                         void * segment_callback_user_data = nullptr);
 
     // CoreML 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 CoreML。
     bool start_stream_ane_(const flowStreamCacheHost & host_cache);
@@ -2117,6 +2164,7 @@ class Token2Mel {
     float temperature_ = 1.0f;
 
     std::vector<float> spk_bc_;
+    std::vector<float> last_mel_bct_; // benchmark-only capture, enabled by OMNI_T2W_CAPTURE_MEL
 
     flowStreamCacheHost cache_in_;
 
@@ -2220,7 +2268,9 @@ class Token2Wav {
                             int64_t              n_tokens,
                             bool                 is_final,
                             std::vector<float> & wave_bt_out,
-                            int64_t &            out_T_audio);
+                            int64_t &            out_T_audio,
+                            token2wav_segment_callback_t segment_callback = nullptr,
+                            void * segment_callback_user_data = nullptr);
 
     bool push_tokens_window(const std::vector<int32_t> & tokens,
                             bool                         is_final,
@@ -2232,6 +2282,27 @@ class Token2Wav {
     void reset_stream();
 
     static constexpr int32_t kSampleRate = omni::vocoder::hifigan2::hg2_hift_generator::HG2_SAMPLING_RATE;
+
+    // 返回 token2mel(flow) 的 GPU backend；vocoder 的 backend 见 vocoder_backend()
+    ggml_backend_t t2m_backend() const { return t2m_.backend(); }
+
+    ggml_backend_t vocoder_backend() const { return voc_model_.backend; }
+    bool get_dispatch_diagnostics(flowDispatchDiagnostics & diagnostics) const {
+        return t2m_.get_dispatch_diagnostics(diagnostics);
+    }
+    int cooperative_segment_count(bool last_chunk) const {
+        return t2m_.cooperative_segment_count(last_chunk);
+    }
+    void copy_last_token2mel(std::vector<float> & mel_bct_out) const { t2m_.copy_last_mel(mel_bct_out); }
+
+    // 遗留：无活跃调用方。空跑一次 vocoder（零输入、丢弃输出、不动流式缓存），
+    // 把首次提交计算的一次性代价从第一个音频窗口挪到 init。
+    bool warmup_vocoder();
+
+    // 预热：空跑一个完整窗口（token2mel + vocoder），预热 flow 侧的首次运行成本
+    // （图捕获/实例化、内核加载）。会写脏流式状态，调用方必须随后重新 start_stream 复位；
+    // 见 Token2WavSession::init_from_prompt_cache_gguf 里的用法。
+    bool warmup_pipeline(int32_t n_tokens = 28);
 
   private:
     Token2Mel t2m_;
@@ -2284,6 +2355,15 @@ struct Token2WavSession {
     }
 
     bool feed_window(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & wave_bt_out);
+
+    bool feed_window_with_callback(const int32_t * tokens, int64_t n_tokens, bool is_final,
+                                   std::vector<float> & wave_bt_out,
+                                   token2wav_segment_callback_t segment_callback,
+                                   void * segment_callback_user_data);
+
+    int cooperative_segment_count(bool last_chunk) const {
+        return t2w.cooperative_segment_count(last_chunk);
+    }
 
     bool feed_window(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & wave_bt_out) {
         return feed_window(tokens.data(), (int64_t) tokens.size(), is_final, wave_bt_out);

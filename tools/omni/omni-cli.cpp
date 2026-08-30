@@ -163,7 +163,7 @@ static void print_model_paths(const OmniModelPaths & paths) {
 }
 
 void test_case(struct omni_context *ctx_omni, common_params& params, std::string data_path_prefix, int cnt){
-    // 🔧 单工模式：先 prefill 所有输入，然后 decode 一次生成完整回复
+    // 单工模式：先 prefill 所有输入，然后 decode 一次生成完整回复
     // 使用同步模式 prefill，避免 async 模式下的竞态条件
     ctx_omni->system_prompt_initialized = false;
     bool orig_async = ctx_omni->async;
@@ -395,8 +395,8 @@ int main(int argc, char ** argv) {
     if (!params.token2wav_coreml_model_path.empty()) {
         printf("  T2W CoreML: %s\n", params.token2wav_coreml_model_path.c_str());
     }
-    
-    // 🔧 Token2Wav 使用 GPU（Metal），已用 ggml_add+ggml_repeat 替代不支持的 ggml_add1
+
+    // Token2Wav 走 GPU 后端；图内用 ggml_add+ggml_repeat 替代metal后端不支持的 ggml_add1
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir, -1, "gpu:0");
     if (ctx_omni == nullptr) {
         fprintf(stderr, "Error: Failed to initialize omni context\n");

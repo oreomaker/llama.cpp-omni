@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <stddef.h>
@@ -156,6 +157,9 @@ struct audition_context_params {
 struct audition_ctx * audition_init(const char * fname, struct audition_context_params ctx_params);
 
 void audition_free(struct audition_ctx * ctx);
+
+// 返回 APM 的 CUDA/GPU 计算 backend（无则 NULL）。当前无调用方，预留给调度层。
+ggml_backend_t audition_get_backend(struct audition_ctx * ctx);
 
 int audition_n_output_tokens(const struct audition_ctx * ctx, struct audition_audio_f32 * audio);
 

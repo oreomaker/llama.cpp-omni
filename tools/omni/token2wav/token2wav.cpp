@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 namespace omni {
 namespace flow {
@@ -26,6 +27,19 @@ bool Token2WavSession::init_from_prompt_cache_gguf(const std::string & encoder_g
     }
     if (!t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
         return false;
+    }
+    // 预热：空跑一个窗口，把 flow + vocoder 的首次运行成本（图捕获/实例化、内核加载）
+    // 移出第一个真实窗口，再重新 start_stream 把被写脏的流式状态复位。
+    // 默认开启，OMNI_T2W_WARMUP=0 关闭。
+    {
+        const char * w = getenv("OMNI_T2W_WARMUP");
+        if (w == nullptr || atoi(w) != 0) {
+            if (t2w.warmup_pipeline() &&
+                !t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
+                std::fprintf(stderr, "Token2WavSession: warmup 后 start_stream 复位失败\n");
+                return false;
+            }
+        }
     }
     const auto   t1     = std::chrono::steady_clock::now();
     const double init_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -75,6 +89,17 @@ bool Token2WavSession::feed_window(const int32_t *      tokens,
         return false;
     }
     return true;
+}
+
+bool Token2WavSession::feed_window_with_callback(
+        const int32_t * tokens, int64_t n_tokens, bool is_final,
+        std::vector<float> & wave_bt_out,
+        token2wav_segment_callback_t segment_callback,
+        void * segment_callback_user_data) {
+    wave_bt_out.clear();
+    int64_t T_audio = 0;
+    return t2w.push_tokens_window(tokens, n_tokens, is_final, wave_bt_out, T_audio,
+                                  segment_callback, segment_callback_user_data);
 }
 
 bool Token2WavSession::feed_window(const int32_t *              tokens,

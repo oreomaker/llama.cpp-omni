@@ -1,3 +1,5 @@
+#pragma once
+
 #include "ggml.h"
 #include "llama.h"
 #include "tts-condition-graph.h"
@@ -12,6 +14,9 @@
 #include <chrono>
 #include <functional>
 #include <atomic>
+#include <cstdint>
+#include <utility>
+#include <unordered_map>
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -29,15 +34,14 @@ class Token2WavSession;
 }
 }
 
-// 🔧 [Duplex Pipeline] 仅在 duplex_mode=true 时分配；
-// 定义在 omni.cpp 的 "===== DUPLEX PIPELINE (Stage 1) =====" 区域，
+// 仅在 duplex_mode=true 时分配（定义在 duplex_core.cpp）。
 // omni_context 只持有指针，simplex 路径不受影响。
 struct DuplexPipeline;
 
-// 定义在 omni.cpp 的 "===== DUPLEX SESSION (high-level) =====" 区域。
-// 封装了 prefill_worker / decode_worker 两条调度线程，
-// 让外部只需要 push_frame / wait_next_frame，无需知道 stream_prefill/stream_decode
-// 的"index 语义"和并发约束。
+// 高层 duplex 会话（定义在 duplex_core.cpp）。
+// 封装 prefill_worker / decode_worker 两条调度线程，
+// 让外部只需要 push_frame / wait_next_frame，无需关心 stream_prefill/stream_decode
+// 的 index 语义和并发约束。
 struct DuplexSession;
 
 //
@@ -48,7 +52,6 @@ struct omni_embed {
     int n_pos;
 };
 struct omni_embeds{
-    // 🔧 [高清模式] vision_embed 改为二维 vector
     // vision_embed[0] = overview embed (64 tokens * hidden_size)
     // vision_embed[1..n] = slice embeds (各 64 tokens * hidden_size)
     std::vector<std::vector<float>> vision_embed;
@@ -76,7 +79,9 @@ struct T2WOut {
     std::vector<llama_token> audio_tokens;  // Audio token IDs (25 tokens per chunk)
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
-    int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
+    int round_idx = -1;  // 轮次索引（TTS 设置、T2W 用它确定输出目录）
+    uint64_t frame_id = 0;
+    int chunk_idx = -1;
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
 };
 
@@ -93,8 +98,9 @@ struct T2WThreadInfo {
 
 // Projector Semantic: 2-layer MLP (LLM hidden states -> TTS embedding)
 // forward(x): relu(linear1(x)) -> linear2
+
 // ==================== 滑动窗口配置 ====================
-// 🔧 [#39] 基于 Python stream_decoder.py 的 DuplexWindowConfig
+// 参数对齐 Python stream_decoder.py 的 DuplexWindowConfig
 struct SlidingWindowConfig {
     // 滑窗模式: "off" / "basic" / "context"
     // - "off": 禁用滑窗
@@ -117,8 +123,8 @@ struct UnitEntry {
     std::string type;              // 类型: "audio" / "video" / "omni" / "system" / "response"
     std::vector<llama_token> generated_tokens;  // 生成的 tokens
     bool is_listen = false;        // 是否是 listen 状态
-    // 🔧 [turn 级滑窗] 该 unit 所属 turn 的 id
-    // 一个 turn = 一轮完整的 [用户输入 prefill + 模型 response] 序列
+    // 该 unit 所属 turn 的 id。
+    // 一个 turn = 一轮完整的 [用户输入 prefill + 模型 response] 序列；
     // 同一 turn 内的 prefill unit 和 response unit 共享同一个 turn_id，
     // turn 结束（TURN_EOS / ended_with_listen 等）时 current_turn_id++，
     // 滑窗时优先把整个最早的已完成 turn 一次性丢掉。
@@ -161,19 +167,18 @@ using audio_output_cb_t = std::function<void(const float * samples, int n_sample
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
     struct audition_ctx * ctx_audio = NULL;
-    
+
+
     struct llama_context * ctx_llama = NULL;
     struct llama_model * model = NULL;
     struct common_sampler * ctx_sampler = NULL;
     
-    // 🔧 [单双工适配] 是否拥有模型（用于 omni_free 时决定是否释放模型）
-    // true: omni_init 内部加载的模型，omni_free 时需要释放
-    // false: 外部传入的已有模型（模型复用），omni_free 时不释放
+    // 是否拥有模型（决定 omni_free 时是否释放）。
+    // true: omni_init 内部加载，omni_free 时释放；false: 外部传入（模型复用），不释放。
     bool owns_model = true;
 
-    // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
-    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
-    // length_penalty < 1.0 会增加 EOS 概率，让模型更早结束
+    // 调整 EOS token 的采样概率：
+    // > 1.0 降低 EOS 概率（生成更长）；< 1.0 提高 EOS 概率（更早结束）。
     float length_penalty = 1.0f;
 
     struct llama_context * ctx_tts_llama = NULL;
@@ -228,11 +233,10 @@ struct omni_context {
     int total_unit_fallbacks = 0;        // 仅 turn 模式：整 turn 丢不动 → 退化按 unit 丢的次数；
                                          //   非 turn 模式恒为 0
 
-    // 🔧 [turn 级滑窗] 当前正在构建的 turn id
-    // 每个 UnitEntry 注册时会被打上 current_turn_id，
-    // 在 turn 边界（round_start_positions 推进处）会把 current_turn_id++。
-    // sliding_window_enforce 先按 turn 丢，当 unit_history 里只剩 turn_id == current_turn_id
-    // 的 unit（即只剩当前正在构建、还没收尾的 turn）时，退化为按 unit 丢。
+    // 当前正在构建的 turn id。
+    // 每个 UnitEntry 注册时被打上 current_turn_id；在 turn 边界推进处 ++。
+    // sliding_window_enforce 先按 turn 丢；当 unit_history 里只剩 turn_id == current_turn_id
+    // 的 unit（即只剩当前未收尾的 turn）时，退化为按 unit 丢。
     int current_turn_id = 0;
     
     bool async = false;
@@ -243,21 +247,23 @@ struct omni_context {
     struct TTSThreadInfo *tts_thread_info = NULL;
     struct T2WThreadInfo *t2w_thread_info = NULL;
 
-    // 🔧 [Duplex Pipeline - Stage 1]
-    // 仅在 duplex_mode=true && async=true 时由 omni_init / stream_prefill(index=0) 分配。
-    // 作用：取代 duplex 路径下的老 llm_thread_func，把"VPM+APM 编码"和
-    //      "LLM prefill + autoregressive decode" 拆成两个独立常驻线程，
-    //      并通过自有的细粒度锁解耦，为后续阶段的 encoder 并行、
-    //      batch 融合打基础。
-    // 生命周期：omni_free 中通过 duplex_pipeline_free 销毁。
-    // 非 duplex_mode 下始终为 nullptr。
+    // 仅在 duplex_mode=true && async=true 时分配。
+    // 取代 duplex 路径下的老 llm_thread_func：把"VPM+APM 编码"和
+    // "LLM prefill + autoregressive decode" 拆成两个独立常驻线程，
+    // 用细粒度锁解耦，为 encoder 并行、batch 融合打基础。
+    // 由 omni_free 里的 duplex_stop_threads 销毁；非 duplex_mode 下始终为 nullptr。
     DuplexPipeline * duplex = NULL;
 
     // 高层 duplex 会话句柄；由 omni_duplex_session_begin 分配，session_end 销毁。
     // 持有内部 prefill_worker/decode_worker 线程及 frame 队列。
     // omni_free 时若仍存在，会被强制 session_end 释放。
     DuplexSession * duplex_session = NULL;
-    
+
+    // T2W 线程记录每个音频窗口完成的绝对 wall 时间（epoch ms）。
+    // 由 T2W 线程在每次 wav 落盘时追加（供 TTFA：帧结果到达后第一个 wav）。
+    std::mutex t2w_wav_mtx;
+    std::vector<double> t2w_wav_walls;
+
     volatile bool need_speek = false;
     volatile bool speek_done = true;
     
@@ -278,8 +284,8 @@ struct omni_context {
     //                     用于彻底关闭当前会话，需要重新 omni_init
     std::atomic<bool> session_stop_event{false};
     
-    // 🔧 [双工模式] 记录当前 decode 是否以 <|listen|> 结束
-    // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
+    // 记录当前 decode 是否以 <|listen|> 结束。
+    // 如果是，则不清理 KV cache，让后续音频片段继续累积上下文。
     std::atomic<bool> ended_with_listen{false};
     
     // [滑窗专用] 记录最近一次 decode 结果是 LISTEN 还是 SPEAK
@@ -287,9 +293,8 @@ struct omni_context {
     // 只由 decode 的实际输出驱动（LISTEN→true, SPEAK→false）
     std::atomic<bool> slide_last_was_listen{true};
     
-    // 🔧 [与 Python 对齐] LLM 生成结束标志
-    // 当 LLM 检测到 end token 时设置为 true
-    // TTS 线程检查此标志来决定是否添加 text_eos_embed
+    // LLM 生成结束标志：检测到 end token 时置 true，
+    // TTS 线程据此决定是否添加 text_eos_embed。
     std::atomic<bool> llm_generation_done{false};
     
     // ==================== 双工模式参数 ====================
@@ -331,14 +336,14 @@ struct omni_context {
     std::string tts_bin_dir = "";
     std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
     
-    // 🔧 [高清/高刷模式] 
-    // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
-    // high_refresh: 高刷模式，1秒5帧，第1帧作为主图，后4帧stack合并成一张图
-    //               注意：stack 处理在 Python server 层实现，C++ 只是标记
+    // 高清/高刷模式：
+    // high_image: 高清模式，max_slice_nums 设为 2，vision 看更多细节。
+    // high_refresh: 高刷模式，1 秒 5 帧，第 1 帧作主图、后 4 帧 stack 合并成一张图。
+    //               注意：stack 处理在 Python server 层实现，C++ 只打标记。
     bool high_image = false;
     bool high_refresh = false;
-    
-    // 🔧 [多实例支持] 可配置的输出目录，避免多个服务实例冲突
+
+    // 可配置的输出目录，避免多个服务实例冲突。
     std::string base_output_dir = "./tools/omni/output";
     
     // 每次会话，是否清除 kv cache（默认开启自动清理 kv cache）
@@ -402,18 +407,16 @@ struct omni_context {
     int tts_condition_n_embd = 0;  // Embedding dimension (768)
     bool tts_condition_saved = false;  // Whether condition has been saved
     
-    // 🔧 TTS KV cache 累计位置（用于保持跨 chunk 的上下文连续性）
-    // Python TTSStreamingGenerator 使用 text_start_pos 来跟踪位置
+    // TTS KV cache 累计位置（跨 chunk 上下文连续性）。
+    // 对应 Python TTSStreamingGenerator 的 text_start_pos。
     int tts_n_past_accumulated = 0;
-    
-    // 🔧 [关键修复] TTS 已生成的所有 audio tokens（跨 chunk 累积）
-    // Python: self.all_generated_tokens 是类成员变量，跨 chunk 持续累积
-    // 用于：1. RAS 重复检测（需要完整历史）2. 正确判断 audio_bos（只有第一个 token 才是）
+
+    // TTS 已生成的所有 audio tokens（跨 chunk 累积，对应 Python self.all_generated_tokens）。
+    // 用途：1. RAS 重复检测（需完整历史）；2. 判断 audio_bos（仅第一个 token 是）。
     std::vector<llama_token> tts_all_generated_tokens;
-    
-    // 🔧 [与 Python 对齐] TTS audio token buffer（跨 text chunk 累积）
-    // Python: self._token_buffer 是类成员变量，用于累积 audio token
-    // 只有满足 chunk_size (25) 才会 yield，不足的保留到下一个 text chunk
+
+    // TTS audio token buffer（跨 text chunk 累积，对应 Python self._token_buffer）。
+    // 攒够 chunk_size (25) 才 yield，不足的保留到下一个 text chunk。
     std::vector<int32_t> tts_token_buffer;
     
     // Timestamp for stream_decode start (used for WAV file naming)
@@ -424,9 +427,8 @@ struct omni_context {
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
     
-    // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
-    // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
-    // macOS 上默认使用 C++ 实现（无 CUDA）
+    // 使用 Python stepaudio2 库实现 Token2Wav（true = Python，精度更高；false = C++）。
+    // macOS 上默认用 C++（无 CUDA）。
     bool use_python_token2wav = false;
     audio_output_cb_t audio_output_cb = nullptr; // called by T2W threads when a chunk of audio is ready
     std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
@@ -439,10 +441,9 @@ struct omni_context {
     bool python_t2w_initialized = false;
     std::string python_t2w_gpu_id;      // GPU ID (如 "0", "1")
     
-    // 🔧 Python T2W 独立 GPU 配置
-    // C++ LLM+TTS 占用约 22GB，Python T2W 占用约 3.3GB
-    // 单卡 24GB 放不下，需要使用独立 GPU
-    // 设置为空字符串表示使用与 C++ 相同的 GPU
+    // Python T2W 独立 GPU 配置。
+    // C++ LLM+TTS 约 22GB、Python T2W 约 3.3GB，单卡 24GB 放不下，需独立 GPU。
+    // 空字符串 = 与 C++ 共用 GPU。
     std::string python_t2w_dedicated_gpu = "";  // 独立 GPU ID，如 "1"
     
     // Token2Wav sliding window buffer (跨 chunk 保持状态)
@@ -452,7 +453,7 @@ struct omni_context {
     int token2wav_wav_idx = 0;  // 输出 WAV 文件计数器
     int wav_turn_base = 0;      // 每轮对话结束时 +1000，用于区分不同轮次的 WAV 文件
     
-    // 🔧 [单工模式] 当前轮次索引（用于创建 round_000、round_001 等子目录）
+    // 单工模式当前轮次索引（用于创建 round_000、round_001 等子目录）。
     int simplex_round_idx = 0;
     
     // ==================== 特殊 Token ID ====================
@@ -541,6 +542,9 @@ struct OmniDuplexFrame {
     std::string img_fname;          // 该帧图片文件路径，空字符串表示无图片
     int max_slice_nums = -1;        // 与 stream_prefill 同义；-1 表示用全局
     int64_t user_seq = 0;           // 调用方自定义序号，原样回传到 result
+    // Optional producer hint.  A non-negative value is explicit (including
+    // zero for back-to-back input); -1 keeps timestamp inference.
+    double expected_interval_ms = -1.0;
 };
 
 struct OmniDuplexFrameResult {
@@ -553,7 +557,14 @@ struct OmniDuplexFrameResult {
     double   ms_prefill_submit = 0; // push_frame → prefill_worker 完成提交（不等编码）
     double   ms_decode = 0;         // decode_worker 内部 stream_decode 阻塞时长
     double   ms_total = 0;          // push_frame → 本帧 result 出队的端到端 wall time
+    double   ms_ttft = 0;           // TTFT: push_frame → 本帧 LLM 首个输出 token（仅 SPEAK 帧有效，>0）
 };
+
+// T2W 每个音频窗口完成的绝对 wall 时间（epoch ms），FAR/TTFA 用。
+// 由 T2W 线程在每次 wav 落盘时追加；测试程序经 omni_duplex_get_wav_walls 读取，
+// 对每个 SPEAK 帧取"帧结果到达后第一个 wav"算 TTFA（push → 该帧首段音频）。
+void omni_duplex_get_wav_walls(struct omni_context * ctx_omni,
+                               std::vector<double> & out);
 
 // 启动一次 duplex 会话。
 //   ctx_omni      : 已经 omni_init() + ctx_omni->async = true + duplex_mode = true 的上下文
@@ -598,6 +609,17 @@ bool clean_kvcache(struct omni_context * ctx_omni);
 
 // TTS 推理函数声明（用于 test_tts_inference.cpp）
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);
+
+// TTS 音频 token 自回归生成（benchmark hook，与 tts_thread_func_duplex 内部同路径）。
+// 输入 merged condition embeddings（文本 emb_text + projector(hidden) + L2norm，不含 audio_bos），
+// 内部追加 audio_bos（is_end_of_turn 时先追加 text_eos），生成最多 max_audio_tokens 个 audio token。
+// output_audio_tokens 输出 relative audio token id（0..6561）。
+bool generate_audio_tokens_local(struct omni_context * ctx_omni, common_params * params,
+                                 const std::vector<float>& merged_embeddings, int n_tokens,
+                                 int tts_n_embd, int chunk_idx, std::vector<int32_t>& output_audio_tokens,
+                                 bool is_end_of_turn = false, const std::string& output_dir = "",
+                                 std::chrono::steady_clock::time_point queue_enter = {},
+                                 uint64_t frame_id = 0);
 bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, float* embed, int n_pos, int n_batch, int* n_past_tts);
 // sample_tts_token 参数说明：
 // - all_generated_tokens: 跨 chunk 累积的所有 tokens（用于判断是否是整个过程的第一个 token，即 re-forward condition）

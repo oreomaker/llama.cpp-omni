@@ -30,6 +30,7 @@ typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bo
 #endif
 #include <cstring>
 #include <memory>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -41,6 +42,11 @@ typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bo
 #ifndef ENABLE_STDERR_LOG
 #define ENABLE_STDERR_LOG 0
 #endif
+
+static bool t2w_capture_mel_enabled() {
+    const char * value = std::getenv("OMNI_T2W_CAPTURE_MEL");
+    return value != nullptr && std::atoi(value) != 0;
+}
 
 // token2wav 每次调用图的形状完全固定（chunk_size、n_timesteps、head_dim 都是编译期常量，
 // KV cache 到达 max_t_cache 后也不再增长），因此 ggml-cuda 对 GGML_OP_ADD 的
@@ -710,7 +716,7 @@ int fmCausalConditionalCFM::out_channels() const {
 void fmCausalConditionalCFM::reset_stream_state() const {
     chunk_call_id_ = 0;
 }
-// 生成噪声张量（使用真随机数）
+// 生成噪声张量（固定种子，可复现）
 ggml_tensor * fmCausalConditionalCFM::deterministic_noise(ggml_context * ctx,
                                                           int64_t        C,
                                                           int64_t        T,
@@ -724,7 +730,7 @@ ggml_tensor * fmCausalConditionalCFM::deterministic_noise(ggml_context * ctx,
     if (!ggml_get_no_alloc(ctx)) {
         float *       data  = static_cast<float *>(noise->data);
         const int64_t total = C * T * B;
-        // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
+        // 用伪随机噪声替代周期性波形，避免音频伪影
         static std::mt19937 gen(42);  // 固定种子保证可复现
         std::normal_distribution<float> dist(0.0f, 1.0f);
         for (int64_t i = 0; i < total; ++i) {
@@ -966,6 +972,11 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
         ggml_tensor * dphi      = ggml_sub(ctx, term_main, term_cfg);
         ggml_tensor * dphi_scaled = ggml_scale(ctx, dphi, dt);
         x                         = ggml_add(ctx, x, dphi_scaled);
+        {
+            char name_buf[80];
+            std::snprintf(name_buf, sizeof(name_buf), "fm_cfm_x_chunk%d_step%d", call_id, step);
+            ggml_set_name(x, name_buf);
+        }
         if (cache_out != nullptr) {
             // 1.B: 在 ggml 中 concat 会新分配并 memcpy 两个 operand，
             //      之前的顺序累加 (ggml_concat(acc, x_i)) 是 O(N²) 字节拷贝。
@@ -2330,7 +2341,7 @@ void fmFlowMatchingGGUFModelLoader::fill_noise_ctb(std::vector<float> & noise_ct
                                                    int64_t              offset_ct) {
     noise_ctb.resize((size_t) C * (size_t) T * (size_t) B);
     const int64_t total = C * T * B;
-    // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
+    // 用伪随机噪声替代周期性波形，避免音频伪影
     static std::mt19937 gen(42);  // 固定种子保证可复现
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int64_t i = 0; i < total; ++i) {
@@ -3047,7 +3058,7 @@ ggml_tensor * ueMaskUtils::make_pad_mask(ggml_context * ctx, ggml_tensor * lengt
     ggml_tensor * len_minus_i_tb = ggml_sub(ctx, lengths_tb, seq_range_tb);
     ggml_tensor * valid_f32_tb   = ggml_step(ctx, len_minus_i_tb);
     ggml_tensor * one_f32    = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
-    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    // 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
     ggml_tensor * neg_valid  = ggml_neg(ctx, valid_f32_tb);
     ggml_tensor * one_rep    = ggml_repeat(ctx, one_f32, neg_valid);
     ggml_tensor * pad_f32_tb = ggml_add(ctx, neg_valid, one_rep);
@@ -3756,7 +3767,7 @@ ggml_tensor * ueMultiHeadedAttention::build_forward_attention(ggml_context * ctx
     if (mask != nullptr) {
         ggml_tensor * valid_bh      = ue_mha_prepare_valid_mask_bh(ctx, mask, T_k, T_q, B, (int) H);
         ggml_tensor * one_f32       = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
-        // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+        // 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
         ggml_tensor * neg_valid     = ggml_neg(ctx, valid_bh);
         ggml_tensor * one_rep       = ggml_repeat(ctx, one_f32, neg_valid);
         ggml_tensor * masked_bh     = ggml_add(ctx, neg_valid, one_rep);
@@ -4425,7 +4436,7 @@ ggml_tensor * ue_uce_make_valid_mask(ggml_context * ctx, ggml_tensor * lengths_b
     ggml_tensor * pad_f32_tb =
         (pad_i32_tb->type == GGML_TYPE_F32) ? pad_i32_tb : ggml_cast(ctx, pad_i32_tb, GGML_TYPE_F32);
     ggml_tensor * one_f32      = ggml_arange(ctx, 1.0f, 2.0f, 1.0f);
-    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    // 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
     ggml_tensor * neg_pad      = ggml_neg(ctx, pad_f32_tb);
     ggml_tensor * one_rep      = ggml_repeat(ctx, one_f32, neg_pad);
     ggml_tensor * valid_f32_tb = ggml_add(ctx, neg_pad, one_rep);
@@ -5021,7 +5032,7 @@ ggml_tensor * hg2_f0_predictor::hg_f0_predictor_build_graph(ggml_context * ctx, 
         return nullptr;
     }
     ggml_tensor * bias_s = ggml_reshape_4d(ctx, linear_bias, 1, 1, 1, 1);
-    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    // 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
     ggml_tensor * bias_rep = ggml_repeat(ctx, bias_s, y_tb);
     y_tb                 = ggml_add(ctx, y_tb, bias_rep);
     y_tb                 = ggml_abs(ctx, y_tb);
@@ -6102,7 +6113,7 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     ggml_tensor * fn_tdb = ggml_mul(ctx, f0_tdb, hm_tdb);
     ggml_tensor * rad_tdb = ggml_scale(ctx, fn_tdb, 1.0f / float(HG2_SAMPLING_RATE));
     rad_tdb               = ggml_cont(ctx, rad_tdb);
-    // 🔧 用 reshape + sum + scale 替代 ggml_interpolate 下采样，支持 Metal 加速
+    // 用 reshape + sum + scale 替代 ggml_interpolate 下采样，支持 Metal 加速
     // 下采样 [T, dim, B] -> [Tm, dim, B]，对每 scale 个值取平均
     const int64_t scale_ds = HG2_UPSAMPLE_SCALE;
     // reshape [T, dim, B] -> [scale, Tm, dim, B]
@@ -6134,7 +6145,7 @@ bool hg2_sine_gen2::hg_sine_gen2_build_graph(ggml_context * ctx,
     phase_tdb = ggml_scale(ctx, phase_tdb, 2.0f * float(M_PI));
     phase_tdb = ggml_cont(ctx, phase_tdb);
     ggml_tensor * phase_t1db    = ggml_reshape_4d(ctx, phase_tdb, Tm, 1, dim, B);
-    // 🔧 用线性插值替代 ggml_interpolate BILINEAR，支持 Metal 加速
+    // 用线性插值替代 ggml_interpolate BILINEAR，支持 Metal 加速
     // 关键：相位需要平滑过渡，不能用 repeat（会产生电音）
     // 方法：对每个 frame 的相位差进行线性展开
     // phase[i] 到 phase[i+1] 之间的 scale 个点应该是线性递增的
@@ -6291,7 +6302,7 @@ bool hg2_source_nsf2::hg_source_nsf2_build_graph(ggml_context * ctx,
     ggml_tensor * mm   = ggml_mul_mat(ctx, sine_2d, w);
     ggml_tensor * y_tb = ggml_reshape_2d(ctx, mm, T, B);
     ggml_tensor * b_s = ggml_reshape_4d(ctx, linear_bias, 1, 1, 1, 1);
-    // 🔧 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
+    // 用 ggml_add + ggml_repeat 替代 ggml_add1，支持 Metal 加速
     ggml_tensor * b_rep = ggml_repeat(ctx, b_s, y_tb);
     y_tb              = ggml_add(ctx, y_tb, b_rep);
     y_tb              = ggml_tanh(ctx, y_tb);
@@ -7409,6 +7420,11 @@ void runner_build_cosine_t_span(int n_timesteps, std::vector<float> & t_span_out
         t_span_out[(size_t) i] = 1.0f - std::cos(u * 0.5f * kPi);
     }
 }
+static std::mt19937 & runner_noise_generator() {
+    static std::mt19937 gen(42);
+    return gen;
+}
+
 void runner_fill_noise_ctb(std::vector<float> & noise_ctb,
                     int64_t              C,
                     int64_t              T,
@@ -7417,13 +7433,14 @@ void runner_fill_noise_ctb(std::vector<float> & noise_ctb,
                     int64_t              offset_ct) {
     noise_ctb.resize((size_t) C * (size_t) T * (size_t) B);
     const int64_t total = C * T * B;
-    // 🔧 使用真随机数替代周期性伪噪声，避免音频伪影
-    static std::mt19937 gen(42);  // 固定种子保证可复现
+    // 使用连续的固定种子序列保证跨 chunk 可复现；不要在每个 chunk 重置。
+    std::mt19937 & gen = runner_noise_generator();
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int64_t i = 0; i < total; ++i) {
         noise_ctb[(size_t) i] = temperature * dist(gen);
     }
 }
+
 void runner_fill_timestep_1d(std::vector<float> & t_host, int64_t B_total, float t_value) {
     t_host.resize((size_t) B_total);
     for (int64_t i = 0; i < B_total; ++i) {
@@ -7512,6 +7529,88 @@ int64_t runner_n_elements_approx(const ggml_tensor * t) {
     }
     return n;
 }
+
+// The chunk graph is built in topological order. Each timestep has a named
+// input tensor, so the ranges between successive timestep inputs are stable
+// graph boundaries without rebuilding or copying any device-resident tensor.
+static bool runner_collect_timestep_ranges(
+        ggml_cgraph * gf, int n_timesteps, std::vector<std::pair<int, int>> & ranges) {
+    ranges.clear();
+    if (gf == nullptr || n_timesteps <= 0) {
+        return false;
+    }
+    std::vector<int> step_nodes;
+    step_nodes.reserve((size_t) n_timesteps);
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        const char * name = node != nullptr ? ggml_get_name(node) : nullptr;
+        if (name == nullptr || std::strstr(name, "fm_cfm_x_chunk") == nullptr ||
+            std::strstr(name, "_step") == nullptr) {
+            continue;
+        }
+        const char * step = std::strstr(name, "_step");
+        char * end = nullptr;
+        const long step_idx = std::strtol(step + 5, &end, 10);
+        if (end == step + 5 || step_idx < 0 || step_idx >= n_timesteps) {
+            continue;
+        }
+        if ((size_t) step_idx >= step_nodes.size()) {
+            step_nodes.resize((size_t) step_idx + 1, -1);
+        }
+        step_nodes[(size_t) step_idx] = i;
+    }
+    if ((int) step_nodes.size() != n_timesteps) {
+        return false;
+    }
+    for (int i = 0; i < n_timesteps; ++i) {
+        if (step_nodes[(size_t) i] < 0 || (i > 0 && step_nodes[(size_t) i] <= step_nodes[(size_t) i - 1])) {
+            ranges.clear();
+            return false;
+        }
+    }
+    for (int i = 0; i < n_timesteps; ++i) {
+        const int begin = i == 0 ? 0 : step_nodes[(size_t) i];
+        const int end = i + 1 < n_timesteps ? step_nodes[(size_t) i + 1] : ggml_graph_n_nodes(gf);
+        if (begin >= end) {
+            ranges.clear();
+            return false;
+        }
+        ranges.emplace_back(begin, end);
+    }
+    return true;
+}
+
+static bool runner_split_dispatch_enabled() {
+    const char * value = std::getenv("OMNI_T2W_DISPATCH");
+    return value != nullptr && std::strcmp(value, "split") == 0;
+}
+
+static bool runner_split_dispatch_forced_full() {
+    const char * value = std::getenv("OMNI_T2W_DISPATCH");
+    return value != nullptr && std::strcmp(value, "full") == 0;
+}
+
+static bool runner_split_profile_enabled() {
+    const char * value = std::getenv("OMNI_T2W_SPLIT_PROFILE");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+static ggml_status runner_dispatch_graph(
+        ggml_backend_t backend, ggml_cgraph * gf, const std::vector<std::pair<int, int>> & ranges,
+        bool split, bool disable_cuda_graph, const char * graph_kind,
+        token2wav_segment_callback_t segment_callback,
+        void * segment_callback_user_data) {
+    (void) ranges; (void) split; (void) graph_kind; (void) segment_callback; (void) segment_callback_user_data;
+    if (disable_cuda_graph) {
+        omni_set_cuda_disable_graph(backend, true);
+    }
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (disable_cuda_graph) {
+        omni_set_cuda_disable_graph(backend, false);
+    }
+    return status;
+}
+
 ggml_tensor * runner_slice_time_dim1_4d(ggml_context * ctx, ggml_tensor * x, int64_t t0, int64_t tlen) {
     const size_t  off = x->nb[1] * (size_t) t0;
     ggml_tensor * v   = ggml_view_4d(ctx, x, x->ne[0], tlen, x->ne[2], x->ne[3], x->nb[1], x->nb[2], x->nb[3], off);
@@ -7563,6 +7662,8 @@ struct flowGGUFModelRunner::streamSession {
     ggml_cgraph * gf_setup   = nullptr;
     ggml_cgraph * gf_nonlast = nullptr;
     ggml_cgraph * gf_last    = nullptr;
+    std::vector<std::pair<int, int>> split_ranges_nonlast;
+    std::vector<std::pair<int, int>> split_ranges_last;
     int call_id_setup   = -1;
     int call_id_nonlast = -1;
     int call_id_last    = -1;
@@ -7608,6 +7709,11 @@ bool flowGGUFModelRunner::load_from_gguf(const std::string & encoder_gguf_path,
     reset_stream();
     return true;
 }
+
+void flowGGUFModelRunner::reset_noise_sequence_for_benchmark() {
+    runner_noise_generator().seed(42);
+}
+
 void flowGGUFModelRunner::set_num_threads(int n_threads) {
     num_threads_ = n_threads > 0 ? n_threads : 1;
     if (loader_.backend() && !runner_backend_is_device(loader_.backend())) {
@@ -7799,6 +7905,8 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_att_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
+        runner_collect_timestep_ranges(sess_->gf_nonlast, n_timesteps, sess_->split_ranges_nonlast);
+        runner_collect_timestep_ranges(sess_->gf_last, n_timesteps, sess_->split_ranges_last);
 
         
         ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
@@ -7876,7 +7984,9 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                                           int                         n_timesteps,
                                           float                       temperature,
                                           std::vector<float> &        mel_bct_out,
-                                          flowStreamCacheHost &       cache_out) {
+                                          flowStreamCacheHost &       cache_out,
+                                          token2wav_segment_callback_t segment_callback,
+                                          void *                       segment_callback_user_data) {
     mel_bct_out.clear();
     cache_out.clear();
     if (!token_bt || !spk_bc || B <= 0 || T_token <= 0) {
@@ -7945,6 +8055,25 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                          last_chunk ? "gf_last" : "gf_nonlast");
             std::fprintf(stderr, "[profile] n_nodes=%d n_timesteps=%d T_chunk_token=%lld B=%lld\n",
                          ggml_graph_n_nodes(gf), n_timesteps, (long long) sess_->T_chunk_token, (long long) B);
+            // op 直方图（零扰动，代替被 GGML_LOG_INFO 压掉的 ggml_graph_print），
+            // 用来看 flow 图里有哪些算子。
+            {
+                const int nn = ggml_graph_n_nodes(gf);
+                std::vector<int> cnt(GGML_OP_COUNT, 0);
+                std::vector<int> ucnt(GGML_UNARY_OP_COUNT, 0);
+                for (int i = 0; i < nn; ++i) {
+                    ggml_tensor * nd = ggml_graph_node(gf, i);
+                    cnt[nd->op]++;
+                    if (nd->op == GGML_OP_UNARY) ucnt[ggml_get_unary_op(nd)]++;
+                }
+                std::vector<std::pair<int,int>> v;
+                for (int o = 0; o < GGML_OP_COUNT; ++o) if (cnt[o]) v.push_back({cnt[o], o});
+                std::sort(v.rbegin(), v.rend());
+                std::fprintf(stderr, "[profile] op histogram (%s):\n", last_chunk ? "gf_last" : "gf_nonlast");
+                for (auto & p : v) std::fprintf(stderr, "[profile]   %-24s %d\n", ggml_op_name((ggml_op) p.second), p.first);
+                for (int u = 0; u < GGML_UNARY_OP_COUNT; ++u) if (ucnt[u])
+                    std::fprintf(stderr, "[profile]   UNARY:%-18s %d\n", ggml_unary_op_name((ggml_unary_op) u), ucnt[u]);
+            }
             ggml_graph_print(gf);
         }
     }
@@ -7966,17 +8095,20 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
             const char * e = std::getenv("OMNI_T2W_DISABLE_LAST_GRAPH");
             return !e || std::string(e) != "0"; // default on; "0" to opt out
         }();
-        if (disable_last_graph) {
-            omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/true);
-        }
-        const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
-        if (disable_last_graph) {
-            omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/false);
-        }
+        // Supplying a segment callback is the production runtime opt-in for
+        // split dispatch.  Keep OMNI_T2W_DISPATCH=split working for the
+        // standalone benchmark even when no scheduler callback is present.
+        const bool split_dispatch = !runner_split_dispatch_forced_full() &&
+            (runner_split_dispatch_enabled() || segment_callback != nullptr);
+        const auto & split_ranges = last_chunk ? sess_->split_ranges_last : sess_->split_ranges_nonlast;
+        const ggml_status st = runner_dispatch_graph(
+            loader_.backend(), gf, split_ranges, split_dispatch && !split_ranges.empty(),
+            disable_last_graph, last_chunk ? "last" : "nonlast",
+            segment_callback, segment_callback_user_data);
         if (st != GGML_STATUS_SUCCESS) {
             return false;
         }
-        if (runner_backend_is_device(loader_.backend())) {
+        if (runner_backend_is_device(loader_.backend()) && !(split_dispatch && !split_ranges.empty())) {
             ggml_backend_synchronize(loader_.backend());
         }
     }
@@ -8441,6 +8573,8 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         ggml_build_forward_expand(sess_->gf_last, cpy_conf_att_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_cnn_2);
         ggml_build_forward_expand(sess_->gf_last, cpy_est_att_2);
+        runner_collect_timestep_ranges(sess_->gf_nonlast, n_timesteps, sess_->split_ranges_nonlast);
+        runner_collect_timestep_ranges(sess_->gf_last, n_timesteps, sess_->split_ranges_last);
 
         ggml_cgraph * gf_alloc = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 1024, false);
         ggml_build_forward_expand(gf_alloc, sess_->out_feat_nonlast_ctb);
@@ -8505,6 +8639,53 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         backend_tensor_set(loader_.backend(), sess_->est_att_cache, cache_host.estimator_att_cache.data(),
                                          cache_host.estimator_att_cache.size());
         ggml_backend_synchronize(loader_.backend());
+    }
+    return true;
+}
+
+static size_t runner_tree_concat_copy_bytes(int parts, size_t bytes_per_part) {
+    size_t copied = 0;
+    while (parts > 1) {
+        const int pairs = parts / 2;
+        copied += (size_t) pairs * 2 * bytes_per_part;
+        parts = (parts + 1) / 2;
+        bytes_per_part *= 2;
+    }
+    return copied;
+}
+
+bool flowGGUFModelRunner::get_dispatch_diagnostics(flowDispatchDiagnostics & diagnostics) const {
+    diagnostics = flowDispatchDiagnostics{};
+    if (!sess_ || !sess_->ctx || !sess_->gf_nonlast || !sess_->gf_last || !sess_->galloc) {
+        return false;
+    }
+    diagnostics.n_timesteps = sess_->n_timesteps;
+    diagnostics.nonlast_nodes = ggml_graph_n_nodes(sess_->gf_nonlast);
+    diagnostics.last_nodes = ggml_graph_n_nodes(sess_->gf_last);
+    diagnostics.nonlast_segments = (int) sess_->split_ranges_nonlast.size();
+    diagnostics.last_segments = (int) sess_->split_ranges_last.size();
+    diagnostics.compute_buffer_bytes = ggml_gallocr_get_buffer_size(sess_->galloc, 0);
+    diagnostics.conformer_cache_bytes = ggml_nbytes(sess_->conf_cnn_cache) + ggml_nbytes(sess_->conf_att_cache);
+    diagnostics.estimator_cnn_cache_bytes = ggml_nbytes(sess_->est_cnn_cache);
+    diagnostics.estimator_att_cache_bytes = ggml_nbytes(sess_->est_att_cache);
+
+    const int steps = diagnostics.n_timesteps;
+    const int depth = loader_.estimator() ? loader_.estimator()->depth() : 0;
+    if (steps > 0 && depth > 0 && diagnostics.estimator_cnn_cache_bytes > 0 &&
+        diagnostics.estimator_att_cache_bytes > 0) {
+        // The graph performs one balanced tree concat across depth block caches
+        // for each step, followed by one balanced tree concat across steps.
+        diagnostics.cache_pack_concat_ops = (uint64_t) 2 *
+            ((uint64_t) steps * (uint64_t) (depth - 1) + (uint64_t) (steps - 1));
+        const size_t cnn_block_bytes = diagnostics.estimator_cnn_cache_bytes / ((size_t) steps * (size_t) depth);
+        const size_t att_block_bytes = diagnostics.estimator_att_cache_bytes / ((size_t) steps * (size_t) depth);
+        const size_t cnn_step_bytes = cnn_block_bytes * (size_t) depth;
+        const size_t att_step_bytes = att_block_bytes * (size_t) depth;
+        diagnostics.cache_pack_bytes_estimate =
+            (size_t) steps * (runner_tree_concat_copy_bytes(depth, cnn_block_bytes) +
+                               runner_tree_concat_copy_bytes(depth, att_block_bytes)) +
+            runner_tree_concat_copy_bytes(steps, cnn_step_bytes) +
+            runner_tree_concat_copy_bytes(steps, att_step_bytes);
     }
     return true;
 }
@@ -9001,7 +9182,22 @@ bool Token2Mel::ensure_ready_for_infer() const {
     return true;
 }
 
-bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct) {
+int Token2Mel::cooperative_segment_count(bool last_chunk) const {
+    if (backend_kind_ != Backend::GGUF || runner_split_dispatch_forced_full()) {
+        return 0;
+    }
+    flowDispatchDiagnostics diagnostics;
+    if (!runner_.get_dispatch_diagnostics(diagnostics)) {
+        return 0;
+    }
+    const int count = last_chunk ? diagnostics.last_segments : diagnostics.nonlast_segments;
+    return count > 0 ? count : 0;
+}
+
+bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk,
+                                std::vector<float> & mel_bct,
+                                token2wav_segment_callback_t segment_callback,
+                                void * segment_callback_user_data) {
     // 用于推理一个固定窗口(dt=28)并更新内部cache
     mel_bct.clear();
     if (!ensure_ready_for_infer()) {
@@ -9015,7 +9211,7 @@ bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last
 
     flowStreamCacheHost cache_out;
     if (!runner_.inference_chunk(chunk_bt.data(), 1, kDt, spk_bc_.data(), kSpkDim, last_chunk, cache_in_, n_timesteps_,
-                                 temperature_, mel_bct, cache_out)) {
+                                 temperature_, mel_bct, cache_out, segment_callback, segment_callback_user_data)) {
         LOG_ERROR( "Token2Mel.infer_one_chunk: runner.inference_chunk failed\n");
         return false;
     }
@@ -9404,7 +9600,10 @@ void Token2Mel::append_bct_along_time(const std::vector<float> & src_bct,
     dst_bct_inout.swap(next);
 }
 
-bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out) {
+bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final,
+                            std::vector<float> & mel_bct_out,
+                            token2wav_segment_callback_t segment_callback,
+                            void * segment_callback_user_data) {
     // 用于将tokens补齐并推理一次(必要时按n_tokens裁剪输出T)
     mel_bct_out.clear();
     if (!ensure_ready_for_infer()) {
@@ -9428,7 +9627,8 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
     std::vector<float> mel_chunk_bct;
     const bool ok = (backend_kind_ == Backend::ANE)
                         ? infer_one_chunk_ane_(chunk_bt, is_final, mel_chunk_bct)
-                        : infer_one_chunk(chunk_bt, is_final, mel_chunk_bct);
+                        : infer_one_chunk(chunk_bt, is_final, mel_chunk_bct,
+                                          segment_callback, segment_callback_user_data);
     if (!ok) {
         return false;
     }
@@ -9456,6 +9656,10 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
 
     append_bct_along_time(mel_chunk_bct, 1, kMelChannels, mel_bct_out);
 
+    if (t2w_capture_mel_enabled()) {
+        last_mel_bct_ = mel_bct_out;
+    }
+
     return true;
 }
 
@@ -9464,6 +9668,7 @@ void Token2Mel::reset_stream() {
     stream_started_ = false;
     spk_bc_.clear();
     cache_in_.clear();
+    last_mel_bct_.clear();
     // ANE 模式：重置 per-timestep cache（不释放 ane_handle_，可复用）
     ane_cnn_caches_.clear();
     ane_att_caches_.clear();
@@ -9673,6 +9878,43 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
     return true;
 }
 
+// 遗留：无活跃调用方。空跑一次 vocoder：把首次提交计算的一次性代价
+// （stream 创建、内核/模块加载、首次 CUDA graph 捕获+实例化）提前到 init，
+// 不再落进第一个音频窗口（实测该代价 200~450ms 且不稳定）。
+// 形状对齐稳态窗口：T_mel = mel cache(8) + 1s 音频(50 帧)，cache_source 取满 Tc=kSourceCacheLen。
+// 输入全零、输出丢弃，不触碰任何流式缓存（voc_mel_cache_ / voc_cache_source_ / voc_speech_cache_）。
+bool Token2Wav::warmup_vocoder() {
+    if (!models_loaded_ || voc_model_.backend == nullptr) {
+        return false;
+    }
+    const int64_t T_mel = (int64_t) kMelCacheLen + (int64_t) (kSampleRate / kSamplesPerMel);
+    const int64_t Tc    = (int64_t) kSourceCacheLen;
+
+    std::vector<float> mel_bct((size_t) (T_mel * Token2Mel::kMelChannels), 0.0f);
+    std::vector<float> cache_source_bt1((size_t) Tc, 0.0f);
+    std::vector<float> wave_bt;
+    std::vector<float> source_bt1;
+    int64_t            T_audio = 0, T_source = 0;
+
+    return voc_runner_.voc_hg2_runner_eval_stream(mel_bct, T_mel, cache_source_bt1, Tc, wave_bt, T_audio, source_bt1,
+                                                  T_source);
+}
+
+// 预热：空跑一个完整窗口，预热 token2mel(flow) 侧的首次运行成本。
+// warmup_vocoder 只覆盖 vocoder；flow 的首次图捕获/内核加载仍留在第一个真实窗口里，实测使首窗
+// 260~290ms（稳态约 130ms），且该窗口结束时若正撞上一次 LLM decode，会把它由 26ms 拖到 76~86ms。
+// 用 pad token 走与真实窗口相同的形状（默认 28 = CHUNK_SIZE + PRE_LOOKAHEAD）。
+// 副作用：会写入 t2m 流式状态与 voc 缓存，调用方必须随后重新 start_stream 复位。
+bool Token2Wav::warmup_pipeline(int32_t n_tokens) {
+    if (!models_loaded_ || n_tokens <= 0) {
+        return false;
+    }
+    std::vector<int32_t> tokens((size_t) n_tokens, Token2Mel::kPadToken);
+    std::vector<float>   wave;
+    int64_t              T_audio = 0;
+    return push_tokens_window(tokens, /*is_final=*/false, wave, T_audio);
+}
+
 bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                                     int                 n_timesteps,
                                                     float               temperature) {
@@ -9718,7 +9960,9 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
                                    int64_t              n_tokens,
                                    bool                 is_final,
                                    std::vector<float> & wave_bt_out,
-                                   int64_t &            out_T_audio) {
+                                   int64_t &            out_T_audio,
+                                   token2wav_segment_callback_t segment_callback,
+                                   void *                segment_callback_user_data) {
     wave_bt_out.clear();
     out_T_audio = 0;
 
@@ -9741,7 +9985,16 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
 
     std::vector<float> mel_bct;
     const auto         t_t2m0 = clock::now();
-    if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct)) {
+    // A scheduler callback means this window is running under the
+    // cooperative runtime path.  In that path the GGUF token2mel runner
+    // emits one callback per timestep range; ANE/non-GGUF keeps the legacy
+    // single token2mel -> vocoder boundary.
+    const int t2m_split_segments = segment_callback != nullptr
+        ? t2m_.cooperative_segment_count(is_final) : 0;
+    const bool split_dispatch = t2m_split_segments > 0;
+    if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct,
+                          split_dispatch ? segment_callback : nullptr,
+                          split_dispatch ? segment_callback_user_data : nullptr)) {
         LOG_ERROR("Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
         return false;
     }
@@ -9764,6 +10017,13 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     if (mel_bct.size() % (size_t) Token2Mel::kMelChannels != 0) {
         LOG_ERROR( "Token2Wav.push_tokens_window: invalid mel size (not divisible by 80)\n");
         return false;
+    }
+
+    // Non-split backends retain the original token2mel -> vocoder boundary.
+    // Split GGUF dispatch already emitted all timestep boundaries above; its
+    // final callback started the extra vocoder segment.
+    if (segment_callback != nullptr && !split_dispatch) {
+        segment_callback(0, 2, segment_callback_user_data);
     }
 
     std::vector<float> mel_in_bct = voc_mel_cache_bct_;

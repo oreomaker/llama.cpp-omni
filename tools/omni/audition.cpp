@@ -1317,6 +1317,10 @@ void audition_free(audition_ctx * ctx) {
     delete ctx;
 }
 
+ggml_backend_t audition_get_backend(audition_ctx * ctx) {
+    return ctx ? ctx->backend : nullptr;
+}
+
 
 //
 // audition processor
@@ -1559,14 +1563,14 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         LOG_ERR("%s: expected output %d tokens, got %d\n", 
                 __func__, expected_n_tokens_out, n_tokens_out);
         
-        // 🔧 [安全检查] 如果输出 0 tokens，返回 false 而不是 abort
+        // 输出 0 tokens 时返回 false 而不是 abort
         if (n_tokens_out == 0) {
             LOG_WRN("%s: audio encoding produced 0 tokens, returning false\n", __func__);
             return false;
         }
         
-        // 🔧 [修复] 由于 pooling 边界的舍入误差，允许 ±1 token 的差异
-        // 这种情况在处理非整数秒的音频时很常见
+        // pooling 边界的舍入误差可能造成 ±1 token 的差异，允许该范围
+        // 处理非整数秒的音频时很常见
         const int diff = abs(n_tokens_out - expected_n_tokens_out);
         if (diff <= 1) {
             LOG_WRN("%s: token count mismatch within tolerance (expected=%d, got=%d, diff=%d), continuing\n",
@@ -2051,9 +2055,7 @@ bool audition_audio_preprocess(
     LOG_INF("%s: Decoded audio - sample_rate=%d, n_samples=%zu\n",
             __func__, sample_rate, pcm_f32.size());
     
-    // 🔧 [修复] 将音频 pad 到 100ms 的倍数（1600 samples @ 16kHz）
-    // 这是为了确保 Whisper encoder 的输出 token 数与预期一致
-    // 原因：
+    // 将音频 pad 到 100ms 的倍数（1600 samples @ 16kHz），确保 Whisper encoder 的输出 token 数与预期一致：
     //   - mel_frames = n_samples / 160
     //   - conv2 下采样 2 倍：mel_frames / 2
     //   - pool (k=5, s=5)：(mel_frames/2 - 5) / 5 + 1

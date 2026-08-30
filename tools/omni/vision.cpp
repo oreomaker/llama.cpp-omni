@@ -13,6 +13,7 @@
 #endif
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -204,11 +205,11 @@ struct vision_ctx {
 
     int max_nodes = 8192;
     
-    // 🔧 [高清模式] 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
+    // 运行时覆盖 max_slice_nums，-1 表示使用模型默认值
     int max_slice_nums_override = -1;
 
-    // 🔧 [batch encode 开关] 是否对多个尺寸相同的 slice 启用批量编码优化。
-    // 默认 false（关闭）—— 该优化只在大图/高清高刷等 slice 数较多时收益明显，
+    // 是否对多个尺寸相同的 slice 启用批量编码优化。
+    // 默认 false（关闭）——该优化只在大图等 slice 数较多时收益明显，
     // 并非通用场景，因此需要显式开启。
     bool batch_encode = false;
 
@@ -532,6 +533,7 @@ struct vision_graph {
                 cb(cur, "ffn_out_scaled", il);
             }
             cur = ggml_add(ctx0, inpL, cur);
+            ggml_format_name(cur, "vit_block_%d_out", il);
             cb(cur, "layer_out", il);
 
             inpL = cur;
@@ -670,6 +672,7 @@ struct vision_graph {
                     cb(cur, "ffn_out_scaled", il);
                 }
                 cur = ggml_add(ctx0, inpL, cur);
+                ggml_format_name(cur, "vit_block_%d_out", il);
                 cb(cur, "layer_out", il);
 
                 inpL = cur;
@@ -846,6 +849,7 @@ private:
 
             // residual 2
             cur = ggml_add(ctx0, inpL, cur);
+            ggml_format_name(cur, "vit_block_%d_out", il);
             cb(cur, "layer_out", il);
 
             inpL = cur;
@@ -1636,6 +1640,10 @@ void vision_free(vision_ctx * ctx) {
     delete ctx;
 }
 
+ggml_backend_t vision_get_backend(vision_ctx * ctx) {
+    return ctx ? ctx->backend : nullptr;
+}
+
 
 //
 // vision processor
@@ -1895,7 +1903,7 @@ struct llava_uhd {
         res.overview_size = best_size;
 
         {
-            // 🔧 [高清模式] 优先使用运行时覆盖值，否则使用模型默认值
+            // 优先使用运行时覆盖值，否则使用模型默认值
             const int max_slice_nums = (ctx->max_slice_nums_override >= 0) 
                                        ? ctx->max_slice_nums_override 
                                        : ctx->model.hparams.minicpmv_max_slice_nums;
@@ -2284,11 +2292,78 @@ int vision_n_mmproj_embd(const struct vision_ctx * ctx) {
     }
 }
 
+int vision_n_layers(const struct vision_ctx * ctx) {
+    return ctx != nullptr ? ctx->model.hparams.n_layer : 0;
+}
+
 
 //
 // vision forward
 //
-bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const vision_image_f32_batch * imgs_c_ptr, float * vec) {
+struct vision_block_group_eval_state {
+    int group_size = 0;
+    int n_layers = 0;
+    int last_boundary_layer = -1;
+    std::chrono::steady_clock::time_point segment_start;
+    vision_block_group_profile * profile = nullptr;
+    vision_segment_callback_t callback = nullptr;
+    void * callback_user_data = nullptr;
+};
+
+static int vision_block_output_layer(const ggml_tensor * tensor) {
+    static constexpr char prefix[] = "vit_block_";
+    static constexpr char suffix[] = "_out";
+    const char * name = tensor != nullptr ? ggml_get_name(tensor) : nullptr;
+    if (name == nullptr || std::strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long layer = std::strtol(name + sizeof(prefix) - 1, &end, 10);
+    if (end == nullptr || std::strcmp(end, suffix) != 0 || layer < 0 || layer > INT32_MAX) {
+        return -1;
+    }
+    return (int) layer;
+}
+
+static bool vision_block_group_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * state = static_cast<vision_block_group_eval_state *>(user_data);
+    const int layer = vision_block_output_layer(tensor);
+    const bool boundary = layer >= 0 && layer + 1 < state->n_layers &&
+        (layer + 1) % state->group_size == 0;
+    if (ask) {
+        return boundary;
+    }
+    if (!boundary) {
+        return true;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (state->profile != nullptr) {
+        state->profile->segments.push_back({
+            state->last_boundary_layer + 1,
+            layer,
+            std::chrono::duration<double, std::milli>(now - state->segment_start).count(),
+        });
+    }
+    if (state->callback != nullptr) {
+        const int segment_id = (layer + 1) / state->group_size - 1;
+        const int segment_count = (state->n_layers + state->group_size - 1) / state->group_size;
+        state->callback(segment_id, segment_count, state->callback_user_data);
+    }
+    state->last_boundary_layer = layer;
+    state->segment_start = now;
+    return true;
+}
+
+static bool vision_image_batch_encode_impl(
+        vision_ctx * ctx,
+        const int n_threads,
+        const vision_image_f32_batch * imgs_c_ptr,
+        float * vec,
+        int block_group_size,
+        vision_block_group_profile * profile,
+        vision_segment_callback_t callback,
+        void * callback_user_data) {
     const vision_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
 
@@ -2504,10 +2579,47 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
         }
     }
 
+    vision_block_group_eval_state group_state;
+    if (profile != nullptr) {
+        profile->n_layers = hparams.n_layer;
+        profile->block_group_size = block_group_size;
+        profile->graph_nodes = ggml_graph_n_nodes(gf);
+        profile->segments.clear();
+    }
+    if (block_group_size > 0 && block_group_size < hparams.n_layer &&
+            (profile != nullptr || callback != nullptr)) {
+        group_state.group_size = block_group_size;
+        group_state.n_layers = hparams.n_layer;
+        group_state.profile = profile;
+        group_state.callback = callback;
+        group_state.callback_user_data = callback_user_data;
+        group_state.segment_start = std::chrono::steady_clock::now();
+        ggml_backend_sched_set_eval_callback(
+            ctx->sched.get(), vision_block_group_eval_callback, &group_state);
+    }
+
+    const auto compute_start = std::chrono::steady_clock::now();
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    const auto compute_end = std::chrono::steady_clock::now();
+    ggml_backend_sched_set_eval_callback(ctx->sched.get(), nullptr, nullptr);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    if (profile != nullptr) {
+        if (block_group_size > 0 && block_group_size < hparams.n_layer) {
+            profile->segments.push_back({
+                group_state.last_boundary_layer + 1,
+                hparams.n_layer - 1,
+                std::chrono::duration<double, std::milli>(compute_end - group_state.segment_start).count(),
+            });
+        } else {
+            profile->segments.push_back({
+                0,
+                hparams.n_layer - 1,
+                std::chrono::duration<double, std::milli>(compute_end - compute_start).count(),
+            });
+        }
     }
 
     // print debug nodes
@@ -2538,22 +2650,73 @@ bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const visi
     return true;
 }
 
+bool vision_image_batch_encode(vision_ctx * ctx, const int n_threads, const vision_image_f32_batch * imgs_c_ptr, float * vec) {
+    return vision_image_batch_encode_impl(ctx, n_threads, imgs_c_ptr, vec, 0, nullptr, nullptr, nullptr);
+}
+
+bool vision_image_batch_encode_block_groups(
+        vision_ctx * ctx,
+        int n_threads,
+        const vision_image_f32_batch * imgs,
+        int block_group_size,
+        float * vec,
+        vision_block_group_profile * profile) {
+    if (ctx == nullptr || imgs == nullptr || vec == nullptr || profile == nullptr || block_group_size < 0) {
+        return false;
+    }
+    return vision_image_batch_encode_impl(ctx, n_threads, imgs, vec, block_group_size, profile, nullptr, nullptr);
+}
+
+bool vision_image_batch_encode_block_groups_with_callback(
+        vision_ctx * ctx,
+        int n_threads,
+        const vision_image_f32_batch * imgs,
+        int block_group_size,
+        float * vec,
+        vision_block_group_profile * profile,
+        vision_segment_callback_t callback,
+        void * callback_user_data) {
+    if (ctx == nullptr || imgs == nullptr || vec == nullptr || block_group_size < 0) {
+        return false;
+    }
+    return vision_image_batch_encode_impl(ctx, n_threads, imgs, vec, block_group_size, profile,
+                                          callback, callback_user_data);
+}
+
 bool vision_image_encode(struct vision_ctx * ctx, const int n_threads, vision_image_f32 * img, float * vec) {
+    return vision_image_encode_with_callback(ctx, n_threads, img, vec, 0, nullptr, nullptr);
+}
+
+bool vision_image_encode_with_callback(
+        vision_ctx * ctx,
+        int n_threads,
+        vision_image_f32 * img,
+        float * vec,
+        int block_group_size,
+        vision_segment_callback_t callback,
+        void * callback_user_data) {
+    if (ctx == nullptr || img == nullptr || vec == nullptr || block_group_size < 0) {
+        return false;
+    }
     vision_image_f32_batch imgs;
     vision_image_f32_ptr img_copy(vision_image_f32_init());
     *img_copy = *img;
     imgs.entries.push_back(std::move(img_copy));
 
 #if defined(ENABLE_COREML)
-    if (!ctx->coreml_model_path.empty()) {
+    if (!ctx->coreml_model_path.empty() && callback == nullptr) {
         LOG_INF("vision use CoreML (ANE)\n");
         return vision_image_batch_encode_coreml(ctx, &imgs, vec);
     }
 #endif
+    if (callback != nullptr) {
+        return vision_image_batch_encode_block_groups_with_callback(
+            ctx, n_threads, &imgs, block_group_size, vec, nullptr, callback, callback_user_data);
+    }
     return vision_image_batch_encode(ctx, n_threads, &imgs, vec);
 }
 
-// 🔧 [高清模式] 设置 max_slice_nums 覆盖值
+// 设置 max_slice_nums 覆盖值
 void vision_set_max_slice_nums(struct vision_ctx * ctx, int max_slice_nums) {
     if (ctx) {
         ctx->max_slice_nums_override = max_slice_nums;
@@ -2561,7 +2724,7 @@ void vision_set_max_slice_nums(struct vision_ctx * ctx, int max_slice_nums) {
     }
 }
 
-// 🔧 [batch encode 开关] 设置/读取多 slice 批量编码优化
+// 设置多 slice 批量编码优化开关（配套 getter：vision_get_batch_encode）
 void vision_set_batch_encode(struct vision_ctx * ctx, bool enable) {
     if (ctx) {
         ctx->batch_encode = enable;
