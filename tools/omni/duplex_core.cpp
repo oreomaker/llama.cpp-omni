@@ -65,26 +65,24 @@ void duplex_stop_threads(omni_context * ctx_omni) {
     DuplexPipeline * dup = ctx_omni->duplex;
 
     dup->running.store(false);
-    dup->encoder_cv.notify_all();
+    dup->pending_cv.notify_all();
     dup->llm_cv.notify_all();
-    dup->decode_done_cv.notify_all();
 
     if (dup->encoder_thread.joinable()) dup->encoder_thread.join();
     if (dup->llm_thread.joinable())     dup->llm_thread.join();
 
-    // 清理残留
-    while (!dup->encoder_queue.empty()) {
-        delete dup->encoder_queue.front();
-        dup->encoder_queue.pop();
+    // 清理残留帧（未消费的 stream 帧 / 未编码的 session 帧）
+    while (!dup->pending_frames.empty()) {
+        delete dup->pending_frames.front();
+        dup->pending_frames.pop();
     }
     while (!dup->prefill_queue.empty()) {
         delete dup->prefill_queue.front();
         dup->prefill_queue.pop();
     }
     if (dup->pending_decode) {
-        dup->pending_decode->done.store(true);
-        dup->pending_decode->ok.store(false);
-        dup->decode_done_cv.notify_all();
+        // 停线程时 llm_owner 可能没来得及消费 stream 帧；由仍在等它的 duplex_decode
+        // 负责释放，这里只清槽位防悬挂。
         dup->pending_decode = nullptr;
     }
 
@@ -107,32 +105,31 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
     const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
     while (dup->running.load()) {
-        DuplexEncodeReq * req = nullptr;
+        DuplexFrame * frame = nullptr;
         {
-            std::unique_lock<std::mutex> lk(dup->encoder_mtx);
-            dup->encoder_cv.wait(lk, [&]{
-                return !dup->encoder_queue.empty() || !dup->running.load();
+            std::unique_lock<std::mutex> lk(dup->pending_mtx);
+            dup->pending_cv.wait(lk, [&]{
+                return !dup->pending_frames.empty() || !dup->running.load();
             });
             if (!dup->running.load()) break;
-            req = dup->encoder_queue.front();
-            dup->encoder_queue.pop();
+            frame = dup->pending_frames.front();
+            dup->pending_frames.pop();
         }
-        dup->encoder_cv.notify_all();  // 唤醒可能在等队列空位的 producer
-        if (!req) continue;
+        dup->pending_cv.notify_all();  // 唤醒可能在等队列空位的 push 侧
+        if (!frame) continue;
 
-        DuplexPrefillPacket * packet = new DuplexPrefillPacket();
-        packet->index = req->index;
+        frame->stage = FrameStage::ENCODING;
 
-        const bool has_img = !req->img_fname.empty() && ctx_omni->ctx_vision != nullptr;
-        const bool has_aud = !req->aud_fname.empty();
+        const bool has_img = !frame->input.img_fname.empty() && ctx_omni->ctx_vision != nullptr;
+        const bool has_aud = !frame->input.aud_fname.empty();
 
         auto t_enc_begin = std::chrono::high_resolution_clock::now();
 
         // vision_set_max_slice_nums 只改 ctx_vision 的一个配置字段，不影响 ctx_audio，
         // 所以放在 VPM 任务启动之前（主线程）设置是安全的；若放 VPM 任务内部设置，
         // 也不会被 APM 看到。
-        if (has_img && req->max_slice_nums >= 1) {
-            vision_set_max_slice_nums(ctx_omni->ctx_vision, req->max_slice_nums);
+        if (has_img && frame->input.max_slice_nums >= 1) {
+            vision_set_max_slice_nums(ctx_omni->ctx_vision, frame->input.max_slice_nums);
         }
 
         // ---- VPM 任务 ----
@@ -142,11 +139,11 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             if (!omni_image_embed_make_chunks_with_filename(
                     ctx_omni->ctx_vision,
                     params->cpuparams.n_threads,
-                    req->img_fname,
-                    packet->vision_embed)) {
+                    frame->input.img_fname,
+                    frame->vision_embed)) {
                 LOG_ERR("Duplex encoder: vision encode failed for %s\n",
-                        req->img_fname.c_str());
-                packet->vision_embed.clear();
+                        frame->input.img_fname.c_str());
+                frame->vision_embed.clear();
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -157,15 +154,15 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             if (!has_aud) return 0.0;
             auto t0 = std::chrono::high_resolution_clock::now();
             auto * audio_embeds = omni_audio_embed_make_with_filename(
-                ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname);
+                ctx_omni->ctx_audio, params->cpuparams.n_threads, frame->input.aud_fname);
             if (audio_embeds != nullptr && audio_embeds->n_pos > 0) {
-                packet->audio_embed.resize(audio_embeds->n_pos * hidden_size);
-                std::memcpy(packet->audio_embed.data(), audio_embeds->embed,
-                            packet->audio_embed.size() * sizeof(float));
+                frame->audio_embed.resize(audio_embeds->n_pos * hidden_size);
+                std::memcpy(frame->audio_embed.data(), audio_embeds->embed,
+                            frame->audio_embed.size() * sizeof(float));
                 omni_embed_free(audio_embeds);
             } else {
                 LOG_WRN("Duplex encoder: audio encode returned empty for %s\n",
-                        req->aud_fname.c_str());
+                        frame->input.aud_fname.c_str());
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -188,10 +185,12 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
 
         print_with_timestamp(
             "[prof] encoder index=%d VPM=%.1fms APM=%.1fms wall=%.1fms parallel_savings=%.1fms\n",
-            req->index, vpm_ms, apm_ms, enc_wall_ms,
+            frame->index, vpm_ms, apm_ms, enc_wall_ms,
             (vpm_ms + apm_ms) - enc_wall_ms);
 
-        delete req;
+        // 编码完成（VPM/APM 失败只清空对应 embed，帧仍可 prefill，与旧行为一致）
+        frame->encode_ok = true;
+        frame->stage = FrameStage::PREFILLED;
 
         // ---- push to llm prefill_queue ----
         {
@@ -201,10 +200,10 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
                     || !dup->running.load();
             });
             if (!dup->running.load()) {
-                delete packet;
+                delete frame;
                 break;
             }
-            dup->prefill_queue.push(packet);
+            dup->prefill_queue.push(frame);
         }
         dup->llm_cv.notify_all();
     }
@@ -373,7 +372,7 @@ static inline void append_raw_emb(std::vector<float> & fused,
 // 如果 emb_cache 未初始化，回退到原始多段路径（duplex_do_prefill_one）。
 // ---------------------------------------------------------------------------
 static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params * params,
-                                        DuplexPrefillPacket * packet,
+                                        DuplexFrame * frame,
                                         int hidden_size,
                                         int * out_fused_ntok = nullptr) {
     DuplexPipeline * dup = ctx_omni->duplex;
@@ -384,9 +383,9 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
     int  n_past_0 = ctx_omni->n_past;
 
     int n_audio_tokens = (hidden_size > 0)
-        ? (int)(packet->audio_embed.size() / hidden_size) : 0;
+        ? (int)(frame->audio_embed.size() / hidden_size) : 0;
     bool has_audio  = (n_audio_tokens > 0);
-    bool has_vision = !packet->vision_embed.empty();
+    bool has_vision = !frame->vision_embed.empty();
 
     if (ctx_omni->sliding_window_config.mode != "off") {
         sliding_window_register_unit_start(ctx_omni);
@@ -398,14 +397,14 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
 
     bool build_ok = true;
     if (has_vision) {
-        int n_chunks         = (int)packet->vision_embed.size();
-        int tokens_per_chunk = (int)packet->vision_embed[0].size() / hidden_size;
+        int n_chunks         = (int)frame->vision_embed.size();
+        int tokens_per_chunk = (int)frame->vision_embed[0].size() / hidden_size;
         bool has_slices      = (n_chunks > 1);
 
         build_ok &= append_text_emb(dup, "<unit><image>", fused, fused_ntok);
         if (build_ok) {
             append_raw_emb(fused, fused_ntok,
-                           packet->vision_embed[0].data(), tokens_per_chunk, hidden_size);
+                           frame->vision_embed[0].data(), tokens_per_chunk, hidden_size);
         }
         build_ok &= append_text_emb(dup, "</image>", fused, fused_ntok);
         if (build_ok && has_slices) {
@@ -413,7 +412,7 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
                 build_ok &= append_text_emb(dup, "<slice>", fused, fused_ntok);
                 if (build_ok) {
                     append_raw_emb(fused, fused_ntok,
-                                   packet->vision_embed[i].data(), tokens_per_chunk, hidden_size);
+                                   frame->vision_embed[i].data(), tokens_per_chunk, hidden_size);
                 }
                 build_ok &= append_text_emb(dup, "</slice>", fused, fused_ntok);
             }
@@ -421,13 +420,13 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
         }
         if (has_audio && build_ok) {
             append_raw_emb(fused, fused_ntok,
-                           packet->audio_embed.data(), n_audio_tokens, hidden_size);
+                           frame->audio_embed.data(), n_audio_tokens, hidden_size);
         }
     } else {
         build_ok &= append_text_emb(dup, "<unit>", fused, fused_ntok);
         if (has_audio && build_ok) {
             append_raw_emb(fused, fused_ntok,
-                           packet->audio_embed.data(), n_audio_tokens, hidden_size);
+                           frame->audio_embed.data(), n_audio_tokens, hidden_size);
         }
     }
 
@@ -478,14 +477,14 @@ static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params *
 }
 
 static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * params,
-                                  DuplexPrefillPacket * packet,
+                                  DuplexFrame * frame,
                                   int hidden_size) {
     auto t_begin   = std::chrono::high_resolution_clock::now();
     int  n_past_0  = ctx_omni->n_past;
 
-    // 单 packet 版本：语义上等价于原 batch.size()==1 的情况。
+    // 单帧版本：语义上等价于原 batch.size()==1 的情况。
     // duplex 下 prefill/decode 必须严格 1-1 配对，否则 decode 的 KV 上下文会被
-    // 后续 chunk 的 prefill 污染；因此 llm_thread 每轮只消费 1 个 packet。
+    // 后续 chunk 的 prefill 污染；因此 llm_owner 每轮只消费 1 帧。
     {
         // 注册 unit 开始（滑窗记账）
         if (ctx_omni->sliding_window_config.mode != "off") {
@@ -493,19 +492,19 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
         }
 
         int n_audio_tokens = (hidden_size > 0)
-            ? (int)(packet->audio_embed.size() / hidden_size) : 0;
+            ? (int)(frame->audio_embed.size() / hidden_size) : 0;
         bool has_audio  = (n_audio_tokens > 0);
-        bool has_vision = !packet->vision_embed.empty();
+        bool has_vision = !frame->vision_embed.empty();
 
         if (has_vision) {
-            int n_chunks         = (int)packet->vision_embed.size();
-            int tokens_per_chunk = (int)packet->vision_embed[0].size() / hidden_size;
+            int n_chunks         = (int)frame->vision_embed.size();
+            int tokens_per_chunk = (int)frame->vision_embed[0].size() / hidden_size;
             bool has_slices      = (n_chunks > 1);
 
             // duplex 格式：<unit><image>[overview]</image>(<slice>[slice]</slice>)*\n[audio]
             eval_string(ctx_omni, params, "<unit><image>",
                         params->n_batch, &ctx_omni->n_past, false);
-            prefill_with_emb(ctx_omni, params, packet->vision_embed[0].data(),
+            prefill_with_emb(ctx_omni, params, frame->vision_embed[0].data(),
                              tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
             eval_string(ctx_omni, params, "</image>",
                         params->n_batch, &ctx_omni->n_past, false);
@@ -513,7 +512,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
                 for (int i = 1; i < n_chunks; i++) {
                     eval_string(ctx_omni, params, "<slice>",
                                 params->n_batch, &ctx_omni->n_past, false);
-                    prefill_with_emb(ctx_omni, params, packet->vision_embed[i].data(),
+                    prefill_with_emb(ctx_omni, params, frame->vision_embed[i].data(),
                                      tokens_per_chunk, params->n_batch, &ctx_omni->n_past);
                     eval_string(ctx_omni, params, "</slice>",
                                 params->n_batch, &ctx_omni->n_past, false);
@@ -523,7 +522,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
             }
             if (has_audio) {
                 // duplex 下 audio 直接跟在 vision 后面（无 audio_start/end 标签）
-                prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
+                prefill_with_emb(ctx_omni, params, frame->audio_embed.data(),
                                  n_audio_tokens, params->n_batch, &ctx_omni->n_past);
             }
         } else {
@@ -531,7 +530,7 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
             eval_string(ctx_omni, params, "<unit>",
                         params->n_batch, &ctx_omni->n_past, false);
             if (has_audio) {
-                prefill_with_emb(ctx_omni, params, packet->audio_embed.data(),
+                prefill_with_emb(ctx_omni, params, frame->audio_embed.data(),
                                  n_audio_tokens, params->n_batch, &ctx_omni->n_past);
             }
         }
@@ -559,13 +558,16 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
 }
 
 // ---------------------------------------------------------------------------
-// llm thread 的辅助：执行一轮 duplex decode。
+// llm_owner 的辅助：执行一帧 duplex decode。
 // 语义与原 stream_decode 的 duplex 分支一致（含尾部 response unit 注册与 round boundary），
-// 但抽掉了 simplex 相关分支与冗余的 llama_mtx 加锁——新路径下 ctx_llama 已由 llm 线程独占。
+// 但抽掉了 simplex 相关分支与冗余的 llama_mtx 加锁——新路径下 ctx_llama 已由 llm_owner 独占。
 // 返回 false 表示内部异常或被 break 打断。
 // ---------------------------------------------------------------------------
 static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
-                             const std::string & debug_dir, int round_idx, DuplexDecodeReq * req) {
+                             DuplexFrame * frame) {
+    const int    round_idx = frame->round_idx;
+    const std::string & debug_dir = frame->debug_dir;
+
     // ---- 轮次同步（与老 stream_decode 对齐） ----
     if (round_idx >= 0) {
         if (ctx_omni->simplex_round_idx != round_idx) {
@@ -672,10 +674,8 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             // 本帧首个输出 token 的绝对 wall 时间（epoch ms）
             if (!req_first_token_logged) {
                 req_first_token_logged = true;
-                if (req != nullptr) {
-                    req->t_first_token_ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-                }
+                frame->t_first_token_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now().time_since_epoch()).count();
             }
 
             if (tmp != nullptr && hidden_states != nullptr
@@ -788,6 +788,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
         // 推送到 text_queue（SSE）
         if (!discard_turn && !response.empty()) {
+            frame->text += response;   // 同时累积到本帧结果文本（不包含控制 token）
             std::lock_guard<std::mutex> tl(ctx_omni->text_mtx);
             ctx_omni->text_queue.push_back(response);
             ctx_omni->text_cv.notify_all();
@@ -875,22 +876,47 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 }
 
 // ---------------------------------------------------------------------------
-// llm thread 主循环
+// 帧结果填充（DONE/FAILED 时调用，填 frame->result 供 wait_next_frame 使用）
+// ---------------------------------------------------------------------------
+static void fill_frame_result(omni_context * ctx_omni, DuplexFrame * frame) {
+    OmniDuplexFrameResult & r = frame->result;
+    r.user_seq           = frame->input.user_seq;
+    r.frame_id           = (int64_t)frame->frame_id;
+    r.ok                 = frame->encode_ok && frame->decode_ok;
+    r.is_speak           = frame->is_speak;
+    r.text               = frame->text;
+    r.n_past_after       = ctx_omni->n_past;
+    r.ms_prefill_submit  = std::chrono::duration<double, std::milli>(
+        frame->t_prefilled - frame->t_push).count();
+    r.ms_decode          = frame->ms_decode;
+    r.ms_total           = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - frame->t_push).count();
+    // TTFT：push → 本帧首个输出 token（绝对 epoch ms 之差；仅 SPEAK 帧有效）
+    if (frame->is_speak && frame->t_first_token_ms > 0) {
+        const double t_push_ms = std::chrono::duration<double, std::milli>(
+            frame->t_push.time_since_epoch()).count();
+        r.ms_ttft = frame->t_first_token_ms - t_push_ms;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// llm_owner 主循环（ctx_llama / n_past 的唯一写入者）
 //
-// 严格 1:1 配对语义：每次 pending_decode 出现时，最多消费 *一个* prefill packet
-// 然后做 decode。这是 duplex 正确性的关键：
-//   - 如果 drain 多个 packet 再 decode，KV 会被后续 chunk 的 prefill 污染；
+// 严格 1:1 配对语义：每轮只处理 *一帧* 的 prefill + decode。这是 duplex
+// 正确性的关键：
+//   - 如果 drain 多帧再 decode，KV 会被后续 chunk 的 prefill 污染；
 //   - 如果 decode 先于对应 prefill 执行，KV 缺少本轮 chunk 的上下文。
 //
-// chunk 0（index=0，system prompt 初始化轮）由 stream_prefill 的老路径直接
-// 在 ctx_llama 上 eval，不走 encoder/llm_thread，此时 in_flight=0，
-// duplex_decode 进来时 llm_thread 直接 decode 不消费 packet。
+// 帧来源有两路，但互斥使用（session 与会话 API 二选一）：
+//   - session 路径：帧创建即 decode_requested=true，从 prefill_queue 队头直接消费；
+//   - stream 路径：duplex_decode 把队头帧取下放入 pending_decode 槽并置
+//     decode_requested，llm_owner 优先取 pending_decode 槽。
 //
-// chunk N (N≥1): duplex_prefill 把 encode req 推给 encoder_thread，
-// encoder_thread 编完 push 到 prefill_queue（in_flight 计数从 +1 到
-// llm_thread 消费后 -1）。duplex_decode push pending_decode，
-// llm_thread 看到 pending_decode && in_flight>0 时，wait prefill_queue 非空
-// 并消费 1 个 packet 做 LLM prefill，然后 decode。
+// chunk 0（index=0，system prompt 初始化轮）由 stream_prefill 的老路径直接
+// 在 ctx_llama 上 eval，不走本线程，也不建帧。
+//
+// 取消语义：只处理 cancel_generation 与当前代匹配的帧（旧 break_event 的
+// "丢弃当前帧"归属到帧自身）。
 // ---------------------------------------------------------------------------
 static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * params) {
     print_with_timestamp("Duplex: llm_thread started (strict 1:1 prefill/decode)\n");
@@ -898,96 +924,77 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
     const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
     while (dup->running.load()) {
-        DuplexDecodeReq * decode_req = nullptr;
-
-        // ---- Phase 0: 等待 decode 请求 ----
+        DuplexFrame * frame = nullptr;
         {
             std::unique_lock<std::mutex> lk(dup->llm_mtx);
             dup->llm_cv.wait(lk, [&]{
                 return dup->pending_decode != nullptr
-                    || !dup->running.load()
-                    || ctx_omni->break_event.load();
+                    || (!dup->prefill_queue.empty()
+                        && dup->prefill_queue.front()->decode_requested.load())
+                    || !dup->running.load();
             });
             if (!dup->running.load()) break;
 
-            // break_event：丢弃当前 prefill 和 decode 请求
-            if (ctx_omni->break_event.load()) {
-                int n_dropped = 0;
-                while (!dup->prefill_queue.empty()) {
-                    delete dup->prefill_queue.front();
-                    dup->prefill_queue.pop();
-                    n_dropped++;
-                }
-                if (n_dropped > 0) {
-                    dup->in_flight_prefill.fetch_sub(n_dropped);
-                    dup->in_flight_cv.notify_all();
-                }
-                if (dup->pending_decode) {
-                    dup->pending_decode->done.store(true);
-                    dup->pending_decode->ok.store(false);
-                    dup->pending_decode = nullptr;
-                    dup->decode_done_cv.notify_all();
-                }
-                lk.unlock();
-                dup->llm_cv.notify_all();
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                continue;
-            }
-
-            decode_req = dup->pending_decode;
-            dup->pending_decode = nullptr;
-        }
-        dup->llm_cv.notify_all();  // 解锁 duplex_decode 里新来请求的 wait
-        if (!decode_req) continue;
-
-        // ---- Phase 1: 消费最多 1 个 prefill packet（如果 encoder 还在途） ----
-        //
-        // 判断"是否有对应的 prefill 在途"的方式：in_flight_prefill 计数。
-        //   - chunk 0（老路径 prefill）：in_flight=0，直接 decode
-        //   - chunk N (N≥1)：in_flight ≥ 1，必有 packet 在途；
-        //     wait prefill_queue 非空，消费队头（encoder 是单线程 FIFO 顺序）
-        if (dup->in_flight_prefill.load() > 0) {
-            DuplexPrefillPacket * packet = nullptr;
-            {
-                std::unique_lock<std::mutex> lk(dup->llm_mtx);
-                dup->llm_cv.wait(lk, [&]{
-                    return !dup->prefill_queue.empty()
-                        || !dup->running.load()
-                        || ctx_omni->break_event.load();
-                });
-                if (!dup->running.load()) break;
-                if (!ctx_omni->break_event.load() && !dup->prefill_queue.empty()) {
-                    packet = dup->prefill_queue.front();
-                    dup->prefill_queue.pop();
-                }
-            }
-            dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
-
-            if (packet) {
-                // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
-                if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
-                    duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
-                }
-                print_with_timestamp("[DUPLEX CONTRACT] frame=%d stage=P ctx_owner=llm_thread kv_written=1 n_past_after=%d\n",
-                                     packet->index, ctx_omni->n_past);
-                delete packet;
-                dup->in_flight_prefill.fetch_sub(1);
-                dup->in_flight_cv.notify_all();
+            if (dup->pending_decode != nullptr) {
+                // stream 路径：duplex_decode 已把队头帧取下放入槽位
+                frame = dup->pending_decode;
+                dup->pending_decode = nullptr;
+            } else {
+                // session 路径：队头帧创建即 decode_requested=true，直接消费
+                frame = dup->prefill_queue.front();
+                dup->prefill_queue.pop();
             }
         }
+        dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位 / duplex_decode 在等槽位
 
-        // ---- Phase 2: decode ----
-        if (!ctx_omni->break_event.load()) {
-            bool ok = duplex_do_decode(ctx_omni, params,
-                                       decode_req->debug_dir, decode_req->round_idx, decode_req);
+        // ---- prefill（fused 优先，失败回退多段） ----
+        bool prefill_ok = false;
+        if (frame->cancel_generation == dup->cancel_generation.load()) {
+            if (frame->encode_ok) {
+                if (!duplex_do_prefill_one_fused(ctx_omni, params, frame, hidden_size)) {
+                    duplex_do_prefill_one(ctx_omni, params, frame, hidden_size);
+                }
+                prefill_ok = true;
+            }
+            print_with_timestamp("[DUPLEX CONTRACT] frame=%d stage=P ctx_owner=llm_thread kv_written=%d n_past_after=%d\n",
+                                 frame->index, prefill_ok ? 1 : 0, ctx_omni->n_past);
+        }
+
+        // ---- decode ----
+        frame->stage = FrameStage::DECODING;
+        auto t_dec_start = std::chrono::high_resolution_clock::now();
+        bool decode_ok = false;
+        if (prefill_ok) {
+            decode_ok = duplex_do_decode(ctx_omni, params, frame);
             print_with_timestamp("[DUPLEX CONTRACT] frame=%d pair=P->D sequence=1:1 decode_ok=%d\n",
-                                 decode_req->round_idx, ok ? 1 : 0);
-            decode_req->ok.store(ok);
-        } else {
-            decode_req->ok.store(false);
+                                 frame->round_idx, decode_ok ? 1 : 0);
         }
-        decode_req->done.store(true);
-        dup->decode_done_cv.notify_all();
+        frame->decode_ok = decode_ok;
+        frame->is_speak  = !ctx_omni->ended_with_listen.load();
+        frame->ms_decode = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t_dec_start).count();
+
+        // ---- finalize ----
+        frame->stage = (prefill_ok && decode_ok) ? FrameStage::DONE : FrameStage::FAILED;
+        fill_frame_result(ctx_omni, frame);
+
+        frame->done.store(true);
+        frame->ok.store(prefill_ok && decode_ok);
+
+        if (frame->session_frame) {
+            DuplexSession * sess = ctx_omni->duplex_session;
+            if (sess != nullptr) {
+                std::lock_guard<std::mutex> lk(sess->done_mtx);
+                sess->done_results.push(frame);
+                sess->in_flight.fetch_sub(1);
+                sess->done_cv.notify_all();
+            } else {
+                // 理论上不发生：session 帧在途时 session 必存在（session_end 会等 in_flight 归零）
+                delete frame;
+            }
+        }
+        // 最后发完成信号：stream 路径下 notify 后帧可能立刻被 duplex_decode 删除
+        frame->done_cv.notify_all();
     }
     print_with_timestamp("Duplex: llm_thread stopped\n");
 }
@@ -1005,30 +1012,35 @@ bool duplex_prefill(omni_context * ctx_omni,
         return false;
     }
     DuplexPipeline * dup = ctx_omni->duplex;
+    if (!dup->running.load()) return false;
 
-    DuplexEncodeReq * req = new DuplexEncodeReq();
-    req->aud_fname      = aud_fname;
-    req->img_fname      = img_fname;
-    req->index          = index;
-    req->max_slice_nums = max_slice_nums;
+    // 流式路径（无 session）：建帧入 pending，encoder_worker 负责编码。
+    DuplexFrame * frame = new DuplexFrame();
+    frame->frame_id  = dup->frame_id_counter.fetch_add(1) + 1;
+    frame->index     = index;
+    frame->round_idx = -1;                          // round sync 由 duplex_decode 的 round_idx 决定（当前 server 恒为 -1）
+    frame->input.aud_fname      = aud_fname;
+    frame->input.img_fname      = img_fname;
+    frame->input.max_slice_nums = max_slice_nums;
+    frame->session_frame        = false;
+    frame->cancel_generation    = dup->cancel_generation.load();
+    frame->t_push               = std::chrono::high_resolution_clock::now();
+    frame->t_prefilled          = frame->t_push;
+    // decode_requested / debug_dir 在 duplex_decode 认领时填充
 
     {
-        std::unique_lock<std::mutex> lk(dup->encoder_mtx);
-        dup->encoder_cv.wait(lk, [&]{
-            return dup->encoder_queue.size() < DuplexPipeline::ENCODER_QUEUE_CAP
+        std::unique_lock<std::mutex> lk(dup->pending_mtx);
+        dup->pending_cv.wait(lk, [&]{
+            return dup->pending_frames.size() < DuplexPipeline::PENDING_CAP
                 || !dup->running.load();
         });
         if (!dup->running.load()) {
-            delete req;
+            delete frame;
             return false;
         }
-        dup->encoder_queue.push(req);
+        dup->pending_frames.push(frame);
     }
-    // 计数提交的 prefill；llm_thread 处理完会递减。
-    // 必须在 notify encoder 之前 ++，否则 llm_thread 可能在 notify 前就把 prefill
-    // 处理完并 decrement 到 -1。
-    dup->in_flight_prefill.fetch_add(1);
-    dup->encoder_cv.notify_all();
+    dup->pending_cv.notify_all();
     return true;
 }
 
@@ -1042,34 +1054,47 @@ bool duplex_decode(omni_context * ctx_omni,
     }
     DuplexPipeline * dup = ctx_omni->duplex;
 
-    // 直接 push pending_decode，"等对应 prefill 到达"的责任由 llm_thread 承担。
-    // 这样 duplex_decode 返回速度只受 LLM prefill+decode 影响，不再等 encoder。
-    // encoder 可以继续提前编码后续 chunk 的 embed，把 VPM 时间隐藏在 LLM 工作流里。
-    DuplexDecodeReq req;
-    req.debug_dir = debug_dir;
-    req.round_idx = round_idx;
+    // 串行化：同一时刻只认领一帧（替代旧 pending_decode 单槽语义）。
+    std::unique_lock<std::mutex> s_lock(dup->stream_decode_mtx);
 
+    DuplexFrame * frame = nullptr;
     {
         std::unique_lock<std::mutex> lk(dup->llm_mtx);
-        dup->decode_done_cv.wait(lk, [&]{
-            return dup->pending_decode == nullptr || !dup->running.load();
+        // 等队头出现已编码帧（encoder 完成编码并推入 prefill_queue）。
+        // 注意：不能像旧 pending_decode 一样"先占槽再等 prefill"——帧身份在
+        // prefill 队列里才明确，认领即取走队头，llm_owner 从槽位消费。
+        dup->llm_cv.wait(lk, [&]{
+            return !dup->prefill_queue.empty() || !dup->running.load();
         });
         if (!dup->running.load()) return false;
-        dup->pending_decode = &req;
-    }
-    dup->llm_cv.notify_all();
 
-    // 等 llm_thread 完成本轮 decode（包含消费 1 个 prefill packet + decode 采样）
+        frame = dup->prefill_queue.front();
+        dup->prefill_queue.pop();
+        frame->debug_dir    = debug_dir;
+        frame->round_idx    = round_idx;
+        frame->decode_requested.store(true);
+        dup->pending_decode = frame;
+    }
+    dup->llm_cv.notify_all();   // 通知 llm_owner：pending_decode 槽已就绪
+
+    // 等 llm_owner 处理完这一帧（包含 prefill + decode 采样）
     {
-        std::unique_lock<std::mutex> lk(dup->llm_mtx);
-        dup->decode_done_cv.wait(lk, [&]{
-            return req.done.load() || !dup->running.load();
+        std::unique_lock<std::mutex> lk(frame->done_mtx);
+        frame->done_cv.wait(lk, [&]{
+            return frame->done.load() || !dup->running.load();
         });
     }
     if (out_t_first_token_ms != nullptr) {
-        *out_t_first_token_ms = req.t_first_token_ms;
+        *out_t_first_token_ms = frame->t_first_token_ms;
     }
-    return req.ok.load();
+    bool ok = frame->ok.load();
+    {
+        // llm_owner 可能因停线程没来得及消费槽位；清掉防悬挂
+        std::lock_guard<std::mutex> lk(dup->llm_mtx);
+        if (dup->pending_decode == frame) dup->pending_decode = nullptr;
+    }
+    delete frame;
+    return ok;
 }
 
 // ============================================================================
@@ -1422,16 +1447,15 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     return true;
 }
 
-bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx,
-                   double * out_t_first_token_ms) {
+bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
     // 路由：duplex_mode && async && system prompt 已初始化时，走 duplex 路径。
-    // duplex_decode 会把请求投递到 duplex_llm_thread 并同步等待完成，
+    // duplex_decode 会把请求投递到 llm_owner 并同步等待完成，
     // 返回前 text_queue / tts_thread_info->queue 都已就绪，对调用方（HTTP SSE /
     // test-duplex.cpp）行为与原 stream_decode 一致。
     // 下方主体（本次 if 之后的部分）是非 duplex 的旧同步/异步实现。
     if (ctx_omni->duplex_mode && ctx_omni->async
         && ctx_omni->system_prompt_initialized && ctx_omni->duplex != nullptr) {
-        return duplex_decode(ctx_omni, debug_dir, round_idx, out_t_first_token_ms);
+        return duplex_decode(ctx_omni, debug_dir, round_idx, nullptr);
     }
 
     // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
@@ -2112,112 +2136,11 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
 // 把 stream_prefill / stream_decode 的"两步式 + producer 节奏不同步"调度封装成
 // 一个简单接口：调用方只管 push_frame / wait_next_frame。
 //
-// 内部双 worker 模型：
-//   - prefill_worker: 从 pending 队列拿 frame，调 stream_prefill(idx>=1)；
-//                     stream_prefill 在 duplex 路径下立即返回（push 到 encoder_queue）
-//   - decode_worker:  拿到 prefill 已提交的 frame_id，调 stream_decode；
-//                     stream_decode 阻塞等 duplex_llm_thread 完成本帧 prefill+decode
-// 两 worker 之间通过 decode_pending 队列保持顺序，与 duplex_llm_thread_func 内的
-// 1:1 配对配合，确保 KV cache 严格按 push 顺序写入。
+// 内部结构简化：不再有 session 级 prefill_worker / decode_worker——push_frame
+// 直接建 DuplexFrame 入 pipeline 的 pending 队列，encoder_worker + llm_owner
+// 直连消费；llm_owner 完成后把帧推入本 session 的 done_results，wait_next_frame
+// 按帧序取走（帧在此释放）。session 本身不跑线程，session_end 只排空等待。
 // ============================================================================
-
-
-static void duplex_session_prefill_worker_func(omni_context * ctx_omni) {
-    DuplexSession * sess = ctx_omni->duplex_session;
-    while (true) {
-        OmniDuplexPendingFrame pf;
-        {
-            std::unique_lock<std::mutex> lk(sess->pending_mtx);
-            sess->pending_cv.wait(lk, [&]{
-                return !sess->pending_frames.empty() || !sess->running.load();
-            });
-            if (!sess->running.load() && sess->pending_frames.empty()) break;
-            pf = std::move(sess->pending_frames.front());
-            sess->pending_frames.pop();
-        }
-        // pending 出队 → 通知 push_frame 阻塞侧（如有）队列有空位
-        sess->pending_cv.notify_all();
-
-        // 调底层 stream_prefill。duplex 路径下这是非阻塞的（推到 encoder_queue 立即返回）。
-        bool ok = stream_prefill(ctx_omni, pf.frame.aud_fname, pf.frame.img_fname,
-                                 (int)pf.frame_id, pf.frame.max_slice_nums);
-
-        OmniDuplexInflightFrame inf;
-        inf.frame_id       = pf.frame_id;
-        inf.user_seq       = pf.frame.user_seq;
-        inf.t_push         = pf.t_push;
-        inf.t_push_steady  = pf.t_push_steady;
-        inf.t_prefilled    = std::chrono::high_resolution_clock::now();
-        inf.prefill_failed = !ok;
-        {
-            std::unique_lock<std::mutex> lk(sess->decode_mtx);
-            sess->decode_pending.push(std::move(inf));
-        }
-        sess->decode_cv.notify_all();
-    }
-}
-
-static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
-    DuplexSession * sess = ctx_omni->duplex_session;
-    while (true) {
-        OmniDuplexInflightFrame inf;
-        {
-            std::unique_lock<std::mutex> lk(sess->decode_mtx);
-            sess->decode_cv.wait(lk, [&]{
-                return !sess->decode_pending.empty() || !sess->running.load();
-            });
-            if (!sess->running.load() && sess->decode_pending.empty()) break;
-            inf = std::move(sess->decode_pending.front());
-            sess->decode_pending.pop();
-        }
-
-        OmniDuplexFrameResult r;
-        r.user_seq = inf.user_seq;
-        r.frame_id = inf.frame_id;
-
-        if (inf.prefill_failed) {
-            r.ok = false;
-        } else {
-            // 等本帧 LLM 完成
-            double t_first_token_ms = 0.0;
-            auto t_dec_start = std::chrono::high_resolution_clock::now();
-            bool ok = stream_decode(ctx_omni, sess->debug_dir, (int)inf.frame_id, &t_first_token_ms);
-            auto t_dec_end   = std::chrono::high_resolution_clock::now();
-
-            r.ok       = ok;
-            // TTFT：push → 本帧首个输出 token（绝对时间差）
-            if (ok && t_first_token_ms > 0.0) {
-                const double t_push_ms = std::chrono::duration<double, std::milli>(
-                    inf.t_push.time_since_epoch()).count();
-                r.ms_ttft = t_first_token_ms - t_push_ms;
-            }
-            r.is_speak = !ctx_omni->ended_with_listen.load();
-
-            // 收集本帧文本（剔除控制 token）
-            {
-                std::lock_guard<std::mutex> lock(ctx_omni->text_mtx);
-                while (!ctx_omni->text_queue.empty()) {
-                    std::string piece = ctx_omni->text_queue.front();
-                    ctx_omni->text_queue.pop_front();
-                    if (piece == "__IS_LISTEN__" || piece == "__END_OF_TURN__") continue;
-                    r.text += piece;
-                }
-            }
-
-            r.n_past_after = ctx_omni->n_past;
-            r.ms_decode = std::chrono::duration<double, std::milli>(t_dec_end - t_dec_start).count();
-            r.ms_total  = std::chrono::duration<double, std::milli>(t_dec_end - inf.t_push).count();
-        }
-        r.ms_prefill_submit = std::chrono::duration<double, std::milli>(inf.t_prefilled - inf.t_push).count();
-
-        {
-            std::unique_lock<std::mutex> lk(sess->done_mtx);
-            sess->done_results.push(std::move(r));
-        }
-        sess->done_cv.notify_all();
-        sess->in_flight.fetch_sub(1);
-    }
-}
 
 bool omni_duplex_session_begin(struct omni_context * ctx_omni,
                                const std::string & voice_audio,
@@ -2242,16 +2165,13 @@ bool omni_duplex_session_begin(struct omni_context * ctx_omni,
         return false;
     }
 
-    // 2. 创建 session 并启动 worker 线程
+    // 2. 创建 session（不再启动任何 worker 线程）
     auto * sess = new DuplexSession();
     sess->running.store(true);
     sess->debug_dir = debug_dir.empty() ? std::string("./") : debug_dir;
     ctx_omni->duplex_session = sess;
 
-    sess->prefill_worker = std::thread(duplex_session_prefill_worker_func, ctx_omni);
-    sess->decode_worker  = std::thread(duplex_session_decode_worker_func,  ctx_omni);
-
-    print_with_timestamp("omni_duplex_session_begin: session ready (workers started)\n");
+    print_with_timestamp("omni_duplex_session_begin: session ready (frame pipeline active)\n");
     return true;
 }
 
@@ -2260,26 +2180,36 @@ int64_t omni_duplex_push_frame(struct omni_context * ctx_omni,
     if (!ctx_omni || !ctx_omni->duplex_session) return -1;
     DuplexSession * sess = ctx_omni->duplex_session;
     if (!sess->running.load()) return -1;
+    if (!ctx_omni->duplex) return -1;
+    DuplexPipeline * dup = ctx_omni->duplex;
 
-    OmniDuplexPendingFrame pf;
-    pf.frame    = frame;
-    pf.frame_id = sess->frame_id_counter.fetch_add(1) + 1;  // chunk 0 已被 session_begin 占用
-    pf.t_push   = std::chrono::high_resolution_clock::now();
-    pf.t_push_steady = std::chrono::steady_clock::now();
+    // 建帧入 pending（pending 在 pipeline 上，随 pipeline 生命周期，session_end 安全）
+    DuplexFrame * f = new DuplexFrame();
+    f->frame_id = sess->frame_id_counter.fetch_add(1) + 1;  // chunk 0 已被 session_begin 占用
+    f->index    = (int)f->frame_id;
+    f->round_idx = (int)f->frame_id;                        // session 帧的 round = frame_id
+    f->input    = frame;
+    f->debug_dir = sess->debug_dir;
+    f->session_frame = true;
+    f->decode_requested.store(true);                        // session 帧创建即 eager decode
+    f->cancel_generation = dup->cancel_generation.load();
+    f->t_push   = std::chrono::high_resolution_clock::now();
+    f->t_prefilled = f->t_push;
 
     {
-        std::unique_lock<std::mutex> lk(sess->pending_mtx);
-        sess->pending_cv.wait(lk, [&]{
-            return sess->pending_frames.size() < DuplexSession::PENDING_MAX || !sess->running.load();
+        std::unique_lock<std::mutex> lk(dup->pending_mtx);
+        dup->pending_cv.wait(lk, [&]{
+            return dup->pending_frames.size() < DuplexPipeline::PENDING_CAP || !sess->running.load();
         });
         if (!sess->running.load()) {
+            delete f;
             return -1;
         }
-        sess->pending_frames.push(std::move(pf));
+        dup->pending_frames.push(f);
     }
     sess->in_flight.fetch_add(1);
-    sess->pending_cv.notify_all();
-    return pf.frame_id;
+    dup->pending_cv.notify_all();
+    return (int64_t)f->frame_id;
 }
 
 bool omni_duplex_wait_next_frame(struct omni_context * ctx_omni,
@@ -2302,8 +2232,10 @@ bool omni_duplex_wait_next_frame(struct omni_context * ctx_omni,
         if (!got) return false;
     }
     if (sess->done_results.empty()) return false;
-    *out = std::move(sess->done_results.front());
+    DuplexFrame * f = sess->done_results.front();
     sess->done_results.pop();
+    *out = std::move(f->result);
+    delete f;
     return true;
 }
 
@@ -2339,24 +2271,29 @@ bool omni_duplex_drain_tts_audio(struct omni_context * ctx_omni,
 void omni_duplex_session_end(struct omni_context * ctx_omni) {
     if (!ctx_omni || !ctx_omni->duplex_session) return;
     DuplexSession * sess = ctx_omni->duplex_session;
+    DuplexPipeline * dup = ctx_omni->duplex;
 
-    // 1. 等所有已 push 的帧 LLM 完成（drain）
-    //    注意：调用方负责 wait_next_frame 把 done_results 取空；这里只等 in_flight=0。
+    // 1. 停止接收新帧；唤醒可能阻塞在 pending 满位的 push 侧
+    sess->running.store(false);
+    if (dup != nullptr) dup->pending_cv.notify_all();
+
+    // 2. 等所有已 push 的帧 LLM 完成（in_flight 归零 = llm_owner 已全部入 done_results）
     while (sess->in_flight.load() > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // 2. 通知 worker 退出
-    sess->running.store(false);
-    sess->pending_cv.notify_all();
-    sess->decode_cv.notify_all();
-    sess->done_cv.notify_all();
+    // 3. 排空 done_results（调用方可能没取完），按帧序释放
+    {
+        std::lock_guard<std::mutex> lk(sess->done_mtx);
+        while (!sess->done_results.empty()) {
+            delete sess->done_results.front();
+            sess->done_results.pop();
+        }
+    }
 
-    if (sess->prefill_worker.joinable()) sess->prefill_worker.join();
-    if (sess->decode_worker.joinable())  sess->decode_worker.join();
-
-    delete sess;
+    // 4. 释放 session。此刻 in_flight=0，llm_owner 不再引用 sess（先置 null 再释放）。
     ctx_omni->duplex_session = nullptr;
+    delete sess;
     print_with_timestamp("omni_duplex_session_end: session destroyed\n");
 }
 

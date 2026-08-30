@@ -796,9 +796,8 @@ void omni_stop_threads(struct omni_context * ctx_omni) {
     // 停止 duplex 双线程
     if (ctx_omni->duplex != nullptr) {
         ctx_omni->duplex->running.store(false);
-        ctx_omni->duplex->encoder_cv.notify_all();
+        ctx_omni->duplex->pending_cv.notify_all();
         ctx_omni->duplex->llm_cv.notify_all();
-        ctx_omni->duplex->decode_done_cv.notify_all();
     }
 
     print_with_timestamp("omni_stop_threads: stop signals sent\n");
