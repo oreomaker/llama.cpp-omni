@@ -4,6 +4,7 @@
 #include "omni.h"
 #include "omni_internal.h"
 #include "duplex_core.h"
+#include "omni_prewarm.h"
 #include "token2wav/token2wav-impl.h"
 
 // Implementation map:
@@ -729,6 +730,10 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // the first real session can reuse the same P topology.
         duplex_prepare(ctx_omni, params);
     }
+#ifdef GGML_USE_CUDA
+    // 预热：代表输入 graph 预热 + vocoder 预热（纯 init，无条件跑）。
+    omni_prewarm(ctx_omni);
+#endif
 
     print_with_timestamp("=== omni_init success: ctx_llama = %p\n", (void*)ctx_omni->ctx_llama);
     return ctx_omni;

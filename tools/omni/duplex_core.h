@@ -92,18 +92,6 @@ struct DuplexFrame {
 // Pipeline structures (frames flow: pending -> prefill -> decode)
 // ---------------------------------------------------------------------------
 
-// 特殊 token 的 embedding 查表（fused prefill 用）。
-// 在 duplex 路径启动后懒加载；加载失败时 initialized=false，
-// fused prefill 路径回退到 per-chunk 多次 llama_decode 的老逻辑。
-struct DuplexTokenEmbCache {
-    bool initialized = false;
-    int  hidden_size = 0;
-    // text → embedding buffer（length = n_tokens * hidden_size）。
-    // key 是 duplex prefill 里用到的固定字符串："<unit><image>" / "</image>" / "<slice>" / "</slice>" / "\n" / "<unit>"
-    std::unordered_map<std::string, std::vector<float>> text_emb;
-    std::unordered_map<std::string, int>                text_ntok;
-};
-
 // 帧管道：pending → (encoder_thread) → prefill → (llm_thread) → done。
 // 队列里的元素都是 DuplexFrame*（阶段推进 = 帧换队列 + 更新 stage）。
 // pending/prefill 队列随管道存活，由 duplex_stop_threads 在 join 线程后统一清理，
@@ -132,9 +120,6 @@ struct DuplexPipeline {
     // ---------- workers ----------
     std::thread encoder_thread;
     std::thread llm_thread;
-
-    // 特殊 token embedding 查表（懒加载）
-    DuplexTokenEmbCache emb_cache;
 
     // 流式路径（无 session）的 frame_id 来源；session push 用自身的 frame_id_counter。
     std::atomic<uint64_t> frame_id_counter{0};

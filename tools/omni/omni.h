@@ -44,6 +44,19 @@ struct DuplexPipeline;
 // 的 index 语义和并发约束。
 struct DuplexSession;
 
+// 特殊 token 的 embedding 查表（fused prefill 用）。
+// 在 duplex 路径启动后懒加载；加载失败时 initialized=false，
+// fused prefill 路径回退到 per-chunk 多次 llama_decode 的老逻辑。
+// 纯 LLM 域数据（per-context），挂在 omni_context 上，不依赖 duplex 调度层。
+struct DuplexTokenEmbCache {
+    bool initialized = false;
+    int  hidden_size = 0;
+    // text → embedding buffer（length = n_tokens * hidden_size）。
+    // key 是 duplex prefill 里用到的固定字符串："<unit><image>" / "</image>" / "<slice>" / "</slice>" / "\n" / "<unit>"
+    std::unordered_map<std::string, std::vector<float>> text_emb;
+    std::unordered_map<std::string, int>                text_ntok;
+};
+
 //
 // omni ctx
 //
@@ -258,6 +271,10 @@ struct omni_context {
     // 持有内部 prefill_worker/decode_worker 线程及 frame 队列。
     // omni_free 时若仍存在，会被强制 session_end 释放。
     DuplexSession * duplex_session = NULL;
+
+    // 特殊 token embedding 查表（fused prefill 用；纯 LLM 域数据）。
+    // duplex_prepare 在 omni_init 时填充；simplex 路径不使用。
+    DuplexTokenEmbCache emb_cache;
 
     // T2W 线程记录每个音频窗口完成的绝对 wall 时间（epoch ms）。
     // 由 T2W 线程在每次 wav 落盘时追加（供 TTFA：帧结果到达后第一个 wav）。

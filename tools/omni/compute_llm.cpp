@@ -193,6 +193,139 @@ bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * par
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Fused prefill 路径。
+// 把一个 chunk 的 "<unit><image>" + vision_embed + "</image>" + (slices)
+// + audio_embed 拼成单块 buffer，一次 prefill_with_emb 写入 KV，
+// 消除原来 5~7 次小 llama_decode 的 kernel launch 开销。
+// 需要 ctx_omni->emb_cache 已初始化（duplex_prepare 填充）且 hidden 匹配。
+// 调度层 duplex_do_prefill_one_fused 与 init 预热 omni_prewarm 共用此入口。
+// ---------------------------------------------------------------------------
+
+// 把 text 对应的 embedding buffer 追加到 fused 末尾
+static inline bool append_text_emb(struct omni_context * ctx_omni,
+                                   const std::string & text,
+                                   std::vector<float> & fused,
+                                   int & fused_ntok) {
+    auto it = ctx_omni->emb_cache.text_emb.find(text);
+    if (it == ctx_omni->emb_cache.text_emb.end()) return false;
+    fused.insert(fused.end(), it->second.begin(), it->second.end());
+    fused_ntok += ctx_omni->emb_cache.text_ntok[text];
+    return true;
+}
+
+static inline void append_raw_emb(std::vector<float> & fused,
+                                  int & fused_ntok,
+                                  const float * src, int n_tokens,
+                                  int hidden_size) {
+    fused.insert(fused.end(), src, src + (size_t)n_tokens * hidden_size);
+    fused_ntok += n_tokens;
+}
+
+bool llm_fused_prefill(struct omni_context * ctx_omni, common_params * params,
+                       const std::vector<std::vector<float>> & vision_embed,
+                       const std::vector<float> & audio_embed,
+                       int hidden_size, int * out_fused_ntok) {
+    if (!ctx_omni->emb_cache.initialized) return false;
+    if (ctx_omni->emb_cache.hidden_size != hidden_size) return false;
+
+    auto t_begin  = std::chrono::high_resolution_clock::now();
+    int  n_past_0 = ctx_omni->n_past;
+
+    int n_audio_tokens = (hidden_size > 0)
+        ? (int)(audio_embed.size() / hidden_size) : 0;
+    bool has_audio  = (n_audio_tokens > 0);
+    bool has_vision = !vision_embed.empty();
+
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        sliding_window_register_unit_start(ctx_omni);
+    }
+
+    std::vector<float> fused;
+    fused.reserve(128 * (size_t)hidden_size);
+    int fused_ntok = 0;
+
+    bool build_ok = true;
+    if (has_vision) {
+        int n_chunks         = (int)vision_embed.size();
+        int tokens_per_chunk = (int)vision_embed[0].size() / hidden_size;
+        bool has_slices      = (n_chunks > 1);
+
+        build_ok &= append_text_emb(ctx_omni, "<unit><image>", fused, fused_ntok);
+        if (build_ok) {
+            append_raw_emb(fused, fused_ntok,
+                           vision_embed[0].data(), tokens_per_chunk, hidden_size);
+        }
+        build_ok &= append_text_emb(ctx_omni, "</image>", fused, fused_ntok);
+        if (build_ok && has_slices) {
+            for (int i = 1; i < n_chunks && build_ok; i++) {
+                build_ok &= append_text_emb(ctx_omni, "<slice>", fused, fused_ntok);
+                if (build_ok) {
+                    append_raw_emb(fused, fused_ntok,
+                                   vision_embed[i].data(), tokens_per_chunk, hidden_size);
+                }
+                build_ok &= append_text_emb(ctx_omni, "</slice>", fused, fused_ntok);
+            }
+            build_ok &= append_text_emb(ctx_omni, "\n", fused, fused_ntok);
+        }
+        if (has_audio && build_ok) {
+            append_raw_emb(fused, fused_ntok,
+                           audio_embed.data(), n_audio_tokens, hidden_size);
+        }
+    } else {
+        build_ok &= append_text_emb(ctx_omni, "<unit>", fused, fused_ntok);
+        if (has_audio && build_ok) {
+            append_raw_emb(fused, fused_ntok,
+                           audio_embed.data(), n_audio_tokens, hidden_size);
+        }
+    }
+
+    if (!build_ok) {
+        // 某个特殊串缓存缺失，放弃 fused 路径、让调用方走 fallback。
+        LOG_WRN("duplex_fused: cache miss, fallback to multi-step prefill\n");
+        return false;
+    }
+    if (out_fused_ntok != nullptr) *out_fused_ntok = fused_ntok;
+    print_with_timestamp("[LLM PREFILL] n_past_before=%d n_tokens=%d batch=%d kv_offset=%d topology=fused\n",
+                         n_past_0, fused_ntok, params->n_batch, n_past_0);
+    auto t_after_embed = std::chrono::high_resolution_clock::now();
+
+    // One shot prefill: the fused token count is input-dependent.  The current
+    // validation case uses 77; do not turn that case into a global invariant.
+    if (!prefill_with_emb(ctx_omni, params, fused.data(),
+                          fused_ntok, params->n_batch, &ctx_omni->n_past)) {
+        LOG_ERR("duplex_fused: prefill_with_emb failed\n");
+        return false;
+    }
+    auto t_after_llm = std::chrono::high_resolution_clock::now();
+
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        std::string input_type = has_vision ? "omni" : "audio";
+        sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
+        sliding_window_enforce(ctx_omni);
+    }
+    auto t_after_sliding = std::chrono::high_resolution_clock::now();
+
+    // [计时修正] llama_decode 内部走 ggml_backend_sched_graph_compute_async，
+    // 异步提交、不同步。若不在此等待，prefill 的 GPU 完成时间会被紧随其后的
+    // decode 第一次 llama_get_logits_ith（内部 llama_synchronize）吞进 decode 的
+    // 计时窗口，造成 prefill/decode 的 ms 归属漂移。显式同步：让 prefill ms 含
+    // GPU 完成，decode ms 只计自身；性能中性。
+    llama_synchronize(ctx_omni->ctx_llama);
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t_end - t_begin).count();
+    double ms_embed   = std::chrono::duration<double, std::milli>(t_after_embed  - t_begin).count();
+    double ms_llm     = std::chrono::duration<double, std::milli>(t_after_llm    - t_after_embed).count();
+    double ms_sliding = std::chrono::duration<double, std::milli>(t_after_sliding- t_after_llm).count();
+    double ms_sync    = std::chrono::duration<double, std::milli>(t_end - t_after_sliding).count();
+    print_with_timestamp(
+        "[prof] llm prefill (fused) n_past=%d->%d tokens=%d ms=%.1f [embed=%.1f llm=%.1f sliding=%.1f sync=%.1f]\n",
+        n_past_0, ctx_omni->n_past,
+        ctx_omni->n_past - n_past_0, ms, ms_embed, ms_llm, ms_sliding, ms_sync);
+    return true;
+}
+
 void kv_cache_slide_window(struct omni_context* ctx_omni, common_params* params, int chunk_size) {
     const int n_ctx = params->n_ctx;
 

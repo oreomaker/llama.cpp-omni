@@ -11,6 +11,8 @@ endif()
 
 add_library(omni
             omni.cpp
+            omni_prewarm.cpp
+            omni_prewarm.h
             compute_llm.cpp
             compute_enc.cpp
             compute_tts.cpp
