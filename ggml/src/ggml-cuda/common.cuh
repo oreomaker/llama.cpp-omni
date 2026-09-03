@@ -1397,14 +1397,53 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // per-backend CUDA graph 开关：由 ggml_backend_cuda_set_disable_graph 设置。true 时本
+    // backend 的 graph_compute 强制走 eager（不 capture/replay），用于按组件关闭图而不影响其它 backend。
+    bool disable_graphs = false;
+
+    // Green Context / SM 限制（可选）。环境变量 GGML_CUDA_N_SMS > 0 时，本 backend 创建
+    // green context 并只使用该数量的 SM，用于单卡多模型流水线的组件 SM 测量。
+    // green_n_sms == 0 时保持原行为（primary context 全 SM）。
+    // green context runtime API 需要 CUDA >= 13.1（CUDART_VERSION >= 13010）。
+    int green_n_sms = 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    cudaExecutionContext_t green_ctx = nullptr;
+
+    // 显式 SM 计划路径（ggml_backend_cuda_init_sm）：backend 直接持有协调 split 出的
+    // 一个 disjoint 分组，避免多 backend 并发时 per-backend 各自 split 导致 SM 重叠/时间片。
+    // green_has_resource 优先于 green_n_sms。
+    bool green_has_resource = false;
+    cudaDevResource green_sm_resource = {};
+    // 可选：balanced workqueue 配置（descriptor 里同时带 SM + workqueue 两类资源）
+    bool green_has_wq = false;
+    cudaDevResource green_wq_resource = {};
+
+    // 动态切换（ggml_backend_cuda_set_sm_group）用的 EC 缓存：cache_key -> green context。
+    // 切回同一分组时复用缓存的 EC，避免每次 cudaGreenCtxCreate。规模 = preset 套数（很小）。
+    // 缓存里的 EC 由析构统一销毁；green_ctx 若不在缓存里则单独销毁（见 ggml-cuda.cu 析构函数）。
+    std::unordered_map<int, cudaExecutionContext_t> green_ctx_cache;
+
+    // 按 cache_key 缓存 stream，与下方 cuda_graphs 一起换槽，切回同一分组时零重建 stream /
+    // 零重捕获 graph。sm_slot_key = 当前 streams/cuda_graphs 所属的 cache_key
+    // （-1 = 初始 EC，不进缓存，切走时销毁）。缓存槽里的 EC 一定在 green_ctx_cache 中、不会被销毁，
+    // 故其 stream/graphExec 保持有效。
+    int sm_slot_key = -1;
+    std::unordered_map<int, std::array<cudaStream_t, GGML_CUDA_MAX_STREAMS>> sm_stream_slots;
+#endif
+
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Stable fingerprint of graph topology/shape plus the first-node address.
+    // Including topology prevents P77 and D1 graphs that reuse the same ggml
+    // arena address from continuously resetting one shared graph entry.
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // 切走的分组的 cuda_graphs 暂存于此（按 cache_key），切回时 move 回
+    // cuda_graphs，避免每次切换重捕获。与 sm_stream_slots 配套换槽。
+    std::unordered_map<int, std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>>> sm_graph_slots;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(uint64_t graph_key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1419,9 +1458,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1452,15 +1491,332 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        // 在 backend 初始化前（构造时）读取 env：bench_* 在初始化各组件前 setenv。
+        const char * sms_env = getenv("GGML_CUDA_N_SMS");
+        if (sms_env != nullptr) {
+            int n = atoi(sms_env);
+            if (n > 0) green_n_sms = n;
+        }
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
 
+    // 创建 green context：从设备 SM 资源切出 green_n_sms 个给本 backend（其余留给 primary context）。
+    // 失败（SM 已被其它 GC 占用 / 驱动不支持 / CUDA < 13.1）时回退到 primary context（全 SM）。
+    void ensure_green_ctx() {
+        if (!green_has_resource && green_n_sms <= 0) return;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+        if (green_ctx != nullptr) return;
+        ggml_cuda_set_device(device);   // 同时初始化 primary context（green ctx 创建的前置）
+
+        cudaDevResource sm_res;
+        memset(&sm_res, 0, sizeof(sm_res));
+        unsigned sm_count = 0;
+        if (green_has_resource) {
+            // 显式计划路径：直接用协调 split 出的 disjoint 分组（无时序假设、可并发）
+            sm_res = green_sm_resource;
+            sm_count = sm_res.sm.smCount;
+        } else {
+            // env 路径：每 backend 从全量切一份。单 backend/进程的测量 convenience；
+            // 多 backend 并发会 SM 重叠（≥3 个时均等时间片），生产请用 init_sm 的计划路径。
+            cudaDevResource sm;
+            cudaError_t err_get = cudaDeviceGetDevResource(device, &sm, cudaDevResourceTypeSm);
+            if (err_get != cudaSuccess) {
+                fprintf(stderr, "ggml-cuda: SM resource query failed (%s) for device %d, fallback to primary\n",
+                        cudaGetErrorString(err_get), device);
+                return;
+            }
+            const unsigned align = sm.sm.smCoscheduledAlignment > 0 ? sm.sm.smCoscheduledAlignment : 2;
+            unsigned want = (unsigned) green_n_sms;
+            if (want > sm.sm.smCount) want = sm.sm.smCount;
+            want = (want / align) * align;
+            if (want == 0) want = align;
+
+            cudaDevSmResourceGroupParams gp{};
+            gp.smCount                    = want;
+            gp.coscheduledSmCount         = align;
+            gp.preferredCoscheduledSmCount= align;
+            gp.flags                      = 0;
+
+            cudaDevResource out[1];
+            cudaDevResource remainder;
+            memset(out, 0, sizeof(out));
+            memset(&remainder, 0, sizeof(remainder));
+            const unsigned int nb = 1;
+            cudaError_t err_split = cudaDevSmResourceSplit(out, nb, &sm, &remainder, 0, &gp);
+            if (err_split != cudaSuccess) {
+                fprintf(stderr, "ggml-cuda: SM split failed (%s, want=%u) for device %d, fallback to primary\n",
+                        cudaGetErrorString(err_split), want, device);
+                return;
+            }
+            sm_res = out[0];
+            sm_count = want;
+        }
+
+        // 可选 balanced workqueue：descriptor 同时带 SM + workqueue 两类资源
+        cudaDevResource res[2];
+        int n_res = 1;
+        res[0] = sm_res;
+        if (green_has_wq) {
+            res[1] = green_wq_resource;
+            n_res = 2;
+        }
+
+        cudaDevResourceDesc_t desc = nullptr;
+        cudaError_t err_desc = cudaDevResourceGenerateDesc(&desc, res, n_res);
+        if (err_desc != cudaSuccess) {
+            fprintf(stderr, "ggml-cuda: resource desc generate failed (%s) for device %d, fallback to primary\n",
+                    cudaGetErrorString(err_desc), device);
+            return;
+        }
+        cudaExecutionContext_t gc = nullptr;
+        cudaError_t err = cudaGreenCtxCreate(&gc, desc, device, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ggml-cuda: green ctx create failed (%s) for device %d, fallback to primary\n",
+                    cudaGetErrorString(err), device);
+            return;
+        }
+        green_ctx = gc;
+        fprintf(stderr, "ggml-cuda: green context created, device=%d SMs=%u (align=%u%s)\n",
+                device, sm_count, res[0].sm.smCoscheduledAlignment, green_has_wq ? ", wq=balanced" : "");
+#endif
+    }
+
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    // 某 EC 是否被 green_ctx_cache 持有（切换/析构时避免误销毁被缓存的 EC）。
+    bool is_ec_cached(cudaExecutionContext_t ec) const {
+        for (const auto & kv : green_ctx_cache) {
+            if (kv.second == ec) return true;
+        }
+        return false;
+    }
+
+    // Synchronize the current execution context before changing its SM
+    // resources.  Streams belonging to a green context must not be
+    // synchronized through the current primary context.
+    void synchronize_streams() {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+        if (green_ctx != nullptr) {
+            // A stream created with cudaExecutionCtxStreamCreate is owned by
+            // its execution context.  Synchronizing it through the current
+            // primary context is invalid and is reported by Compute
+            // Sanitizer as "Stream does not belong to the expected context".
+            CUDA_CHECK(cudaExecutionCtxSynchronize(green_ctx));
+        } else
+#endif
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (streams[device][j] != nullptr) {
+                CUDA_CHECK(cudaStreamSynchronize(streams[device][j]));
+            }
+        }
+    }
+
+    // 运行时切换本 backend 使用的 SM 分组（见 ggml_backend_cuda_set_sm_group）。调用方保证此时
+    // backend 空闲。cache_key>=0：EC + stream + graph 都按 key 缓存，切回同一分组时零重建/零重捕获；
+    // cache_key<0：每次重建 EC、释放未缓存 stream、清 graph（旧行为，不缓存）。
+    bool set_sm_group(const cudaDevResource & sm_res, bool has_wq, const cudaDevResource & wq_res, int cache_key) {
+        ggml_cuda_set_device(device);
+
+        // 已在目标分组：no-op（避免误销毁当前 stream/graph）。
+        if (cache_key >= 0 && cache_key == sm_slot_key && green_ctx != nullptr) {
+            return true;
+        }
+
+        // 切换前同步当前 execution context（调用方保证 backend 空闲，但可能有已提交未完成的工作）。
+        // Do not synchronize green streams through the primary context.
+        synchronize_streams();
+
+        const bool to_slot   = (cache_key >= 0);
+        const bool from_slot = (sm_slot_key >= 0);   // 当前 EC 已在 green_ctx_cache 中，不会被销毁
+        cudaExecutionContext_t old_ec = green_ctx;
+
+        // 保存或丢弃当前 stream + graph
+        if (to_slot && from_slot) {
+            // 当前分组的 stream/graph 存回其槽，供以后切回时零成本复用（不销毁 stream / 不清 graph）。
+            auto & sslot = sm_stream_slots[sm_slot_key];
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) { sslot[j] = streams[device][j]; streams[device][j] = nullptr; }
+#ifdef USE_CUDA_GRAPH
+            sm_graph_slots[sm_slot_key] = std::move(cuda_graphs);
+            cuda_graphs.clear();
+#endif
+        } else if (green_ctx != nullptr && from_slot) {
+            // A cached green EC must retain its streams even when the next
+            // target is not another slot (for example, a global fallback).
+            // Park them in the existing slot instead of destroying them while
+            // the EC is alive.
+            auto & sslot = sm_stream_slots[sm_slot_key];
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+                sslot[j] = streams[device][j];
+                streams[device][j] = nullptr;
+            }
+        } else {
+            // Initial/non-cached green EC: destroy the EC first. CUDA 13.1
+            // explicitly permits cudaStreamDestroy after EC destruction.
+            if (green_ctx != nullptr) {
+                CUDA_CHECK(cudaExecutionCtxDestroy(green_ctx));
+                green_ctx = nullptr;
+                old_ec = nullptr;
+            }
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+                if (streams[device][j] != nullptr) { CUDA_CHECK(cudaStreamDestroy(streams[device][j])); streams[device][j] = nullptr; }
+            }
+#ifdef USE_CUDA_GRAPH
+            cuda_graphs.clear();
+#endif
+        }
+
+        // 写入目标分组资源（ensure_green_ctx 据此新建 EC）
+        green_has_resource = true;
+        green_sm_resource  = sm_res;
+        green_has_wq       = has_wq;
+        green_wq_resource  = wq_res;
+
+        // 取/建目标 EC
+        cudaExecutionContext_t target = nullptr;
+        if (cache_key >= 0) {
+            auto it = green_ctx_cache.find(cache_key);
+            if (it != green_ctx_cache.end()) target = it->second;
+        }
+        if (target != nullptr) {
+            // 缓存命中：复用目标 EC；旧 EC 若无主（不在缓存里）则销毁，避免泄漏。
+            green_ctx = target;
+            if (old_ec != nullptr && old_ec != target && !is_ec_cached(old_ec)) {
+                CUDA_CHECK(cudaExecutionCtxDestroy(old_ec));
+            }
+        } else {
+            // 缓存未命中（含 cache_key<0）：旧 EC 若无主则先销毁，再新建。
+            if (old_ec != nullptr && !is_ec_cached(old_ec)) {
+                CUDA_CHECK(cudaExecutionCtxDestroy(old_ec));
+            }
+            green_ctx = nullptr;
+            ensure_green_ctx();
+            if (cache_key >= 0 && green_ctx != nullptr) {
+                green_ctx_cache[cache_key] = green_ctx;
+            }
+        }
+
+        // 取出目标分组的 stream + graph（命中则零成本复用；未命中则留空，下次 stream() 懒建 / 首次捕获）
+        if (to_slot) {
+            auto sit = sm_stream_slots.find(cache_key);
+            if (sit != sm_stream_slots.end()) {
+                for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) streams[device][j] = sit->second[j];
+                sm_stream_slots.erase(sit);
+            }
+#ifdef USE_CUDA_GRAPH
+            auto git = sm_graph_slots.find(cache_key);
+            if (git != sm_graph_slots.end()) {
+                cuda_graphs = std::move(git->second);
+                sm_graph_slots.erase(git);
+                const int64_t restore_time = ggml_time_us();
+                for (auto & [key, graph] : cuda_graphs) {
+                    GGML_UNUSED(key);
+                    if (graph) graph->last_used_time = restore_time;
+                }
+            }
+#endif
+            sm_slot_key = cache_key;
+        } else {
+            sm_slot_key = -1;  // cache_key<0：不进缓存
+        }
+
+        return green_ctx != nullptr;
+    }
+
+    // 回全局（解绑 green context，本 backend 拿满设备全部 SM，等价于不隔离）。
+    // stream + graph 同样按 cache_key 换槽（全局也是一个可缓存分组）。缓存的 EC 保留、无主 EC 销毁。
+    bool set_sm_global(int cache_key) {
+        ggml_cuda_set_device(device);
+
+        // 已在同一全局槽：no-op。
+        if (cache_key == sm_slot_key && green_ctx == nullptr) {
+            return true;
+        }
+
+        synchronize_streams();
+
+        const bool to_slot   = (cache_key >= 0);
+        const bool from_slot = (sm_slot_key >= 0);
+
+        if (to_slot && from_slot) {
+            auto & sslot = sm_stream_slots[sm_slot_key];
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) { sslot[j] = streams[device][j]; streams[device][j] = nullptr; }
+#ifdef USE_CUDA_GRAPH
+            sm_graph_slots[sm_slot_key] = std::move(cuda_graphs);
+            cuda_graphs.clear();
+#endif
+        } else if (green_ctx != nullptr && from_slot) {
+            auto & sslot = sm_stream_slots[sm_slot_key];
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+                sslot[j] = streams[device][j];
+                streams[device][j] = nullptr;
+            }
+#ifdef USE_CUDA_GRAPH
+            // 回 GLOBAL 也要把当前分组的图存回其槽。若不存，切走时（set_sm_group 的 else
+            // 分支）会 clear cuda_graphs，把"暂留在 cuda_graphs 里的图"一起清掉，该分组的
+            // 图会丢失，切回时需重捕获。
+            sm_graph_slots[sm_slot_key] = std::move(cuda_graphs);
+            cuda_graphs.clear();
+#endif
+        } else {
+            if (green_ctx != nullptr) {
+                CUDA_CHECK(cudaExecutionCtxDestroy(green_ctx));
+                green_ctx = nullptr;
+            }
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+                if (streams[device][j] != nullptr) { CUDA_CHECK(cudaStreamDestroy(streams[device][j])); streams[device][j] = nullptr; }
+            }
+#ifdef USE_CUDA_GRAPH
+            cuda_graphs.clear();
+#endif
+        }
+
+        // 解绑 green context：回 primary（全 SM）。缓存的 EC 保留供切回，无主的当前 EC 销毁。
+        if (green_ctx != nullptr && !is_ec_cached(green_ctx)) {
+            CUDA_CHECK(cudaExecutionCtxDestroy(green_ctx));
+        }
+        green_ctx          = nullptr;
+        green_has_resource = false;
+        green_n_sms        = 0;
+
+        if (to_slot) {
+            auto sit = sm_stream_slots.find(cache_key);
+            if (sit != sm_stream_slots.end()) {
+                for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) streams[device][j] = sit->second[j];
+                sm_stream_slots.erase(sit);
+            }
+#ifdef USE_CUDA_GRAPH
+            auto git = sm_graph_slots.find(cache_key);
+            if (git != sm_graph_slots.end()) {
+                cuda_graphs = std::move(git->second);
+                sm_graph_slots.erase(git);
+                const int64_t restore_time = ggml_time_us();
+                for (auto & [key, graph] : cuda_graphs) {
+                    GGML_UNUSED(key);
+                    if (graph) graph->last_used_time = restore_time;
+                }
+            }
+#endif
+            sm_slot_key = cache_key;
+        } else {
+            sm_slot_key = -1;
+        }
+
+        return true;   // 回全局总是成功（primary context 恒在）
+    }
+#endif // CUDART_VERSION >= 13010
+
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
+            ensure_green_ctx();
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+            if (green_ctx != nullptr) {
+                CUDA_CHECK(cudaExecutionCtxStreamCreate(&streams[device][stream], green_ctx, cudaStreamNonBlocking, 0));
+                return streams[device][stream];
+            }
+#endif
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
         }
         return streams[device][stream];
@@ -1576,4 +1932,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

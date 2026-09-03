@@ -447,6 +447,14 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
     return err;
 }
 
+enum ggml_status ggml_backend_graph_compute_range(ggml_backend_t backend, struct ggml_cgraph * cgraph,
+                                                  int i0, int i1) {
+    GGML_ASSERT(cgraph != nullptr);
+    GGML_ASSERT(i0 >= 0 && i0 < i1 && i1 <= cgraph->n_nodes);
+    struct ggml_cgraph view = ggml_graph_view(cgraph, i0, i1);
+    return ggml_backend_graph_compute(backend, &view);
+}
+
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
     return backend->iface.graph_compute(backend, cgraph);

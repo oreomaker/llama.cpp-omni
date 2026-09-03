@@ -103,6 +103,11 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_plan_compute (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+    // Compute only graph nodes in [i0, i1). The view is non-owning and is
+    // created internally so callers need not know ggml_cgraph layout.
+    GGML_API enum ggml_status ggml_backend_graph_compute_range(ggml_backend_t backend,
+                                                                struct ggml_cgraph * cgraph,
+                                                                int i0, int i1);
 
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);

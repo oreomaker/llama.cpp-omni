@@ -553,9 +553,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
-            //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
-            //       device, (unsigned long long) (pool_size/1024/1024),
-            //       (unsigned long long) (reserve_size/1024/1024));
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -605,6 +602,25 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    // Synchronize and destroy execution contexts before destroying streams.
+    // CUDA 13.1 permits cudaStreamDestroy after cudaExecutionCtxDestroy for
+    // streams created with cudaExecutionCtxStreamCreate; the reverse order
+    // makes the runtime validate the stream against the current primary
+    // context and produces "Stream does not belong to the expected context".
+    std::vector<cudaExecutionContext_t> destroyed_ecs;
+    auto destroy_ec = [&](cudaExecutionContext_t ec) {
+        if (ec == nullptr || std::find(destroyed_ecs.begin(), destroyed_ecs.end(), ec) != destroyed_ecs.end()) return;
+        CUDA_CHECK(cudaExecutionCtxSynchronize(ec));
+        CUDA_CHECK(cudaExecutionCtxDestroy(ec));
+        destroyed_ecs.push_back(ec);
+    };
+    for (const auto & kv : green_ctx_cache) destroy_ec(kv.second);
+    if (green_ctx != nullptr) destroy_ec(green_ctx);
+    green_ctx = nullptr;
+    green_ctx_cache.clear();
+#endif
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -618,6 +634,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
     }
+    // 🔧 [Green Context] 销毁 green context（若创建过）
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    // Phase 2（SM_GC_60 §7）：execution contexts were destroyed above; now
+    // their explicitly-created streams can be released safely.
+    for (auto & kv : sm_stream_slots) {
+        for (cudaStream_t s : kv.second) {
+            if (s != nullptr) CUDA_CHECK(cudaStreamDestroy(s));
+        }
+    }
+    sm_stream_slots.clear();
+#endif
 }
 
 
@@ -3251,6 +3278,21 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    // The first scheduler reserve may call synchronize before stream() has
+    // lazily created the green execution context.  Establish it first so the
+    // branch below does not create a green stream and then pass that stream to
+    // cudaStreamSynchronize under the primary context.
+    cuda_ctx->ensure_green_ctx();
+    if (cuda_ctx->green_ctx != nullptr) {
+        // Green streams are tied to an execution context.  The ordinary
+        // cudaStreamSynchronize path uses the current primary context and
+        // is rejected by CUDA 13.1 (and can leave startup in an undefined
+        // state).  Use the explicit context-level synchronization API.
+        CUDA_CHECK(cudaExecutionCtxSynchronize(cuda_ctx->green_ctx));
+        return;
+    }
+#endif
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -3299,15 +3341,36 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    uint64_t hash = (uint64_t) (uintptr_t) cgraph->nodes[0];
+    auto mix = [&](uint64_t value) {
+        hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    };
+    mix((uint64_t) cgraph->n_nodes);
+    mix((uint64_t) cgraph->n_leafs);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        mix((uint64_t) node->op);
+        mix((uint64_t) node->type);
+        mix((uint64_t) (uintptr_t) node->data);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t) node->ne[d]);
+            mix((uint64_t) node->nb[d]);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] == nullptr) continue;
+            mix((uint64_t) (uintptr_t) node->src[s]->data);
+        }
+    }
+    return hash;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
@@ -3345,7 +3408,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -4239,7 +4302,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4454,7 +4517,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -4477,7 +4540,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
+    uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4485,7 +4548,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && !cuda_ctx->disable_graphs) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4513,6 +4576,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -4558,7 +4622,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -5039,9 +5103,31 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     };
 }
 
+// 🔧 [SM Plan] 协调式 SM 分组。struct 定义在此（device_init_backend 访问 plan->n_groups 需要完整类型）
+struct ggml_backend_cuda_sm_plan {
+    int  device;
+    int  n_groups;
+    bool balanced_wq;
+    cudaDevResource * groups;     // [n_groups]
+    cudaDevResource   wq_config;  // balanced_wq 时有效
+};
+
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    // 解析 params 中的 "sm_plan_group=N"：命中且该 device 有注册 plan -> 用对应 disjoint 分组
+    // （协调式 SM 计划注入通道，见 tools/omni/SM_PLAN_DUPLEX_INTEGRATION.md §2）
+    if (params != nullptr) {
+        const char * p = strstr(params, "sm_plan_group=");
+        if (p != nullptr) {
+            const int group = atoi(p + strlen("sm_plan_group="));
+            ggml_backend_cuda_sm_plan * plan = ggml_backend_cuda_sm_plan_get(ctx->device);
+            if (plan != nullptr && group >= 0 && group < plan->n_groups) {
+                return ggml_backend_cuda_init_sm(ctx->device, plan, group);
+            }
+            // plan 缺失 / 组越界：回退普通 init（primary）
+        }
+    }
     return ggml_backend_cuda_init(ctx->device);
 }
 
@@ -5601,6 +5687,15 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// 🔧 [per-backend CUDA graph 开关] 供 host 侧（omni/token2wav）经 proc-address 关掉单个 backend
+// 的 CUDA graph（走 eager），用于按组件做图归因/外科修复。见 common.cuh 的 disable_graphs。
+static void ggml_backend_cuda_set_disable_graph(ggml_backend_t backend, bool disable) {
+    if (!backend || !ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ((ggml_backend_cuda_context *) backend->context)->disable_graphs = disable;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5611,6 +5706,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_disable_graph") == 0) {
+        return (void *)ggml_backend_cuda_set_disable_graph;
     }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_cuda_split_buffer_type;
@@ -5705,5 +5803,161 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 
     return cuda_backend;
 }
+
+// ---------------------------------------------------------------------------
+// SM 计划：协调式 split（disjoint 分组），解决多 GC 并发 SM 重叠。
+// struct 定义在前面的 device_init_backend 之前（它要访问 plan->n_groups）；
+// 进程级注册表与函数实现见 ggml_backend_cuda_init 之后的块。
+// ---------------------------------------------------------------------------
+// 进程级 SM 计划注册表：device -> plan。params 注入路径（"sm_plan_group=N"）按 device 解析 plan；
+// 直接创建者（T2W loader）也可用 ggml_backend_cuda_init_sm(device, NULL, group) 走注册表。
+static std::mutex g_sm_plan_mtx;
+static std::unordered_map<int, ggml_backend_cuda_sm_plan *> g_sm_plans;
+
+ggml_backend_cuda_sm_plan * ggml_backend_cuda_sm_plan_get(int device) {
+    std::lock_guard<std::mutex> lock(g_sm_plan_mtx);
+    auto it = g_sm_plans.find(device);
+    return it == g_sm_plans.end() ? nullptr : it->second;
+}
+
+ggml_backend_cuda_sm_plan * ggml_backend_cuda_sm_plan_create(int device, const int * sms, int n_groups, bool balanced_wq) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count() || n_groups <= 0 || sms == nullptr) {
+        return nullptr;
+    }
+
+    ggml_cuda_set_device(device);
+    cudaDevResource full;
+    cudaError_t err = cudaDeviceGetDevResource(device, &full, cudaDevResourceTypeSm);
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: SM resource query failed (%s) for device %d\n", __func__, cudaGetErrorString(err), device);
+        return nullptr;
+    }
+    const unsigned align = full.sm.smCoscheduledAlignment > 0 ? full.sm.smCoscheduledAlignment : 2;
+
+    // 一次 split 出 n_groups 个 disjoint 分组（smCount 必须为 align 的倍数）
+    std::vector<cudaDevSmResourceGroupParams> gp(n_groups);
+    for (int i = 0; i < n_groups; ++i) {
+        memset(&gp[i], 0, sizeof(gp[i]));
+        unsigned want = (unsigned) sms[i];
+        if (want > full.sm.smCount) want = full.sm.smCount;
+        want = (want / align) * align;
+        if (want == 0) want = align;
+        gp[i].smCount                     = want;
+        gp[i].coscheduledSmCount          = align;
+        gp[i].preferredCoscheduledSmCount = align;
+    }
+
+    cudaDevResource * groups = new cudaDevResource[n_groups]();
+    cudaDevResource remainder;
+    memset(&remainder, 0, sizeof(remainder));
+    const unsigned nb = (unsigned) n_groups;
+    err = cudaDevSmResourceSplit(groups, nb, &full, &remainder, 0, gp.data());
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: coordinated SM split failed (%s) for device %d\n", __func__, cudaGetErrorString(err), device);
+        delete[] groups;
+        return nullptr;
+    }
+
+    ggml_backend_cuda_sm_plan * plan = new ggml_backend_cuda_sm_plan;
+    plan->device      = device;
+    plan->n_groups    = n_groups;
+    plan->balanced_wq = balanced_wq;
+    plan->groups      = groups;
+    if (balanced_wq) {
+        cudaError_t e2 = cudaDeviceGetDevResource(device, &plan->wq_config, cudaDevResourceTypeWorkqueueConfig);
+        if (e2 == cudaSuccess) {
+            plan->wq_config.wqConfig.sharingScope = cudaDevWorkqueueConfigScopeGreenCtxBalanced;
+        } else {
+            plan->balanced_wq = false;   // 查询失败则退化为默认 workqueue
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_sm_plan_mtx);
+        g_sm_plans[device] = plan;   // 覆盖旧的注册
+    }
+    return plan;
+#else
+    (void) device; (void) sms; (void) n_groups; (void) balanced_wq;
+    return nullptr;
+#endif
+}
+
+void ggml_backend_cuda_sm_plan_free(ggml_backend_cuda_sm_plan * plan) {
+    if (plan == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lock(g_sm_plan_mtx);
+        auto it = g_sm_plans.find(plan->device);
+        if (it != g_sm_plans.end() && it->second == plan) {
+            g_sm_plans.erase(it);
+        }
+    }
+    delete[] plan->groups;
+    delete plan;
+}
+
+ggml_backend_t ggml_backend_cuda_init_sm(int device, const ggml_backend_cuda_sm_plan * plan, int group_idx) {
+    if (plan == nullptr) {
+        plan = ggml_backend_cuda_sm_plan_get(device);   // 直接创建者（T2W loader）可只传组号
+    }
+    ggml_backend_t backend = ggml_backend_cuda_init(device);
+    if (backend == nullptr) {
+        return nullptr;
+    }
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    if (plan != nullptr && group_idx >= 0 && group_idx < plan->n_groups) {
+        ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+        ctx->green_has_resource  = true;
+        ctx->green_sm_resource   = plan->groups[group_idx];
+        if (plan->balanced_wq) {
+            ctx->green_has_wq     = true;
+            ctx->green_wq_resource = plan->wq_config;
+        }
+    }
+#else
+    (void) plan; (void) group_idx;
+#endif
+    return backend;
+}
+
+int ggml_backend_cuda_sm_plan_group_sms(const ggml_backend_cuda_sm_plan * plan, int group_idx) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    if (plan == nullptr || group_idx < 0 || group_idx >= plan->n_groups) {
+        return -1;
+    }
+    return (int) plan->groups[group_idx].sm.smCount;
+#else
+    (void) plan; (void) group_idx;
+    return -1;
+#endif
+}
+
+bool ggml_backend_cuda_set_sm_group(ggml_backend_t backend, const ggml_backend_cuda_sm_plan * plan, int group_idx, int cache_key) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    // group_idx == -1：回全局（拿满设备全部 SM，等价于不隔离；plan 忽略）。见 SM_GC_60 §7。
+    if (group_idx == -1) {
+        return ctx->set_sm_global(cache_key);
+    }
+    if (plan == nullptr) {
+        plan = ggml_backend_cuda_sm_plan_get(ctx->device);
+    }
+    if (plan == nullptr || group_idx < 0 || group_idx >= plan->n_groups) {
+        return false;
+    }
+    cudaDevResource wq = {};
+    if (plan->balanced_wq) {
+        wq = plan->wq_config;
+    }
+    return ctx->set_sm_group(plan->groups[group_idx], plan->balanced_wq, wq, cache_key);
+#else
+    (void) backend; (void) plan; (void) group_idx; (void) cache_key;
+    return false;
+#endif
+}
+
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
