@@ -5380,6 +5380,7 @@ bool hg2_hift_generator::build_graph_forward(ggml_context * ctx,
         return false;
     }
     s_over = ggml_cont(ctx, s_over);
+    ggml_set_name(s_over, "voc_source_out");
     ggml_tensor * wave_t_b = nullptr;
     if (!build_graph_decode(ctx, speech_feat_c80_t_b, s_over, &wave_t_b)) {
         LOG_ERROR( "hg2_hift.build_graph_forward: decode failed\n");
@@ -5444,6 +5445,7 @@ bool hg2_hift_generator::build_graph_decode(ggml_context * ctx,
     x_tcb = ggml_cont(ctx, x_tcb);
     x_tcb = ggml_leaky_relu(ctx, x_tcb, lrelu_slope, false);
     x_tcb = ggml_cont(ctx, x_tcb);
+    ggml_set_name(x_tcb, "voc_convpre_out");
     x_tcb = hg_hift_deconv1d_pad_f32_b1(ctx, x_tcb, up0_weight, up0_bias, 8, 4);
     if (!x_tcb) {
         return false;
@@ -5476,6 +5478,7 @@ bool hg2_hift_generator::build_graph_decode(ggml_context * ctx,
     x_tcb = ggml_cont(ctx, x_tcb);
     x_tcb = ggml_leaky_relu(ctx, x_tcb, lrelu_slope, false);
     x_tcb = ggml_cont(ctx, x_tcb);
+    ggml_set_name(x_tcb, "voc_up0_out");
     x_tcb = hg_hift_deconv1d_pad_f32_b1(ctx, x_tcb, up1_weight, up1_bias, 5, 3);
     if (!x_tcb) {
         return false;
@@ -5507,6 +5510,7 @@ bool hg2_hift_generator::build_graph_decode(ggml_context * ctx,
     x_tcb = ggml_cont(ctx, x_tcb);
     x_tcb = ggml_leaky_relu(ctx, x_tcb, lrelu_slope, false);
     x_tcb = ggml_cont(ctx, x_tcb);
+    ggml_set_name(x_tcb, "voc_up1_out");
     x_tcb = hg_hift_deconv1d_pad_f32_b1(ctx, x_tcb, up2_weight, up2_bias, 3, 2);
     if (!x_tcb) {
         return false;
@@ -5543,6 +5547,7 @@ bool hg2_hift_generator::build_graph_decode(ggml_context * ctx,
     x_tcb = ggml_cont(ctx, x_tcb);
     x_tcb                  = ggml_leaky_relu(ctx, x_tcb, 0.01f, false);
     x_tcb                  = ggml_cont(ctx, x_tcb);
+    ggml_set_name(x_tcb, "voc_up2_out");
     ggml_tensor * post_tcb = hg_hift_conv1d_f32(ctx, x_tcb, conv_post_weight, conv_post_bias, 1, 3, 1);
     if (!post_tcb) {
         return false;
@@ -6712,6 +6717,52 @@ bool voc_hg2_runner::voc_hg2_runner_eval(const std::vector<float> & speech_feat_
     return voc_hg2_runner_eval_stream(speech_feat_bct, T_mel, empty_cache, 0, out_wave_bt, out_T_audio,
                                       out_source_dummy, out_T_source_dummy);
 }
+// 收集 HiFiGAN2 vocoder 图的阶段节点区间（与 flow 的 runner_collect_timestep_ranges 同型）：
+// 按 build_graph_decode 里打的阶段标记张量名，把图切成
+//   [0, convpre)  source 生成 + STFT + conv_pre
+//   [convpre, up0)  up0 上采样阶段
+//   [up0, up1)      up1 上采样阶段
+//   [up1, up2)      up2 上采样阶段
+//   [up2, end)      conv_post + iSTFT
+// 任一标记缺失/乱序 → 返回 false（调用方回退整图一次 compute）。
+static bool runner_collect_vocoder_ranges(ggml_cgraph * gf, std::vector<std::pair<int, int>> & ranges) {
+    ranges.clear();
+    if (gf == nullptr) {
+        return false;
+    }
+    static const char * markers[] = {"voc_convpre_out", "voc_up0_out", "voc_up1_out", "voc_up2_out"};
+    const int n_markers = 4;
+    int idx[4] = {-1, -1, -1, -1};
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        const char * name = node != nullptr ? ggml_get_name(node) : nullptr;
+        if (name == nullptr) {
+            continue;
+        }
+        for (int k = 0; k < n_markers; ++k) {
+            if (idx[k] < 0 && std::strcmp(name, markers[k]) == 0) {
+                idx[k] = i;
+            }
+        }
+    }
+    for (int k = 0; k < n_markers; ++k) {
+        if (idx[k] < 0 || (k > 0 && idx[k] <= idx[k - 1])) {
+            ranges.clear();
+            return false;
+        }
+    }
+    for (int k = 0; k < n_markers; ++k) {
+        const int begin = k == 0 ? 0 : idx[k];
+        const int end   = k + 1 < n_markers ? idx[k + 1] : ggml_graph_n_nodes(gf);
+        if (begin >= end) {
+            ranges.clear();
+            return false;
+        }
+        ranges.emplace_back(begin, end);
+    }
+    return true;
+}
+
 bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speech_feat_bct,
                                                 int64_t                    T_mel,
                                                 const std::vector<float> & cache_source_bt1,
@@ -6719,7 +6770,9 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                                                 std::vector<float> &       out_wave_bt,
                                                 int64_t &                  out_T_audio,
                                                 std::vector<float> &       out_source_bt1,
-                                                int64_t &                  out_T_source) const {
+                                                int64_t &                  out_T_source,
+                                                flow::token2wav_segment_callback_t segment_callback,
+                                                void *                           segment_callback_user_data) const {
     if (!model || !model->hg2 || !model->backend || !model->galloc) {
         return false;
     }
@@ -6787,11 +6840,42 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     }
     {
         omni::flow::profile::ScopeTimer _t("voc.compute");
-        const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
-            ggml_free(ctx);
-            return false;
+        std::vector<std::pair<int, int>> voc_ranges;
+        const char * dispatch    = std::getenv("OMNI_T2W_DISPATCH");
+        const bool   forced_full = dispatch != nullptr && std::strcmp(dispatch, "full") == 0;
+        // 与 flow 的 split dispatch 一致：SM 协同路径（segment_callback 非空）下把
+        // vocoder 图按阶段切分，每段 GPU 同步后调 segment_callback 让出 T2W 租约，
+        // 让调度器在 vocoder 子段之间也能再决策（audio 尾巴只剩 T2W 时可及时降回 GLOBAL）。
+        const bool split_voc = segment_callback != nullptr && !forced_full &&
+            runner_collect_vocoder_ranges(gf, voc_ranges);
+        if (split_voc) {
+            omni_set_cuda_disable_graph(model->backend, true);
+            const int n = (int) voc_ranges.size();
+            ggml_status st = GGML_STATUS_SUCCESS;
+            for (int i = 0; i < n; ++i) {
+                st = ggml_backend_graph_compute_range(model->backend, gf,
+                                                      voc_ranges[i].first, voc_ranges[i].second);
+                if (st != GGML_STATUS_SUCCESS) {
+                    break;
+                }
+                ggml_backend_synchronize(model->backend);
+                if (segment_callback != nullptr) {
+                    segment_callback(i, n, segment_callback_user_data);
+                }
+            }
+            omni_set_cuda_disable_graph(model->backend, false);
+            if (st != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("voc_hg2_runner_eval_stream: ggml_backend_graph_compute_range failed\n");
+                ggml_free(ctx);
+                return false;
+            }
+        } else {
+            const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
+                ggml_free(ctx);
+                return false;
+            }
         }
     }
     omni::flow::profile::ScopeTimer _download_timer("voc.download");
@@ -7600,11 +7684,31 @@ static ggml_status runner_dispatch_graph(
         bool split, bool disable_cuda_graph, const char * graph_kind,
         token2wav_segment_callback_t segment_callback,
         void * segment_callback_user_data) {
-    (void) ranges; (void) split; (void) graph_kind; (void) segment_callback; (void) segment_callback_user_data;
     if (disable_cuda_graph) {
         omni_set_cuda_disable_graph(backend, true);
     }
-    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (!split || ranges.empty()) {
+        const ggml_status status = ggml_backend_graph_compute(backend, gf);
+        if (disable_cuda_graph) {
+            omni_set_cuda_disable_graph(backend, false);
+        }
+        return status;
+    }
+
+    ggml_status status = GGML_STATUS_SUCCESS;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        const auto [begin, end] = ranges[i];
+        status = ggml_backend_graph_compute_range(backend, gf, begin, end);
+        if (status != GGML_STATUS_SUCCESS) {
+            break;
+        }
+        ggml_backend_synchronize(backend);
+        if (segment_callback != nullptr) {
+            // The final extra segment is the vocoder, which runs after this
+            // token2mel graph returns.
+            segment_callback((int) i, (int) ranges.size() + 1, segment_callback_user_data);
+        }
+    }
     if (disable_cuda_graph) {
         omni_set_cuda_disable_graph(backend, false);
     }
@@ -9107,8 +9211,33 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
 bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                                     int                 n_timesteps,
                                                     float               temperature) {
-    // 用于从prompt_cache.gguf恢复缓存并初始化runner状态
-    reset_stream();
+    return start_stream_with_prompt_cache_gguf_impl(prompt_cache_gguf_path, n_timesteps, temperature,
+                                                    /*preserve_graph=*/false);
+}
+
+bool Token2Mel::restart_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                                     int                 n_timesteps,
+                                                     float               temperature) {
+    return start_stream_with_prompt_cache_gguf_impl(prompt_cache_gguf_path, n_timesteps, temperature,
+                                                    /*preserve_graph=*/true);
+}
+
+bool Token2Mel::start_stream_with_prompt_cache_gguf_impl(const std::string & prompt_cache_gguf_path,
+                                                         int                 n_timesteps,
+                                                         float               temperature,
+                                                         bool                preserve_graph) {
+    // GGUF warmup changes only stream data. Keep the graph session so its
+    // CUDA graph key and captured instance remain valid for the real stream.
+    if (!preserve_graph) {
+        reset_stream();
+    } else if (backend_kind_ != Backend::GGUF) {
+        // ANE has its own cache representation and no GGUF flow graph to keep.
+        return start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature);
+    } else {
+        cache_in_.clear();
+        last_mel_bct_.clear();
+        stream_started_ = false;
+    }
     if (!model_loaded_) {
         LOG_ERROR( "Token2Mel.start_stream_with_prompt_cache_gguf: model not loaded\n");
         return false;
@@ -9904,7 +10033,7 @@ bool Token2Wav::warmup_vocoder() {
 // warmup_vocoder 只覆盖 vocoder；flow 的首次图捕获/内核加载仍留在第一个真实窗口里，实测使首窗
 // 260~290ms（稳态约 130ms），且该窗口结束时若正撞上一次 LLM decode，会把它由 26ms 拖到 76~86ms。
 // 用 pad token 走与真实窗口相同的形状（默认 28 = CHUNK_SIZE + PRE_LOOKAHEAD）。
-// 副作用：会写入 t2m 流式状态与 voc 缓存，调用方必须随后重新 start_stream 复位。
+// 副作用：会写入 t2m 流式状态与 voc 缓存，调用方必须随后恢复 prompt cache。
 bool Token2Wav::warmup_pipeline(int32_t n_tokens) {
     if (!models_loaded_ || n_tokens <= 0) {
         return false;
@@ -9932,6 +10061,28 @@ bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
     if (!t2m_.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
         LOG_ERROR(
             "Token2Wav.start_stream_with_prompt_cache_gguf: Token2Mel.start_stream_with_prompt_cache_gguf failed\n");
+        return false;
+    }
+    return true;
+}
+
+bool Token2Wav::restart_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                                      int                 n_timesteps,
+                                                      float               temperature) {
+    voc_mel_cache_bct_.clear();
+    voc_cache_source_bt1_.clear();
+    voc_Tc_ = 0;
+    voc_speech_cache_bt_.clear();
+    token2wav_utils::ensure_hamming_window_2n((int64_t) kSourceCacheLen, voc_speech_window_);
+
+    if (!models_loaded_) {
+        LOG_ERROR( "Token2Wav.restart_stream_with_prompt_cache_gguf: models not loaded\n");
+        return false;
+    }
+
+    if (!t2m_.restart_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
+        LOG_ERROR(
+            "Token2Wav.restart_stream_with_prompt_cache_gguf: Token2Mel restart failed\n");
         return false;
     }
     return true;
@@ -10035,7 +10186,8 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     int64_t            out_T_source = 0;
     const auto t_voc0 = clock::now();
     if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source)) {
+                                                out_T_audio, out_source_bt1, out_T_source,
+                                                segment_callback, segment_callback_user_data)) {
         LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
         return false;
     }

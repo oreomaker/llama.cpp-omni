@@ -2052,7 +2052,9 @@ struct voc_hg2_runner {
                                     std::vector<float> &       out_wave_bt,
                                     int64_t &                  out_T_audio,
                                     std::vector<float> &       out_source_bt1,
-                                    int64_t &                  out_T_source) const;
+                                    int64_t &                  out_T_source,
+                                    flow::token2wav_segment_callback_t segment_callback = nullptr,
+                                    void *                           segment_callback_user_data = nullptr) const;
 };
 }  // namespace vocoder
 }  // namespace omni
@@ -2094,6 +2096,11 @@ class Token2Mel {
     bool start_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
                                              int                 n_timesteps = -1,
                                              float               temperature = -1.0f);
+
+    // Restore prompt caches without rebuilding the GGUF inference graphs.
+    bool restart_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                               int                 n_timesteps = -1,
+                                               float               temperature = -1.0f);
 
     bool push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final,
                      std::vector<float> & mel_bct_out,
@@ -2149,6 +2156,10 @@ class Token2Mel {
                          std::vector<float> & mel_bct,
                          token2wav_segment_callback_t segment_callback = nullptr,
                          void * segment_callback_user_data = nullptr);
+    bool start_stream_with_prompt_cache_gguf_impl(const std::string & prompt_cache_gguf_path,
+                                                  int                 n_timesteps,
+                                                  float               temperature,
+                                                  bool                preserve_graph);
 
     // CoreML 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 CoreML。
     bool start_stream_ane_(const flowStreamCacheHost & host_cache);
@@ -2260,6 +2271,11 @@ class Token2Wav {
                                              int                 n_timesteps = -1,
                                              float               temperature = -1.0f);
 
+    // Restore prompt caches while retaining the existing GGUF graph session.
+    bool restart_stream_with_prompt_cache_gguf(const std::string & prompt_cache_gguf_path,
+                                               int                 n_timesteps = -1,
+                                               float               temperature = -1.0f);
+
     bool start_stream_with_prompt(const Token2Mel::PromptBundle & prompt,
                                   int                             n_timesteps = 10,
                                   float                           temperature = 1.0f);
@@ -2300,8 +2316,8 @@ class Token2Wav {
     bool warmup_vocoder();
 
     // 预热：空跑一个完整窗口（token2mel + vocoder），预热 flow 侧的首次运行成本
-    // （图捕获/实例化、内核加载）。会写脏流式状态，调用方必须随后重新 start_stream 复位；
-    // 见 Token2WavSession::init_from_prompt_cache_gguf 里的用法。
+    // （图捕获/实例化、内核加载）。会写脏流式状态，调用方随后恢复 prompt cache；
+    // GGUF 路径保留已捕获的 flow graph。
     bool warmup_pipeline(int32_t n_tokens = 28);
 
   private:
@@ -2392,6 +2408,21 @@ struct Token2WavSession {
     void reset();
 
     Token2Wav t2w;
+
+    // 返回本 session 里在 SM 计划中的 T2W GPU backend（token2mel/flow + vocoder）。
+    // 过滤 null 后返回。动态切换时遍历本表逐个切。
+    std::vector<ggml_backend_t> gpu_backends() const {
+        std::vector<ggml_backend_t> v;
+        ggml_backend_t b = t2w.t2m_backend();
+        if (b != nullptr) {
+            v.push_back(b);
+        }
+        ggml_backend_t voc = t2w.vocoder_backend();
+        if (voc != nullptr) {
+            v.push_back(voc);
+        }
+        return v;
+    }
 
   private:
     std::vector<int32_t> pending_;

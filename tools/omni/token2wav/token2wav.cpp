@@ -29,14 +29,14 @@ bool Token2WavSession::init_from_prompt_cache_gguf(const std::string & encoder_g
         return false;
     }
     // 预热：空跑一个窗口，把 flow + vocoder 的首次运行成本（图捕获/实例化、内核加载）
-    // 移出第一个真实窗口，再重新 start_stream 把被写脏的流式状态复位。
+    // 移出第一个真实窗口，再恢复 prompt cache。GGUF 路径保留已捕获的 flow graph。
     // 默认开启，OMNI_T2W_WARMUP=0 关闭。
     {
         const char * w = getenv("OMNI_T2W_WARMUP");
         if (w == nullptr || atoi(w) != 0) {
             if (t2w.warmup_pipeline() &&
-                !t2w.start_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
-                std::fprintf(stderr, "Token2WavSession: warmup 后 start_stream 复位失败\n");
+                !t2w.restart_stream_with_prompt_cache_gguf(prompt_cache_gguf_path, n_timesteps, temperature)) {
+                std::fprintf(stderr, "Token2WavSession: warmup 后恢复 prompt cache 失败\n");
                 return false;
             }
         }
