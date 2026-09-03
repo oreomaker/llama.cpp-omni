@@ -28,13 +28,25 @@ void print_with_timestamp(const char * format, ...) {
 #else
     localtime_r(&in_time_t, &buf);
 #endif
-    std::cout << std::put_time(&buf, "%H:%M:%S") << '.'
-              << std::setfill('0') << std::setw(3) << ms.count() << ' ';
 
+    // 整行一次性 fwrite 到 stderr：与其它诊断（sm_log / [pb-prof] 等）统一走
+    // stderr 单次写入，避免 stdout(全缓冲) 与 stderr(无缓冲) 在 `2>&1` 合并时
+    // 行被从中间切断（曾导致 T2W wav 行 / LLM prefill 行被 [SM SEG] 打印插入）。
+    char ts[64];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &buf);
+
+    char line[2048];
+    const int n = snprintf(line, sizeof(line), "%s.%03d ", ts, (int) ms.count());
+    if (n < 0) return;
     va_list args;
     va_start(args, format);
-    vprintf(format, args);
+    const int m = vsnprintf(line + n, sizeof(line) - (size_t) n, format, args);
     va_end(args);
+    if (m < 0) return;
+
+    const size_t avail   = sizeof(line) - (size_t) n;
+    const size_t written = (size_t) m < avail ? (size_t) m : avail - 1;
+    fwrite(line, 1, (size_t) n + written, stderr);
 }
 
 bool cross_platform_mkdir_p(const std::string & path) {
