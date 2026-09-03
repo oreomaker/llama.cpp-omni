@@ -14,6 +14,7 @@
 #include "stb/stb_image.h"
 
 #include <cstring>
+
 static bool load_file_to_bytes(const char* path, unsigned char** bytesOut, long *sizeOut) {
     auto file = fopen(path, "rb");
     if (file == NULL) {
@@ -433,7 +434,9 @@ struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_
 // 返回的 vector: [0] = overview, [1..n] = slices
 bool omni_image_embed_make_chunks_with_filename(struct vision_ctx * ctx_vision, int n_threads,
                                                  std::string image_path,
-                                                 std::vector<std::vector<float>> & vision_chunks) {
+                                                 std::vector<std::vector<float>> & vision_chunks,
+                                                 vision_segment_callback_t segment_callback,
+                                                 void * segment_callback_user_data) {
     unsigned char* image_bytes;
     long image_bytes_length;
     auto loaded = load_file_to_bytes(image_path.c_str(), &image_bytes, &image_bytes_length);
@@ -452,7 +455,7 @@ bool omni_image_embed_make_chunks_with_filename(struct vision_ctx * ctx_vision, 
     free(image_bytes);
     
     bool success = encode_image_with_vision_chunks(ctx_vision, n_threads, img, vision_chunks,
-                                                   nullptr, nullptr);
+                                                   segment_callback, segment_callback_user_data);
     vision_image_u8_free(img);
     
     if (success) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "omni.h"
+#include "vision.h"
 
 #include <chrono>
 #include <cstdint>
@@ -178,7 +179,9 @@ struct omni_embed * omni_image_embed_make_with_filename(struct vision_ctx * ctx_
                                                         int n_threads, std::string image_path);
 bool omni_image_embed_make_chunks_with_filename(struct vision_ctx * ctx_vision,
                                                 int n_threads, std::string image_path,
-                                                std::vector<std::vector<float>> & vision_chunks);
+                                                std::vector<std::vector<float>> & vision_chunks,
+                                                vision_segment_callback_t segment_callback = nullptr,
+                                                void * segment_callback_user_data = nullptr);
 struct omni_embed * omni_audio_embed_make_with_filename(struct audition_ctx * ctx_audio,
                                                         int n_threads, std::string audio_path);
 void omni_embed_free(struct omni_embed * emb);

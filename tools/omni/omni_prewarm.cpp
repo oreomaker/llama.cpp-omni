@@ -166,6 +166,32 @@ void omni_prewarm(struct omni_context * ctx_omni) {
         }
     }
 
+    // ---- SM 各 plan 的 EC 预建 ----
+    // 遍历 4 个 preset 对 5 组 backend 各 set_sm_group 一次，把每个 plan 的 green context
+    // 建好并留在 green_ctx_cache。运行期切到任一 plan 零重建 EC。STEADY 放最后，末态 STEADY。
+    if (ctx_omni->sm_sched.enabled && ctx_omni->ctx_llama && ctx_omni->model &&
+            ctx_omni->duplex != nullptr) {
+        SmSched & s = ctx_omni->sm_sched;
+        const int order[4] = {SM_PLAN_ENC_T2W, SM_PLAN_ENC_LLM, SM_PLAN_ENC_TTS, SM_PLAN_STEADY};
+        auto apply_plan_all = [&](int plan) {
+            auto set_one = [&](ggml_backend_t b, int group) {
+                if (b == nullptr) return;
+                ggml_backend_cuda_sm_plan * p = s.presets[plan];
+                if (p != nullptr) ggml_backend_cuda_set_sm_group(b, p, group, plan);
+            };
+            set_one(s.backend[SM_G_LLM], SM_G_LLM);
+            set_one(s.backend[SM_G_TTS], SM_G_TTS);
+            set_one(s.backend[SM_G_APM], SM_G_APM);
+            set_one(s.backend[SM_G_VPM], SM_G_VPM);
+            for (auto b : s.t2w_backends) set_one(b, SM_G_T2W);
+            s.applied_plan = plan;
+        };
+        for (int p : order) {
+            apply_plan_all(p);
+        }
+        print_with_timestamp("[WARM] SM EC prebuilt for 4 plans, applied=STEADY\n");
+    }
+
     // ---- vocoder 预热（session 存在时无条件） ----
     if (ctx_omni->token2wav_session) {
         voc_ok = ctx_omni->token2wav_session->t2w.warmup_vocoder();

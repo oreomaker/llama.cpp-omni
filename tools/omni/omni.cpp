@@ -731,6 +731,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         duplex_prepare(ctx_omni, params);
     }
 #ifdef GGML_USE_CUDA
+    // 段租约 SM 调度器装配（presets + backends）。OMNI_SM_SMS 未设时 no-op。
+    // 在 duplex_prepare 之后（backends 已就绪）、prewarm 之前。
+    sm_sched_init(ctx_omni);
     // 预热：代表输入 graph 预热 + vocoder 预热（纯 init，无条件跑）。
     omni_prewarm(ctx_omni);
 #endif
@@ -988,6 +991,8 @@ void omni_free(struct omni_context * ctx_omni) {
             delete ctx_omni->omni_output;
         }
     }
+
+    sm_sched_free(ctx_omni->sm_sched);
 
     // NOTE: do NOT call llama_backend_free() here — the backend/model is shared
     // and owned by the server; freeing it would break the still-running process.

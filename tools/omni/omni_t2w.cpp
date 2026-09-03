@@ -627,6 +627,14 @@ static void t2w_thread_func_python(struct omni_context * ctx_omni, common_params
 // - 轮次同步流程：Python 调用 stream_decode(round_idx) 同步 simplex_round_idx；
 //   T2W 线程检测到变化后更新 tts_wav_output_dir。
 // ==============================================================================
+// T2W 段边界回调：每 token2mel step 后让出 T2W 租约（非末组；vocoder 是最后一段不在此让出）。
+// GPU 已在 token2mel step 同步点调用回调（见 feed_window_with_callback 的 step 同步语义）。
+static void sm_t2w_segment_cb(int segment_id, int segment_count, void * user_data) {
+    if (segment_id + 1 >= segment_count) return;
+    auto & s = *(SmSched *) user_data;
+    sm_segment_boundary(s, SM_BIT_T2W);
+}
+
 static void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) {
     print_with_timestamp("T2W thread (C++) started\n");
     fflush(stdout);
@@ -829,7 +837,16 @@ static void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *p
             auto t2w_start = std::chrono::high_resolution_clock::now();
 
             std::vector<float> chunk_wav;
-            bool _t2w_fed = ctx_omni->token2wav_session->feed_window(window, is_last_window, chunk_wav);
+            SmSched & sm = ctx_omni->sm_sched;
+            sm_enter(sm, SM_BIT_T2W);   // T2W 段租约
+            const int t2w_selected = sm.applied_plan;
+            bool _t2w_fed = ctx_omni->token2wav_session->feed_window_with_callback(
+                window.data(), (int64_t) window.size(), is_last_window, chunk_wav,
+                sm.enabled ? sm_t2w_segment_cb : nullptr,
+                sm.enabled ? static_cast<void *>(&sm) : nullptr);
+            sm_exit(sm, SM_BIT_T2W);           // T2W 段结束，注销租约
+            sm_task_finish(sm, t2w_selected, SM_BIT_T2W, "t2w",
+                           received_frame_id);
             if (_t2w_fed) {
                 auto t2w_end = std::chrono::high_resolution_clock::now();
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
@@ -994,4 +1011,3 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
         t2w_thread_func_cpp(ctx_omni, params);
     }
 }
-

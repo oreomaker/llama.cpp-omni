@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "tts-condition-graph.h"
+#include "sm_sched.h"
 
 #include <thread>
 #include <memory>
@@ -43,6 +44,7 @@ struct DuplexPipeline;
 // 让外部只需要 push_frame / wait_next_frame，无需关心 stream_prefill/stream_decode
 // 的 index 语义和并发约束。
 struct DuplexSession;
+
 
 // 特殊 token 的 embedding 查表（fused prefill 用）。
 // 在 duplex 路径启动后懒加载；加载失败时 initialized=false，
@@ -275,6 +277,10 @@ struct omni_context {
     // 特殊 token embedding 查表（fused prefill 用；纯 LLM 域数据）。
     // duplex_prepare 在 omni_init 时填充；simplex 路径不使用。
     DuplexTokenEmbCache emb_cache;
+
+    // 段租约 SM 调度器。全部调度状态（锁/CV/位图/plan/epoch/ticket/backends/presets）
+    // 集中在此；OMNI_SM_SMS 未设时 enabled=false，sm_enter/sm_exit 全部 no-op。
+    SmSched sm_sched;
 
     // T2W 线程记录每个音频窗口完成的绝对 wall 时间（epoch ms）。
     // 由 T2W 线程在每次 wav 落盘时追加（供 TTFA：帧结果到达后第一个 wav）。

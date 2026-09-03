@@ -9,6 +9,8 @@
 #include "common/common.h"
 #include "common/sampling.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 
@@ -99,6 +101,13 @@ void duplex_stop_threads(omni_context * ctx_omni) {
 //   （两个独立 backend 实例会各自维护 command queue）。
 // 探针：打印 VPM / APM / pack 的分项耗时，便于对比。
 // ---------------------------------------------------------------------------
+// VPM 段边界回调：每 4-block 组后让出 VPM 租约（非末组），让等着的 peer 可切入。
+// GPU 已在 vision 层同步过（回调在分段计算之后、下段计算之前触发）。
+static void sm_vpm_segment_cb(int segment_id, int segment_count, void * user_data) {
+    if (segment_id + 1 >= segment_count) return;
+    sm_segment_boundary(*static_cast<SmSched *>(user_data), SM_BIT_VPM);
+}
+
 static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * params) {
     print_with_timestamp("Duplex: encoder_thread started (Stage 2: VPM || APM)\n");
     DuplexPipeline * dup = ctx_omni->duplex;
@@ -123,6 +132,14 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         const bool has_img = !frame->input.img_fname.empty() && ctx_omni->ctx_vision != nullptr;
         const bool has_aud = !frame->input.aud_fname.empty();
 
+        // ---- SM 段租约：VPM/APM 原子准入，两个物理 backend 独立释放 ----
+        const uint32_t enc_bits = (has_img ? SM_BIT_VPM : 0u) | (has_aud ? SM_BIT_APM : 0u);
+        int enc_selected = SM_PLAN_GLOBAL;
+        if (enc_bits != 0) {
+            sm_enter(ctx_omni->sm_sched, enc_bits);
+            enc_selected = ctx_omni->sm_sched.applied_plan;   // 首次 enter 时的 applied = selected
+        }
+
         auto t_enc_begin = std::chrono::high_resolution_clock::now();
 
         // vision_set_max_slice_nums 只改 ctx_vision 的一个配置字段，不影响 ctx_audio，
@@ -136,16 +153,20 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         auto vpm_task = [&]() -> double {
             if (!has_img) return 0.0;
             auto t0 = std::chrono::high_resolution_clock::now();
+            const bool sm_enabled = ctx_omni->sm_sched.enabled;
             if (!omni_image_embed_make_chunks_with_filename(
                     ctx_omni->ctx_vision,
                     params->cpuparams.n_threads,
                     frame->input.img_fname,
-                    frame->vision_embed)) {
+                    frame->vision_embed,
+                    sm_enabled ? sm_vpm_segment_cb : nullptr,
+                    sm_enabled ? static_cast<void *>(&ctx_omni->sm_sched) : nullptr)) {
                 LOG_ERR("Duplex encoder: vision encode failed for %s\n",
                         frame->input.img_fname.c_str());
                 frame->vision_embed.clear();
             }
             auto t1 = std::chrono::high_resolution_clock::now();
+            sm_exit(ctx_omni->sm_sched, SM_BIT_VPM);
             return std::chrono::duration<double, std::milli>(t1 - t0).count();
         };
 
@@ -165,6 +186,7 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
                         frame->input.aud_fname.c_str());
             }
             auto t1 = std::chrono::high_resolution_clock::now();
+            sm_exit(ctx_omni->sm_sched, SM_BIT_APM);
             return std::chrono::duration<double, std::milli>(t1 - t0).count();
         };
 
@@ -178,6 +200,11 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
             vpm_ms = vpm_task();
         } else if (has_aud) {
             apm_ms = apm_task();
+        }
+
+        if (enc_bits != 0) {
+            sm_task_finish(ctx_omni->sm_sched, enc_selected, enc_bits, "enc",
+                           (uint64_t) frame->index);
         }
 
         auto t_enc_end = std::chrono::high_resolution_clock::now();
@@ -465,6 +492,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     auto t_dec_begin = ctx_omni->stream_decode_start_time;
     int  n_past_dec_0 = ctx_omni->n_past;
 
+
     print_with_timestamp("[DUPLEX CONTRACT] frame=%d stage=D ctx_owner=llm_thread n_past_before=%d n_keep=%d n_ctx=%d prefill_complete=1\n",
                          round_idx, ctx_omni->n_past, ctx_omni->n_keep, params->n_ctx);
 
@@ -525,6 +553,24 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     std::string response;
     bool discard_turn = false;
+
+    // ---- SM 段租约：LLM decode 段（含 chunk 收尾的 </unit>/<|chunk_eos|> 写入）。
+    // 细粒度段边界：每 llm_group 个普通 token 让出一次（默认 1），让等着的 peer 可切入；
+    // OMNI_SM_LLM_SEG_GROUP=0 时不切段（整段一个租约）。
+    int llm_group = 1;
+    const char * llm_seg_env = getenv("OMNI_SM_LLM_SEG_GROUP");
+    if (llm_seg_env != nullptr) llm_group = atoi(llm_seg_env);
+    if (!ctx_omni->sm_sched.enabled || llm_group <= 0) llm_group = 0;
+    const bool llm_segments = llm_group > 0;
+    const int llm_segment_count_hint = llm_segments
+        ? (max_tgt_len + llm_group - 1) / llm_group : 0;
+    int llm_segment_id = 0, llm_segment_tokens = 0;
+    int decode_selected = SM_PLAN_GLOBAL;
+    if (llm_segments) {
+        sm_enter(ctx_omni->sm_sched, SM_BIT_LLM);
+        decode_selected = ctx_omni->sm_sched.applied_plan;
+    }
+
     for (int il = 0; il < max_tgt_len; ) {
         if (ctx_omni->break_event.load()) {
             llm_finish = true;
@@ -620,6 +666,18 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             }
 
             response += std::string(tmp);
+
+            // SM 段边界：每 llm_group 个普通 token 在同步点等待下一段。
+            // EOS/控制 token 已在上方处理（llm_finish 后不再让出），确保 KV 写入原子。
+            ++llm_segment_tokens;
+            if (llm_segments && llm_segment_tokens >= llm_group &&
+                    llm_segment_id + 1 < llm_segment_count_hint &&
+                    !ctx_omni->break_event.load() && !chunk_limit_reached && !llm_finish) {
+                llama_synchronize(ctx_omni->ctx_llama);
+                sm_segment_boundary(ctx_omni->sm_sched, SM_BIT_LLM);
+                ++llm_segment_id;
+                llm_segment_tokens = 0;
+            }
         }
 
         if (ctx_omni->break_event.load()) {
@@ -711,6 +769,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
         ++llm_chunk_idx;
 
         if (llm_finish) break;
+    }
+
+    if (llm_segments) {
+        sm_exit(ctx_omni->sm_sched, SM_BIT_LLM);           // decode 段结束，注销租约
+        sm_task_finish(ctx_omni->sm_sched, decode_selected, SM_BIT_LLM, "decode",
+                       (uint64_t) std::max(0, round_idx));
     }
 
     // ---- 推送轮次结束标记 ----
@@ -834,9 +898,14 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         bool prefill_ok = false;
         if (frame->cancel_generation == dup->cancel_generation.load()) {
             if (frame->encode_ok) {
+                sm_enter(ctx_omni->sm_sched, SM_BIT_LLM);   // LLM prefill 段租约
+                const int prefill_selected = ctx_omni->sm_sched.applied_plan;
                 if (!duplex_do_prefill_one_fused(ctx_omni, params, frame, hidden_size)) {
                     duplex_do_prefill_one(ctx_omni, params, frame, hidden_size);
                 }
+                sm_exit(ctx_omni->sm_sched, SM_BIT_LLM);           // prefill 段结束，注销租约
+                sm_task_finish(ctx_omni->sm_sched, prefill_selected, SM_BIT_LLM, "prefill",
+                               (uint64_t) frame->index);
                 prefill_ok = true;
             }
             print_with_timestamp("[DUPLEX CONTRACT] frame=%d stage=P ctx_owner=llm_thread kv_written=%d n_past_after=%d\n",
