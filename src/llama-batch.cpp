@@ -28,7 +28,9 @@ bool llama_batch_allocr::init(
         const llama_memory_i * memory,
         uint32_t n_embd,
         uint32_t n_seq_max,
-        bool output_all) {
+        bool output_all,
+        ggml_tensor * device_embd,
+        ggml_backend_t device_embd_backend) {
     clear();
 
     batch = batch_inp;
@@ -36,6 +38,13 @@ bool llama_batch_allocr::init(
     this->vocab = &vocab;
 
     GGML_ASSERT(batch.n_tokens > 0);
+
+    if (device_embd != nullptr) {
+        if (batch.n_tokens != 1 || batch.embd != nullptr || device_embd_backend == nullptr) {
+            LLAMA_LOG_ERROR("%s: device embedding input requires one token, no host embedding, and a source backend\n", __func__);
+            return false;
+        }
+    }
 
     //
     // validate input batch
@@ -151,6 +160,8 @@ bool llama_batch_allocr::init(
 
     this->n_embd    = n_embd;
     this->n_seq_max = n_seq_max;
+    this->device_embd = device_embd;
+    this->device_embd_backend = device_embd_backend;
 
     // count the outputs in this batch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -218,6 +229,8 @@ bool llama_batch_allocr::init(
             /*.n_pos        =*/ n_pos_per_embd,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
+            /*.device_embd  =*/ device_embd,
+            /*.device_embd_backend =*/ device_embd_backend,
             /*.pos          =*/ batch.pos,
             /*.n_seq_id     =*/ batch.n_seq_id,
             /*.seq_id       =*/ batch.seq_id,
@@ -422,6 +435,8 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
+        /*.device_embd  =*/ nullptr,
+        /*.device_embd_backend =*/ nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -654,6 +669,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+    device_embd = nullptr;
+    device_embd_backend = nullptr;
 
     batch = {};
 
@@ -757,6 +774,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
         /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.device_embd  =*/ this->device_embd,
+        /*.device_embd_backend =*/ this->device_embd_backend,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

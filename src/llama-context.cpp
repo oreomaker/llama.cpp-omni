@@ -240,8 +240,13 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
+        // 协调式 SM 计划注入：params.cuda_sm_group >= 0 时把组索引经 params 传给 CUDA backend
+        std::string sm_params;
+        if (params.cuda_sm_group >= 0) {
+            sm_params = "sm_plan_group=" + std::to_string(params.cuda_sm_group);
+        }
         for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, sm_params.empty() ? nullptr : sm_params.c_str());
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
@@ -389,6 +394,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (device_view_ctx) {
+        ggml_free(device_view_ctx);
+        device_view_ctx = nullptr;
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -689,6 +698,18 @@ const llama_model & llama_context::get_model() const {
     return model;
 }
 
+ggml_backend_t llama_context::get_gpu_backend() const {
+    for (ggml_backend_t b : backend_ptrs) {
+        if (b == nullptr) {
+            continue;
+        }
+        if (ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
 const llama_cparams & llama_context::get_cparams() const {
     return cparams;
 }
@@ -871,6 +892,41 @@ float * llama_context::get_embeddings_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+ggml_tensor * llama_context::get_embeddings_ith_device(int32_t i) {
+    synchronize();
+
+    if (last_embd_tensor == nullptr || last_embd_tensor->ne[1] <= 0) {
+        return nullptr;
+    }
+
+    int64_t row = i;
+    if (row < 0) {
+        row += last_embd_tensor->ne[1];
+    }
+    if (row < 0 || row >= last_embd_tensor->ne[1]) {
+        return nullptr;
+    }
+
+    // Views only carry metadata and borrow the graph output buffer. Recreate
+    // the tiny metadata context per request so repeated calls do not grow it.
+    if (device_view_ctx) {
+        ggml_free(device_view_ctx);
+        device_view_ctx = nullptr;
+    }
+    device_view_ctx = ggml_init({
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    });
+    if (!device_view_ctx) {
+        return nullptr;
+    }
+    return ggml_view_2d(device_view_ctx, last_embd_tensor,
+                        last_embd_tensor->ne[0], 1,
+                        last_embd_tensor->nb[1],
+                        (size_t) row * last_embd_tensor->nb[1]);
 }
 
 float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
@@ -1312,7 +1368,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
-
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -1672,7 +1727,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all,
+                      pending_device_embd, get_gpu_backend())) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1817,6 +1873,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        last_embd_tensor = res->get_embd();
+
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
@@ -1846,7 +1904,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        // Device-embedding decodes consume the graph output directly on the
+        // GPU. Do not enqueue the regular host embedding copy for these
+        // single-token steps; llama_get_embeddings_ith_device() uses
+        // last_embd_tensor instead.
+        if (embd.data && t_embd && n_outputs > 0 && pending_device_embd == nullptr) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1995,6 +2057,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     return 0;
+}
+
+int llama_context::decode_device_embd(ggml_tensor * device_embd, llama_pos pos) {
+    if (device_embd == nullptr || device_embd->ne[1] != 1 || device_embd->type != GGML_TYPE_F32) {
+        LLAMA_LOG_ERROR("%s: expected an F32 device tensor with shape [n_embd, 1]\n", __func__);
+        return -1;
+    }
+
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: context has no KV memory\n", __func__);
+        return -1;
+    }
+    ggml_backend_t backend = get_gpu_backend();
+    ggml_backend_buffer_t source_buffer = device_embd->view_src ? device_embd->view_src->buffer : device_embd->buffer;
+    if (backend == nullptr || source_buffer == nullptr || ggml_backend_buffer_is_host(source_buffer)) {
+        LLAMA_LOG_ERROR("%s: device embedding requires a GPU source tensor and backend\n", __func__);
+        return -1;
+    }
+
+    llama_token token = 0; // selector token; graph input chooses device_embd.
+    int8_t logits = 1;
+    llama_batch batch = {};
+    batch.n_tokens = 1;
+    batch.token = &token;
+    batch.pos = &pos;
+    batch.logits = &logits;
+
+    pending_device_embd = device_embd;
+    const int ret = decode(batch);
+    pending_device_embd = nullptr;
+    return ret;
 }
 
 //
@@ -3352,6 +3445,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.cuda_sm_group               =*/ -1,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -3497,6 +3591,14 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
 
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
+}
+
+ggml_backend_t llama_get_gpu_backend(const llama_context * ctx) {
+    return ctx->get_gpu_backend();
+}
+
+ggml_tensor * llama_get_embeddings_ith_device(llama_context * ctx, int32_t i) {
+    return ctx ? ctx->get_embeddings_ith_device(i) : nullptr;
 }
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
@@ -3930,6 +4032,20 @@ int32_t llama_decode(
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
+    return ret;
+}
+
+int32_t llama_decode_device_embd(
+        llama_context * ctx,
+        ggml_tensor   * device_embd,
+        llama_pos       pos) {
+    if (ctx == nullptr) {
+        return -1;
+    }
+    const int ret = ctx->decode_device_embd(device_embd, pos);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode device embedding, ret = %d\n", __func__, ret);
+    }
     return ret;
 }
 

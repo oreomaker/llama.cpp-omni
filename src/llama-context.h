@@ -19,6 +19,13 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+// 内部 omni TTS 入口。不进公共 llama SDK 头文件。
+extern "C" {
+int32_t llama_decode_device_embd(struct llama_context * ctx, struct ggml_tensor * device_embd,
+                                 llama_pos pos);
+struct ggml_tensor * llama_get_embeddings_ith_device(struct llama_context * ctx, int32_t i);
+}
+
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
@@ -61,6 +68,10 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
 
+    // 返回本 context 的首个 GPU 计算 backend（无则 nullptr）。用于运行时切换 green context
+    // 的 SM 分组。只读，不改变调度。
+    ggml_backend_t get_gpu_backend() const;
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_batch()   const;
@@ -82,6 +93,7 @@ struct llama_context {
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
+    ggml_tensor * get_embeddings_ith_device(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
     float * get_embeddings_pre_norm();
@@ -137,6 +149,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_device_embd(ggml_tensor * device_embd, llama_pos pos);
 
     //
     // state save/load
@@ -349,6 +362,13 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Last decoder embedding output, retained as a non-owning graph tensor so
+    // internal consumers can launch a device-side projection without copying
+    // the row through host memory.
+    ggml_tensor * last_embd_tensor = nullptr;
+    ggml_context * device_view_ctx = nullptr;
+    ggml_tensor * pending_device_embd = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

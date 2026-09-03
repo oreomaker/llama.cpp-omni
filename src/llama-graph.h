@@ -119,6 +119,10 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    // The graph's select node is fixed at build time. Keep device embedding
+    // decodes from reusing a graph built for token input (or vice versa).
+    bool use_device_embd = false;
+
     const int64_t n_embd = 0;
 };
 

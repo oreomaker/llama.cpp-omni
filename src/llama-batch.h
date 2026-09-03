@@ -44,6 +44,10 @@ struct llama_ubatch {
     //                          // size               | idx | val
     llama_token  *  token;      // [n_tokens]         | i   | id, token
     float        *  embd;       // [n_embd, n_tokens] | i   | embd
+    // Optional non-owning device embedding source for a single-token decode.
+    // The regular public llama_batch ABI remains host-only.
+    ggml_tensor  *  device_embd;
+    ggml_backend_t  device_embd_backend;
     llama_pos    *  pos;        // [n_tokens*n_pos]   | i   | pos
     int32_t      *  n_seq_id;   // [n_tokens]         | i   | -
     llama_seq_id ** seq_id;     // [n_tokens]         | s   | s0, s1, seq_id
@@ -81,7 +85,9 @@ public:
             const llama_memory_i * memory,
             uint32_t n_embd,
             uint32_t n_seq_max,
-            bool output_all);
+            bool output_all,
+            ggml_tensor * device_embd = nullptr,
+            ggml_backend_t device_embd_backend = nullptr);
 
     const llama_batch & get_batch() const;
 
@@ -170,4 +176,7 @@ private:
     std::vector<bool> used;
 
     int debug;
+
+    ggml_tensor * device_embd = nullptr;
+    ggml_backend_t device_embd_backend = nullptr;
 };

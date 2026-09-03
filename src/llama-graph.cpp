@@ -82,24 +82,35 @@ static ggml_tensor * ggml_mul_mat_aux(
 }
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
     if (ubatch->token) {
-        const int64_t n_tokens = ubatch->n_tokens;
-
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
-        const int64_t n_tokens = ubatch->n_tokens;
-
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
+    }
+
+    if (ubatch->device_embd) {
+        GGML_ASSERT(n_tokens == 1);
+        GGML_ASSERT(n_embd == ubatch->device_embd->ne[0]);
+        GGML_ASSERT(ubatch->device_embd->ne[1] == 1);
+        GGML_ASSERT(ubatch->device_embd_backend != nullptr);
+        // The replacement TTS path supplies a non-owning tensor produced by a
+        // preceding CUDA graph. Keep the copy on the backend stream so the
+        // caller can reuse its temporary lookup tensor after decode returns.
+        ggml_backend_tensor_copy_async(ubatch->device_embd_backend,
+                                       ubatch->device_embd_backend,
+                                       ubatch->device_embd, embd);
     }
 }
 
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
+    res &= use_device_embd == (params.ubatch.device_embd != nullptr);
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
 
@@ -1797,6 +1808,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(n_embd_inp >= n_embd);
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    inp->use_device_embd = ubatch.device_embd != nullptr;
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
@@ -1850,7 +1862,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(ggml_are_same_shape (inps[0], inps[1]));
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
+    const int input_index = ubatch.device_embd ? 1 : (ubatch.token ? 0 : 1);
+    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), input_index);
 
     if (n_embd_inp != n_embd) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);

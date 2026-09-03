@@ -359,6 +359,10 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        // CUDA green-context SM 计划组索引：-1 = 不进计划（默认）；>=0 = 本 context 的
+        // GPU backend 使用 ggml_backend_cuda_init_sm 建立的协调式 SM 分组（disjoint 分组）。
+        int32_t cuda_sm_group;
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
@@ -550,6 +554,10 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+
+    // 返回本 context 的首个 GPU 计算 backend（无 GPU backend 时返回 NULL）。用于运行时切换
+    // green context 的 SM 分组。只读，不改调度状态。
+    LLAMA_API ggml_backend_t llama_get_gpu_backend(const struct llama_context * ctx);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
