@@ -45,6 +45,10 @@ struct DuplexPipeline;
 // 的 index 语义和并发约束。
 struct DuplexSession;
 
+// Replacement TTS/T2W runtime. 定义在 tts_t2w_replacement.cpp；用 shared_ptr 持有
+// 不完整类型，避免公共头文件依赖其定义。
+struct OmniTtsT2wReplacement;
+
 
 // 特殊 token 的 embedding 查表（fused prefill 用）。
 // 在 duplex 路径启动后懒加载；加载失败时 initialized=false，
@@ -261,6 +265,8 @@ struct omni_context {
     struct LLMThreadInfo *llm_thread_info = NULL;
     struct TTSThreadInfo *tts_thread_info = NULL;
     struct T2WThreadInfo *t2w_thread_info = NULL;
+
+    std::shared_ptr<OmniTtsT2wReplacement> tts_t2w_replacement;
 
     // 仅在 duplex_mode=true && async=true 时分配。
     // 取代 duplex 路径下的老 llm_thread_func：把"VPM+APM 编码"和
@@ -642,7 +648,9 @@ bool generate_audio_tokens_local(struct omni_context * ctx_omni, common_params *
                                  int tts_n_embd, int chunk_idx, std::vector<int32_t>& output_audio_tokens,
                                  bool is_end_of_turn = false, const std::string& output_dir = "",
                                  std::chrono::steady_clock::time_point queue_enter = {},
-                                 uint64_t frame_id = 0);
+                                 uint64_t frame_id = 0,
+                                 void (*segment_callback)(int, int, void *) = nullptr,
+                                 void * segment_callback_user_data = nullptr);
 bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, float* embed, int n_pos, int n_batch, int* n_past_tts);
 // sample_tts_token 参数说明：
 // - all_generated_tokens: 跨 chunk 累积的所有 tokens（用于判断是否是整个过程的第一个 token，即 re-forward condition）

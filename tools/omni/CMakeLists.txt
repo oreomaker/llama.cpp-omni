@@ -2,6 +2,8 @@
 
 find_package(Threads REQUIRED)
 
+option(OMNI_REPLACEMENT_TTS_T2W "Use replacement TTS/T2W workers" OFF)
+
 # CoreML / ANE support option：在 macOS 上默认开，其它平台默认关
 if(APPLE)
     option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" ON)
@@ -11,6 +13,7 @@ endif()
 
 add_library(omni
             omni.cpp
+            tts_t2w_replacement.cpp
             omni_prewarm.cpp
             omni_prewarm.h
             compute_llm.cpp
@@ -62,6 +65,10 @@ target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
 target_compile_features   (omni PRIVATE cxx_std_17)
+
+if(OMNI_REPLACEMENT_TTS_T2W)
+    target_compile_definitions(omni PRIVATE OMNI_REPLACEMENT_TTS_T2W=1)
+endif()
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled
 if(ENABLE_COREML)

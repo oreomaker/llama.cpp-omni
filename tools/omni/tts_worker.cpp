@@ -8,6 +8,8 @@
 #include "common/common.h"
 #include "common/sampling.h"
 
+#include <cstdlib>
+
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/stat.h>
@@ -17,6 +19,11 @@
 // ==========================================================================
 // TTS generation and worker implementation
 // ==========================================================================
+
+static void sm_tts_segment_cb(int segment_id, int segment_count, void * user_data) {
+    if (segment_id + 1 >= segment_count || user_data == nullptr) return;
+    sm_segment_boundary(*static_cast<SmSched *>(user_data), SM_BIT_TTS);
+}
 
 
 // Helper function to filter special tokens (matching Python file_loader.py logic)
@@ -350,6 +357,7 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
     const std::string tts_output_dir = base_output_dir + "/tts_txt";
     const std::string llm_debug_output_dir = base_output_dir + "/llm_debug";
     const std::string tts_wav_output_dir = base_output_dir + "/tts_wav";
+    const bool write_debug = !OMNI_REPLACEMENT_TTS_T2W || std::getenv("OMNI_TTS_DIAGNOSTICS") != nullptr;
     
     // Helper function to create directory
     auto create_dir = [](const std::string& dir_path) {
@@ -738,7 +746,8 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             
             // 保存 LLM debug 数据（追加模式，统一放在 llm_debug 目录）
             // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
-            {
+            const bool write_debug = !OMNI_REPLACEMENT_TTS_T2W || std::getenv("OMNI_TTS_DIAGNOSTICS") != nullptr;
+            if (write_debug) {
                 // 1. Save LLM text output (追加模式，只记录纯文本，不记录 special tokens)
                 {
                     // 从 llm_text 中过滤掉 special tokens
@@ -834,10 +843,18 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                     n_tokens_filtered = 0;
                 }
                 
+                int tts_selected = SM_PLAN_GLOBAL;
+                sm_enter(ctx_omni->sm_sched, SM_BIT_TTS);
+                tts_selected = ctx_omni->sm_sched.applied_plan;
                 bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, merged_embeddings,
                                                 n_tokens_filtered, tts_n_embd, current_chunk_idx,
-                                                audio_tokens_out, is_end_of_turn, tts_wav_output_dir,
-                                                current_chunk_queue_enter, current_frame_id);
+                                                audio_tokens_out, is_end_of_turn,
+                                                write_debug ? tts_wav_output_dir : std::string(),
+                                                current_chunk_queue_enter, current_frame_id,
+                                                ctx_omni->sm_sched.enabled ? sm_tts_segment_cb : nullptr,
+                                                ctx_omni->sm_sched.enabled ? static_cast<void *>(&ctx_omni->sm_sched) : nullptr);
+                sm_exit(ctx_omni->sm_sched, SM_BIT_TTS);
+                sm_task_finish(ctx_omni->sm_sched, tts_selected, SM_BIT_TTS, "tts", current_frame_id);
                 
                 if (tts_gen_success) {
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
@@ -859,7 +876,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 ctx_omni->warmup_done = true;
                 speek_cv.notify_all();
                 
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+                if (write_debug) {
+                    merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+                }
                 
                 if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
                     // LISTEN/CHUNK_EOS: 保持 TTS 状态
@@ -921,10 +940,18 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 int n_tokens_for_tts = 0;
                 int current_chunk_idx = chunk_idx;
                 
+                int tts_selected = SM_PLAN_GLOBAL;
+                sm_enter(ctx_omni->sm_sched, SM_BIT_TTS);
+                tts_selected = ctx_omni->sm_sched.applied_plan;
                 bool tts_gen_success = generate_audio_tokens_local(ctx_omni, params, empty_embeddings,
                                                 n_tokens_for_tts, tts_n_embd, current_chunk_idx,
-                                                audio_tokens_out, true, tts_wav_output_dir,
-                                                current_chunk_queue_enter, current_frame_id);
+                                                audio_tokens_out, true,
+                                                write_debug ? tts_wav_output_dir : std::string(),
+                                                current_chunk_queue_enter, current_frame_id,
+                                                ctx_omni->sm_sched.enabled ? sm_tts_segment_cb : nullptr,
+                                                ctx_omni->sm_sched.enabled ? static_cast<void *>(&ctx_omni->sm_sched) : nullptr);
+                sm_exit(ctx_omni->sm_sched, SM_BIT_TTS);
+                sm_task_finish(ctx_omni->sm_sched, tts_selected, SM_BIT_TTS, "tts", current_frame_id);
                 
                 if (tts_gen_success) {
                     all_audio_tokens.insert(all_audio_tokens.end(), audio_tokens_out.begin(), audio_tokens_out.end());
@@ -948,7 +975,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             }
             
             // 重置 TTS 状态
-            merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+            if (write_debug) {
+                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+            }
             llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
             if (mem) {
                 llama_memory_seq_rm(mem, 0, 0, -1);
@@ -1030,6 +1059,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
     std::string tts_output_dir = current_round_dir + "/tts_txt";
     std::string llm_debug_output_dir = current_round_dir + "/llm_debug";
     std::string tts_wav_output_dir = current_round_dir + "/tts_wav";
+    const bool write_debug = !OMNI_REPLACEMENT_TTS_T2W || std::getenv("OMNI_TTS_DIAGNOSTICS") != nullptr;
     
     // 记录上一次创建目录的 round_idx，避免重复创建
     int last_created_round_idx = -1;
@@ -1077,7 +1107,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             fclose(f_timing);
         }
     };
-    create_wav_timing_file();
+    if (write_debug) {
+        create_wav_timing_file();
+    }
 
     print_with_timestamp("TTS thread started\n");
 
@@ -1379,7 +1411,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             // 确保每轮数据保存在独立的 round_XXX 子目录下
             if (chunk_idx == 0 && !ctx_omni->duplex_mode) {
                 update_output_dirs();
-                create_wav_timing_file();
+                if (write_debug) {
+                    create_wav_timing_file();
+                }
             }
             
             // Save current chunk_idx to ensure consistent directory naming
@@ -1476,7 +1510,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             }
             
             // Save LLM debug data: text, token_ids, hidden_states, and merged embeddings
-            {
+            if (write_debug) {
                 // Create chunk-specific directory
                 std::string chunk_dir = llm_debug_output_dir + "/chunk_" + std::to_string(current_chunk_idx);
                 create_dir(chunk_dir);
@@ -1580,22 +1614,24 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 // 传递 is_final_text_chunk，用于 flush buffer（与 Python 对齐）
                 tts_gen_success = generate_audio_tokens_local_simplex(ctx_omni, params, merged_embeddings,
                                                 n_tokens_filtered, tts_n_embd, current_chunk_idx,
-                                                audio_tokens, tts_wav_output_dir, is_final_text_chunk);
+                                                audio_tokens, write_debug ? tts_wav_output_dir : std::string(), is_final_text_chunk);
                 if (tts_gen_success) {
                     tts_success = true;
                     
                     // Save audio tokens for external token2wav processing (backup)
                     // token2wav expects relative token IDs (0-6561)
-                    std::string tokens_txt_file = tts_wav_output_dir + "/audio_tokens_chunk_" + 
-                                                  std::to_string(current_chunk_idx) + ".txt";
-                    FILE* f_tokens = fopen(tokens_txt_file.c_str(), "w");
-                    if (f_tokens) {
-                        for (size_t i = 0; i < audio_tokens.size(); ++i) {
-                            fprintf(f_tokens, "%d", audio_tokens[i]);
-                            if (i < audio_tokens.size() - 1) fprintf(f_tokens, ",");
+                    if (write_debug) {
+                        std::string tokens_txt_file = tts_wav_output_dir + "/audio_tokens_chunk_" +
+                                                      std::to_string(current_chunk_idx) + ".txt";
+                        FILE* f_tokens = fopen(tokens_txt_file.c_str(), "w");
+                        if (f_tokens) {
+                            for (size_t i = 0; i < audio_tokens.size(); ++i) {
+                                fprintf(f_tokens, "%d", audio_tokens[i]);
+                                if (i < audio_tokens.size() - 1) fprintf(f_tokens, ",");
+                            }
+                            fprintf(f_tokens, "\n");
+                            fclose(f_tokens);
                         }
-                        fprintf(f_tokens, "\n");
-                        fclose(f_tokens);
                     }
                     
                     // Accumulate all audio tokens for final WAV generation
@@ -1654,7 +1690,9 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 print_with_timestamp("TTS: finished processing all chunks\n");
                 
                 // Merge all WAV files into a single file
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+                if (write_debug) {
+                    merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+                }
                 // Python: end_of_turn = last_id in turn_terminator_token_ids
                 
                 // 保存当前 round_idx 用于 T2W（递增前的值）
@@ -1785,7 +1823,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                     }
                     
                     // Save LLM debug data: text, hidden states, and merged embeddings
-                    {
+                    if (write_debug) {
                         // Create chunk-specific directory
                         std::string chunk_dir = llm_debug_output_dir + "/chunk_" + std::to_string(chunk_idx);
                         create_dir(chunk_dir);
@@ -2131,7 +2169,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         
         // Save audio tokens to file for debugging/analysis
         // Note: Save relative indices (0-6561) for token2wav compatibility
-        if (!audio_tokens.empty()) {
+        if (write_debug && !audio_tokens.empty()) {
             // Always save to fixed output directory
             const int audio_bos_token_id = 151687;
             std::string token_file = tts_output_dir + "/tts_audio_tokens_chunk_" + std::to_string(chunk_idx) + ".txt";
@@ -2226,7 +2264,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         // If only audio_gen_finish is true but llm_finish is false, continue to next chunk
         if (llm_finish && (tts_finish || audio_gen_finish)) {
             // Save all collected audio tokens to a summary file
-            if (!all_audio_tokens.empty()) {
+            if (write_debug && !all_audio_tokens.empty()) {
                 // Always save to fixed output directory
                 // Note: Save relative indices (0-6561) for token2wav compatibility
                 const int audio_bos_token_id = 151687;

@@ -420,8 +420,12 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Fallback to tools/omni/token2wav-gguf if not found
         ctx_omni->token2wav_initialized = false;
         
-        // 使用 Python Token2Wav 时跳过 C++ 初始化以节省显存
+        // Replacement mode always uses the in-process C++ CUDA session.
         bool skip_cpp_token2wav = ctx_omni->use_python_token2wav;
+#if OMNI_REPLACEMENT_TTS_T2W
+        ctx_omni->use_python_token2wav = false;
+        skip_cpp_token2wav = false;
+#endif
         
         // Check if token2wav model files exist
         // 优先检查 HF 模型目录下的 token2wav-gguf (tts_bin_dir 的父目录)
@@ -549,7 +553,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_bundle_dir,
                         vocoder_gguf, device_token2mel, device_vocoder, n_ts, 1.0f);
             }
-            // Fallback to CPU
+            // The replacement path must not silently fall back to a CPU
+            // Token2Wav session. The legacy build retains its old fallback.
+#if !OMNI_REPLACEMENT_TTS_T2W
             if (!init_ok) {
                 print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
                 ctx_omni->token2wav_session.reset();
@@ -558,6 +564,11 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                         encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
                         vocoder_gguf, "cpu", "cpu", n_ts, 1.0f);
             }
+#else
+            if (!init_ok) {
+                print_with_timestamp("Token2Wav replacement: CUDA initialization failed; CPU fallback is disabled\n");
+            }
+#endif
             
             if (init_ok) {
                 ctx_omni->token2wav_initialized = true;
@@ -607,7 +618,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                              ctx_omni->python_t2w_script_dir.c_str(),
                              ctx_omni->python_t2w_model_dir.c_str());
         
-        if (ctx_omni->use_python_token2wav) {
+        if (ctx_omni->use_python_token2wav && !OMNI_REPLACEMENT_TTS_T2W) {
             print_with_timestamp("Python T2W: 使用 Python Token2Wav 实现\n");
             
             // Python T2W GPU 配置：C++ LLM+TTS 约 22GB、Python T2W 约 3.3GB，
@@ -671,6 +682,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             print_with_timestamp("Token2Wav: 使用 C++ 实现\n");
         }
     }
+#if OMNI_REPLACEMENT_TTS_T2W
+    if (ctx_omni->use_tts && !omni_tts_t2w_replacement_init(ctx_omni)) {
+        LOG_ERR("omni_init: TTS/T2W replacement initialization failed\n");
+        omni_free(ctx_omni);
+        return nullptr;
+    }
+#endif
     ctx_omni->async = true;
     
     // ==================== 初始化特殊 Token ID ====================
@@ -911,6 +929,7 @@ void omni_free(struct omni_context * ctx_omni) {
     audition_free(ctx_omni->ctx_audio);
     
     if (ctx_omni->use_tts) {
+        omni_tts_t2w_replacement_free(ctx_omni);
         llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);

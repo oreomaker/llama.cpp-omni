@@ -8,8 +8,12 @@
 #include "common/common.h"
 #include "common/sampling.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
+
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
 
     auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) {
@@ -1181,7 +1185,20 @@ llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct omni_c
         }
         *n_past_tts = condition_n_past;
     }
-    
+
+#if OMNI_REPLACEMENT_TTS_T2W
+    if (ctx_omni->tts_t2w_replacement) {
+        llama_token replacement_token = 0;
+        if (omni_tts_replacement_sample_token(
+                smpl, ctx_omni, params, n_past_tts,
+                all_generated_tokens, nullptr, token_index_in_chunk,
+                force_no_eos, is_final_text_chunk, &replacement_token)) {
+            return replacement_token;
+        }
+        LOG_WRN("TTS replacement: GPU head/lookup failed in simplex; using legacy CPU path for this token\n");
+    }
+#endif
+
     // 使用 head_code 层计算 audio logits
     const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
     if (hidden_state == nullptr) {
@@ -1354,6 +1371,7 @@ llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct omni_c
 }
 
 llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk) {
+
     // Debug: Save logits directory (set via environment variable)
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
     
@@ -1440,10 +1458,26 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         // Update n_past_tts to match the condition length
         *n_past_tts = condition_n_past;
     }
-    
+
+#if OMNI_REPLACEMENT_TTS_T2W
+    if (ctx_omni->tts_t2w_replacement) {
+        llama_token replacement_token = 0;
+        if (omni_tts_replacement_sample_token(
+                smpl, ctx_omni, params, n_past_tts,
+                all_generated_tokens, chunk_generated_tokens,
+                token_index_in_chunk, force_no_eos, is_final_text_chunk,
+                &replacement_token)) {
+            return replacement_token;
+        }
+        LOG_WRN("TTS replacement: GPU head/lookup failed; using legacy CPU path for this token\n");
+    }
+#endif
+
     // 1. 获取TTS模型的最后一个位置的hidden state
     // hidden_state shape: (hidden_size=768,)
+
     const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
+
     if (hidden_state == nullptr) {
         LOG_ERR("TTS: failed to get hidden state from TTS model\n");
         return 0;
@@ -1640,6 +1674,7 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     if (ctx_omni->duplex_mode && is_eos && !is_final_text_chunk) {
         // 非 final chunk 采样到 EOS，不 prefill，直接返回
         // 这样 TTS 模型的 KV cache 不会包含 EOS，下一个 chunk 可以继续使用
+    
         return id;
     }
     
@@ -1668,20 +1703,24 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
             }
         }
         
+    
         // Use prefill_with_emb_tts to decode with embedding instead of token ID
         if (!prefill_with_emb_tts(ctx_omni, params, audio_token_embedding.data(), 1, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token embedding\n");
             return 0;
         }
+    
     } else {
         // Fallback: use token IDs (may fail if token ID exceeds vocab size)
         LOG_ERR("TTS: emb_code not available, falling back to token IDs (may fail if token exceeds vocab)\n");
         std::vector<llama_token> tokens;
         tokens.push_back(id);
+    
         if (!eval_tokens_tts(ctx_omni, params, tokens, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token ID (token may exceed vocab size)\n");
             return 0;
         }
+    
     }
     
     return id;
@@ -2126,7 +2165,9 @@ bool generate_audio_tokens_local(
     bool is_end_of_turn,  // 是否是轮次结束（默认值见 omni.h 声明）
     const std::string& output_dir,
     std::chrono::steady_clock::time_point queue_enter,
-    uint64_t frame_id
+    uint64_t frame_id,
+    void (*segment_callback)(int, int, void *),
+    void * segment_callback_user_data
 ) {
     print_with_timestamp("TTS Local: generating audio tokens for chunk %d (n_tokens=%d, tts_n_embd=%d, emb_size=%zu)\n",
                          chunk_idx, n_tokens, tts_n_embd, merged_embeddings.size());
@@ -2184,7 +2225,6 @@ bool generate_audio_tokens_local(
                 merged_embeddings.size(), n_tokens, tts_n_embd);
         return false;
     }
-
 
     // 在 prefill 之前动态添加 text_eos_embed（如果是轮次结束）和 audio_bos embedding
     // Python TTSStreamingGenerator.generate_with_buffer 逻辑：
@@ -2303,7 +2343,17 @@ bool generate_audio_tokens_local(
     const int FIRST_CHUNK_SIZE = 28;  // 首批推送阈值，减少首响时间
     bool first_chunk_pushed = false;
     std::vector<int32_t> stream_buffer;
-    
+
+    // Token boundaries are reported after the TTS backend has synchronized.
+    // The worker owns the lease; this callback only reports a safe boundary.
+    int tts_group = 1;
+    const char * tts_seg_env = getenv("OMNI_SM_TTS_SEG_GROUP");
+    if (tts_seg_env != nullptr) tts_group = atoi(tts_seg_env);
+    if (tts_group <= 0) tts_group = 0;
+    const int tts_segment_count_hint = tts_group > 0
+        ? (max_audio_tokens + tts_group - 1) / tts_group : 0;
+    int tts_segment_id = 0, tts_segment_tokens = 0;
+
     for (int t = 0; t < max_audio_tokens; ++t) {
         // 计算 force_no_eos
         // Python generate_chunk: if force_no_stop or t < min_new_tokens: logits[:, eos_token] = -torch.inf
@@ -2398,7 +2448,18 @@ bool generate_audio_tokens_local(
             break;
         }
 
+        // EOS 已在上方 break，不会在末 token 让出。
+        ++tts_segment_tokens;
+        if (segment_callback != nullptr && tts_group > 0 && tts_segment_tokens >= tts_group &&
+                tts_segment_id + 1 < tts_segment_count_hint) {
+            llama_synchronize(ctx_omni->ctx_tts_llama);
+            segment_callback(tts_segment_id, tts_segment_count_hint,
+                             segment_callback_user_data);
+            ++tts_segment_id;
+            tts_segment_tokens = 0;
+        }
     }
+
     // 问题：如果只推送 25 tokens，T2W buffer 从 3->28，处理后剩余 3 个 tokens
     //       这 3 个 tokens 是当前 chunk 的最后 3 个，要等到下一个 chunk 才被处理
     //       导致当前 chunk 的尾音被延迟，听起来"吞字"

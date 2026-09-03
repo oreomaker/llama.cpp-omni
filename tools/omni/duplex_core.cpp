@@ -1260,6 +1260,10 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
 
             if (ctx_omni->use_tts && !ctx_omni->tts_thread.joinable()) {
                 tts_thread_running = true;
+#if OMNI_REPLACEMENT_TTS_T2W
+                ctx_omni->tts_thread = std::thread(omni_tts_replacement_thread_func, ctx_omni, ctx_omni->params);
+                print_with_timestamp("create tts replacement thread success\n");
+#else
                 // 按 duplex_mode 选择 TTS 线程函数
                 if (ctx_omni->duplex_mode) {
                     ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
@@ -1268,13 +1272,19 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
                     print_with_timestamp("create tts thread (simplex mode) success\n");
                 }
+#endif
             }
 
             // Start T2W thread if TTS is enabled and thread is not already running
             if (ctx_omni->use_tts && ctx_omni->t2w_thread_info && !ctx_omni->t2w_thread.joinable()) {
                 t2w_thread_running = true;
+#if OMNI_REPLACEMENT_TTS_T2W
+                ctx_omni->t2w_thread = std::thread(omni_t2w_replacement_thread_func, ctx_omni, ctx_omni->params);
+                print_with_timestamp("create t2w replacement thread success\n");
+#else
                 ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
                 print_with_timestamp("create t2w thread success\n");
+#endif
             }
         }
 
@@ -1473,6 +1483,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 确保线程已启动（若 prefill 是同步模式执行的，线程可能尚未启动）
         if (!ctx_omni->tts_thread.joinable() && ctx_omni->use_tts) {
             tts_thread_running = true;
+#if OMNI_REPLACEMENT_TTS_T2W
+            ctx_omni->tts_thread = std::thread(omni_tts_replacement_thread_func, ctx_omni, ctx_omni->params);
+            print_with_timestamp("stream_decode: create tts replacement thread\n");
+#else
             if (ctx_omni->duplex_mode) {
                 ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (duplex mode)\n");
@@ -1480,11 +1494,17 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (simplex mode)\n");
             }
+#endif
         }
         if (!ctx_omni->t2w_thread.joinable() && ctx_omni->use_tts && ctx_omni->t2w_thread_info) {
             t2w_thread_running = true;
+#if OMNI_REPLACEMENT_TTS_T2W
+            ctx_omni->t2w_thread = std::thread(omni_t2w_replacement_thread_func, ctx_omni, ctx_omni->params);
+            print_with_timestamp("stream_decode: create t2w replacement thread\n");
+#else
             ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
             print_with_timestamp("stream_decode: create t2w thread\n");
+#endif
         }
         
         ctx_omni->need_speek = true;

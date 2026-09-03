@@ -11,6 +11,17 @@
 #include <string>
 #include <vector>
 
+#ifndef OMNI_REPLACEMENT_TTS_T2W
+#define OMNI_REPLACEMENT_TTS_T2W 0
+#endif
+
+// 内部 omni TTS 入口。不进公共 llama SDK 头文件。
+extern "C" {
+int32_t llama_decode_device_embd(struct llama_context * ctx, struct ggml_tensor * device_embd,
+                                 llama_pos pos);
+struct ggml_tensor * llama_get_embeddings_ith_device(struct llama_context * ctx, int32_t i);
+}
+
 // Shared implementation helpers. These are intentionally outside omni.h so
 // they do not become part of the public omni API.
 void print_with_timestamp(const char * format, ...);
@@ -41,6 +52,21 @@ void t2w_thread_func(omni_context * ctx, common_params * params);
 // layer functions below.
 void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params * params);
 void tts_thread_func(struct omni_context * ctx_omni, common_params * params);
+
+// Replacement 运行时。内部实现，随 omni 一起编译；默认构建仍走既有 worker 入口。
+bool omni_tts_t2w_replacement_init(struct omni_context * ctx);
+void omni_tts_t2w_replacement_free(struct omni_context * ctx);
+void omni_tts_replacement_thread_func(struct omni_context * ctx, common_params * params);
+void omni_t2w_replacement_thread_func(struct omni_context * ctx, common_params * params);
+bool omni_tts_replacement_sample_token(struct common_sampler * smpl,
+                                       struct omni_context * ctx,
+                                       common_params * params,
+                                       int * n_past_tts,
+                                       const std::vector<llama_token> * all_generated_tokens,
+                                       const std::vector<llama_token> * chunk_generated_tokens,
+                                       int token_index_in_chunk, bool force_no_eos,
+                                       bool is_final_text_chunk,
+                                       llama_token * out_token);
 
 // Prompt-eval 与单工 LLM 线程。
 //   eval_prefix / eval_prefix_with_hidden：把 "<|im_start|>user\n" 前缀写入 KV。
@@ -214,7 +240,9 @@ bool generate_audio_tokens_local(struct omni_context * ctx_omni, common_params *
                                  std::vector<int32_t> & output_audio_tokens,
                                  bool is_end_of_turn, const std::string & output_dir,
                                  std::chrono::steady_clock::time_point queue_enter,
-                                 uint64_t frame_id);
+                                 uint64_t frame_id,
+                                 void (*segment_callback)(int, int, void *),
+                                 void * segment_callback_user_data);
 bool generate_audio_tokens_local_simplex(struct omni_context * ctx_omni, common_params * params,
                                          const std::vector<float> & merged_embeddings,
                                          int n_tokens, int tts_n_embd, int chunk_idx,
