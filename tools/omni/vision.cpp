@@ -222,6 +222,12 @@ struct vision_ctx {
     bool debug_graph = false;
     std::vector<ggml_tensor *> debug_print_tensors;
 
+    // Positional embeddings depend only on the patch grid and embedding width.
+    std::vector<float> pos_embed_cache;
+    int pos_embed_cache_w = 0;
+    int pos_embed_cache_h = 0;
+    int pos_embed_cache_dim = 0;
+
     vision_ctx(vision_context_params & ctx_params) {
         debug_graph = std::getenv("Omni_DEBUG_GRAPH") != nullptr;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -1721,54 +1727,62 @@ struct image_manipulation {
         dst.ny = target_height;
         dst.buf.resize(3 * target_width * target_height);
 
-        float Cc;
-        float C[5] = {};
-        float d0, d2, d3, a0, a1, a2, a3;
-        int i, j, k, jj;
-        int x, y;
-        float dx, dy;
-        float tx, ty;
+        struct AxisSample {
+            int index[4];
+            float weight[4];
+        };
+        auto make_sample = [](float coordinate, int limit) {
+            AxisSample sample{};
+            const int base = (int) coordinate;
+            const float d = coordinate - base;
+            const float d2 = d * d;
+            const float d3 = d2 * d;
+            sample.index[0] = clip(base - 1, 0, limit - 1);
+            sample.index[1] = clip(base,     0, limit - 1);
+            sample.index[2] = clip(base + 1, 0, limit - 1);
+            sample.index[3] = clip(base + 2, 0, limit - 1);
+            // Expanded form of the original cubic interpolation polynomial.
+            sample.weight[0] = -d / 3.0f + d2 / 2.0f - d3 / 6.0f;
+            sample.weight[1] =  1.0f - d / 2.0f - d2 + d3 / 2.0f;
+            sample.weight[2] =  d + d2 / 2.0f - d3 / 2.0f;
+            sample.weight[3] = -d / 6.0f + d3 / 6.0f;
+            return sample;
+        };
 
-        tx = (float)nx / (float)target_width;
-        ty = (float)ny / (float)target_height;
+        const float tx = (float) nx / (float) target_width;
+        const float ty = (float) ny / (float) target_height;
+        std::vector<AxisSample> x_samples(target_width);
+        std::vector<AxisSample> y_samples(target_height);
+        for (int j = 0; j < target_width; ++j) {
+            x_samples[j] = make_sample(tx * j, nx);
+        }
+        for (int i = 0; i < target_height; ++i) {
+            y_samples[i] = make_sample(ty * i, ny);
+        }
 
         // Bicubic interpolation; adapted from ViT.cpp, inspired from :
         //    -> https://github.com/yglukhov/bicubic-interpolation-image-processing/blob/master/libimage.c#L36
         //    -> https://en.wikipedia.org/wiki/Bicubic_interpolation
 
-        for (i = 0; i < target_height; i++) {
-            for (j = 0; j < target_width; j++) {
-                x = (int)(tx * j);
-                y = (int)(ty * i);
-
-                dx = tx * j - x;
-                dy = ty * i - y;
-
-                for (k = 0; k < 3; k++) {
-                    for (jj = 0; jj <= 3; jj++) {
-                        d0 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x - 1, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-                        d2 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x + 1, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-                        d3 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x + 2, 0, nx - 1)) * 3 + k] - img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-                        a0 = img.buf[(clip(y - 1 + jj, 0, ny - 1) * nx + clip(x, 0, nx - 1)) * 3 + k];
-
-                        a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
-                        a2 =  1.0 / 2 * d0 +      1.0 / 2 * d2;
-                        a3 = -1.0 / 6 * d0 -      1.0 / 2 * d2 + 1.0 / 6 * d3;
-
-                        C[jj] = a0 + a1 * dx + a2 * dx * dx + a3 * dx * dx * dx;
-
-                        d0 = C[0] - C[1];
-                        d2 = C[2] - C[1];
-                        d3 = C[3] - C[1];
-                        a0 = C[1];
-                        a1 = -1.0 / 3 * d0 + d2 - 1.0 / 6 * d3;
-                        a2 =  1.0 / 2 * d0 +      1.0 / 2 * d2;
-                        a3 = -1.0 / 6 * d0 -      1.0 / 2 * d2 + 1.0 / 6 * d3;
-                        Cc = a0 + a1 * dy + a2 * dy * dy + a3 * dy * dy * dy;
-
-                        const uint8_t Cc2 = std::min(std::max(std::round(Cc), 0.0f), 255.0f);
-                        dst.buf[(i * target_width + j) * 3 + k] = float(Cc2);
+        for (int i = 0; i < target_height; ++i) {
+            const AxisSample & ys = y_samples[i];
+            for (int j = 0; j < target_width; ++j) {
+                const AxisSample & xs = x_samples[j];
+                const size_t dst_base = ((size_t) i * target_width + j) * 3;
+                for (int c = 0; c < 3; ++c) {
+                    float rows[4] = {};
+                    for (int r = 0; r < 4; ++r) {
+                        const size_t row_base = (size_t) ys.index[r] * nx * 3;
+                        rows[r] = xs.weight[0] * img.buf[row_base + (size_t) xs.index[0] * 3 + c]
+                                + xs.weight[1] * img.buf[row_base + (size_t) xs.index[1] * 3 + c]
+                                + xs.weight[2] * img.buf[row_base + (size_t) xs.index[2] * 3 + c]
+                                + xs.weight[3] * img.buf[row_base + (size_t) xs.index[3] * 3 + c];
                     }
+                    const float value = ys.weight[0] * rows[0]
+                                      + ys.weight[1] * rows[1]
+                                      + ys.weight[2] * rows[2]
+                                      + ys.weight[3] * rows[3];
+                    dst.buf[dst_base + c] = (uint8_t) std::min(std::max(std::round(value), 0.0f), 255.0f);
                 }
             }
         }
@@ -2354,7 +2368,6 @@ static bool vision_block_group_eval_callback(ggml_tensor * tensor, bool ask, voi
     state->segment_start = now;
     return true;
 }
-
 static bool vision_image_batch_encode_impl(
         vision_ctx * ctx,
         const int n_threads,
@@ -2389,6 +2402,7 @@ static bool vision_image_batch_encode_impl(
     ctx->debug_print_tensors.clear();
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = vision_image_build_graph(ctx, imgs);
+
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
 
     // set inputs
@@ -2415,14 +2429,14 @@ static bool vision_image_batch_encode_impl(
         return inp;
     };
 
-    auto set_input_f32 = [&get_inp_tensor](const char * name, std::vector<float> & values) {
+    auto set_input_f32 = [&get_inp_tensor](const char * name, const std::vector<float> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
     };
 
-    auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
+    auto set_input_i32 = [&get_inp_tensor](const char * name, const std::vector<int32_t> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
@@ -2473,17 +2487,26 @@ static bool vision_image_batch_encode_impl(
 
                 int embed_dim = vision_n_mmproj_embd(ctx);
 
-                auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
+                const bool pos_cache_hit = ctx->pos_embed_cache_w == pos_w
+                    && ctx->pos_embed_cache_h == pos_h
+                    && ctx->pos_embed_cache_dim == embed_dim
+                    && ctx->pos_embed_cache.size() == (size_t) embed_dim * pos_w * pos_h;
+                if (!pos_cache_hit) {
+                    auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
 
-                // pos_embed is [embed_dim, n_pos, 1] — same for all batch elements (broadcast)
-                std::vector<float> pos_embed(embed_dim * pos_w * pos_h);
-                for(int i = 0; i < pos_w * pos_h; ++i){
-                    for(int j = 0; j < embed_dim; ++j){
-                        pos_embed[i * embed_dim + j] = pos_embed_t[i][j];
+                    // pos_embed is [embed_dim, n_pos, 1] — same for all batch elements (broadcast)
+                    ctx->pos_embed_cache.resize((size_t) embed_dim * pos_w * pos_h);
+                    for (int i = 0; i < pos_w * pos_h; ++i) {
+                        for (int j = 0; j < embed_dim; ++j) {
+                            ctx->pos_embed_cache[(size_t) i * embed_dim + j] = pos_embed_t[i][j];
+                        }
                     }
+                    ctx->pos_embed_cache_w = pos_w;
+                    ctx->pos_embed_cache_h = pos_h;
+                    ctx->pos_embed_cache_dim = embed_dim;
                 }
 
-                set_input_f32("pos_embed", pos_embed);
+                set_input_f32("pos_embed", ctx->pos_embed_cache);
             } break;
         case MiniCPM_o_4_6:
             {
@@ -2578,6 +2601,7 @@ static bool vision_image_batch_encode_impl(
             ggml_backend_set_n_threads_fn(ctx->backend_cpu, n_threads);
         }
     }
+
 
     vision_block_group_eval_state group_state;
     if (profile != nullptr) {
