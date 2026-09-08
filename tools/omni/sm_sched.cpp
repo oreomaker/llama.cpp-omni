@@ -8,18 +8,20 @@
 
 #ifdef GGML_USE_CUDA
 
-#include <chrono>
-#include <cstdarg>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
+#    include "audition.h"                  // audition_get_backend
+#    include "omni.h"                      // omni_context
+#    include "omni_internal.h"             // print_with_timestamp
+#    include "token2wav/token2wav-impl.h"  // Token2WavSession::t2w.gpu_backends()
+#    include "vision.h"                    // vision_get_backend
 
-#include "omni_internal.h"   // print_with_timestamp
-#include "omni.h"            // omni_context
-#include "audition.h"        // audition_get_backend
-#include "vision.h"          // vision_get_backend
-#include "token2wav/token2wav-impl.h"   // Token2WavSession::t2w.gpu_backends()
+#    include <cctype>
+#    include <chrono>
+#    include <cstdarg>
+#    include <cstdio>
+#    include <cstdlib>
+#    include <cstring>
+#    include <ctime>
+#    include <string>
 
 // SM 观测走 stderr：stdout 重定向到文件时是全缓冲，进程若中途挂起，缓冲内容会丢。
 // 调度诊断不能丢。整行一次性 fwrite 到 stderr（单次写，glibc 按调用加锁），与
@@ -64,15 +66,131 @@ static double sm_now_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+static int sm_component_from_name(const std::string & name) {
+    if (name == "LLM") {
+        return SM_G_LLM;
+    }
+    if (name == "TTS") {
+        return SM_G_TTS;
+    }
+    if (name == "APM") {
+        return SM_G_APM;
+    }
+    if (name == "VPM") {
+        return SM_G_VPM;
+    }
+    if (name == "T2W") {
+        return SM_G_T2W;
+    }
+    return -1;
+}
+
+// Parse one optional physical-group sharing set, for example APM+TTS+T2W.
+// The logical component bits remain separate; this only changes group layout.
+static bool sm_parse_share_set(const std::string & text, bool shared[SM_COMPONENT_COUNT]) {
+    for (int c = 0; c < SM_COMPONENT_COUNT; ++c) {
+        shared[c] = false;
+    }
+    if (text.empty()) {
+        return true;
+    }
+
+    size_t pos = 0;
+    int    n   = 0;
+    while (pos < text.size()) {
+        const size_t      end       = text.find('+', pos);
+        const std::string name      = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        const int         component = sm_component_from_name(name);
+        if (component < 0 || shared[component]) {
+            return false;
+        }
+        shared[component] = true;
+        ++n;
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 1;
+        if (pos == text.size()) {
+            return false;
+        }
+    }
+    return n >= 2;
+}
+
+static bool sm_parse_sms_list(const std::string & text, int out[SM_COMPONENT_COUNT]) {
+    int    n   = 0;
+    size_t pos = 0;
+    while (pos < text.size() && n < SM_COMPONENT_COUNT) {
+        while (pos < text.size() && (text[pos] == ',' || std::isspace((unsigned char) text[pos]))) {
+            ++pos;
+        }
+        if (pos >= text.size() || text[pos] < '0' || text[pos] > '9') {
+            return false;
+        }
+        int value = 0;
+        while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+            value = value * 10 + (text[pos] - '0');
+            ++pos;
+        }
+        out[n++] = value;
+    }
+    while (pos < text.size() && std::isspace((unsigned char) text[pos])) {
+        ++pos;
+    }
+    return n == SM_COMPONENT_COUNT && pos == text.size();
+}
+
+static bool sm_build_layout(const int      logical_sms[SM_COMPONENT_COUNT],
+                            const bool     shared[SM_COMPONENT_COUNT],
+                            SmPlanLayout & out) {
+    out              = SmPlanLayout{};
+    int shared_group = -1;
+    out.n_groups     = 0;
+    for (int c = 0; c < SM_COMPONENT_COUNT; ++c) {
+        if (shared[c]) {
+            if (shared_group < 0) {
+                shared_group = out.n_groups++;
+            }
+            out.group_of[c] = shared_group;
+        } else {
+            out.group_of[c] = out.n_groups++;
+        }
+    }
+    for (int c = 0; c < SM_COMPONENT_COUNT; ++c) {
+        out.sms[out.group_of[c]] += logical_sms[c];
+    }
+    return true;
+}
+
+static void sm_log_layout(const char * prefix, const SmPlanLayout & layout) {
+    char line[256];
+    int  n = std::snprintf(line, sizeof(line), "[SM] %s groups=%d LLM=%d TTS=%d APM=%d VPM=%d T2W=%d sms=", prefix,
+                           layout.n_groups, layout.group_of[SM_G_LLM], layout.group_of[SM_G_TTS],
+                           layout.group_of[SM_G_APM], layout.group_of[SM_G_VPM], layout.group_of[SM_G_T2W]);
+    if (n < 0 || (size_t) n >= sizeof(line)) {
+        return;
+    }
+    for (int i = 0; i < layout.n_groups; ++i) {
+        n += std::snprintf(line + n, sizeof(line) - (size_t) n, "%s%d", i == 0 ? "" : ",", layout.sms[i]);
+        if (n < 0 || (size_t) n >= sizeof(line)) {
+            return;
+        }
+    }
+    sm_log("%s\n", line);
+}
+
 // 设备级整卡切换：5 个 backend + t2w_backends 一次 set_sm_group。
 // plan == SM_PLAN_GLOBAL：group_idx=-1 回全局（primary 全 SM），cache_key=-1 不缓存。
-// 否则用 presets[plan] 的第 group_idx 组，cache_key=plan（槽制缓存，切回零重建/零重捕获）。
+// 否则按 plan 的物理 group 映射绑定，cache_key=plan（槽制缓存，切回零重建/零重捕获）。
 // 任一 backend 切换失败 → 回滚已切的 backend 到旧 plan，返回 false（不推进 epoch）。
 static bool sm_apply_plan(SmSched & s, int plan) {
     const int64_t t0 = ggml_time_us();
     const int old_plan = s.applied_plan;
 
-    struct One { ggml_backend_t b; int group; };
+    struct One {
+        ggml_backend_t b;
+        int            component;
+    };
     std::vector<One> ones;
     ones.push_back({s.backend[SM_G_LLM], SM_G_LLM});
     ones.push_back({s.backend[SM_G_TTS], SM_G_TTS});
@@ -80,21 +198,33 @@ static bool sm_apply_plan(SmSched & s, int plan) {
     ones.push_back({s.backend[SM_G_VPM], SM_G_VPM});
     for (auto b : s.t2w_backends) ones.push_back({b, SM_G_T2W});
 
-    auto switch_one = [&](ggml_backend_t b, int group_idx, int cache_key) -> bool {
-        if (b == nullptr) return true;
+    auto switch_one = [&](ggml_backend_t b, int component, int cache_key) -> bool {
+        if (b == nullptr) {
+            return true;
+        }
         if (plan == SM_PLAN_GLOBAL) {
             return ggml_backend_cuda_set_sm_group(b, nullptr, -1, cache_key);
         }
         ggml_backend_cuda_sm_plan * p = s.presets[plan];
-        if (p == nullptr) return false;
-        return ggml_backend_cuda_set_sm_group(b, p, group_idx, cache_key);
+        if (p == nullptr) {
+            return false;
+        }
+        const SmPlanLayout & layout = s.layouts[plan];
+        if (layout.n_groups <= 0 || layout.n_groups > SM_COMPONENT_COUNT || component < 0 ||
+            component >= SM_COMPONENT_COUNT) {
+            return false;
+        }
+        return ggml_backend_cuda_set_sm_group(b, p, layout.group_of[component], cache_key);
     };
 
     std::vector<One> switched;
     bool ok = true;
     for (auto & o : ones) {
         if (o.b == nullptr) continue;
-        if (!switch_one(o.b, o.group, plan)) { ok = false; break; }
+        if (!switch_one(o.b, o.component, plan)) {
+            ok = false;
+            break;
+        }
         switched.push_back(o);
     }
     if (!ok && !switched.empty()) {
@@ -103,7 +233,10 @@ static bool sm_apply_plan(SmSched & s, int plan) {
                 ggml_backend_cuda_set_sm_group(o.b, nullptr, -1, old_plan);
             } else {
                 ggml_backend_cuda_sm_plan * p = s.presets[old_plan];
-                if (p) ggml_backend_cuda_set_sm_group(o.b, p, o.group, old_plan);
+                if (p) {
+                    const SmPlanLayout & layout = s.layouts[old_plan];
+                    ggml_backend_cuda_set_sm_group(o.b, p, layout.group_of[o.component], old_plan);
+                }
             }
         }
         fprintf(stderr, "[SM SWITCH] plan=%s apply failed, rolled back to %s\n",
@@ -239,39 +372,71 @@ void sm_sched_free(SmSched & s) {
 // ---------------------------------------------------------------------------
 void sm_sched_init(struct omni_context * ctx_omni) {
     if (ctx_omni == nullptr) return;
-    const char * env = getenv("OMNI_SM_SMS");
-    if (env == nullptr || *env == '\0' || strcmp(env, "0") == 0) return;   // 关闭调度
+    const char * env_c = getenv("OMNI_SM_SMS");
+    if (env_c == nullptr || *env_c == '\0' || strcmp(env_c, "0") == 0) {
+        return;  // 关闭调度
+    }
+
+    const std::string spec(env_c);
+    const size_t      at = spec.find('@');
+    if (at != std::string::npos && spec.find('@', at + 1) != std::string::npos) {
+        fprintf(stderr, "[SM] OMNI_SM_SMS='%s' has more than one '@', scheduler disabled\n", env_c);
+        return;
+    }
+    const std::string base                       = at == std::string::npos ? spec : spec.substr(0, at);
+    const std::string share                      = at == std::string::npos ? std::string() : spec.substr(at + 1);
+    bool              shared[SM_COMPONENT_COUNT] = {};
+    if (!sm_parse_share_set(share, shared)) {
+        fprintf(stderr, "[SM] OMNI_SM_SMS='%s' invalid share set '%s', scheduler disabled\n", env_c, share.c_str());
+        return;
+    }
 
     SmSched & s = ctx_omni->sm_sched;
-    if (strcmp(env, "DYN") == 0) {
-        // 组序 [LLM,TTS,APM,VPM,T2W]，合计 ≤120（与主工作区 C1 一致）
-        static const int SMS[4][5] = {
-            /* STEADY=C1  */ {48, 16,  8, 24, 24},
-            /* ENC_T2W    */ { 8,  8,  8, 48, 48},
-            /* ENC_LLM    */ {52,  2,  8, 64,  2},
-            /* ENC_TTS    */ { 2, 32,  2, 90,  2},
-        };
-        const int plan_ids[4] = {SM_PLAN_STEADY, SM_PLAN_ENC_T2W, SM_PLAN_ENC_LLM, SM_PLAN_ENC_TTS};
+    // [LLM,TTS,APM,VPM,T2W]
+    static const int DYN_SMS[4][SM_COMPONENT_COUNT] = {
+        /* STEADY  */ { 40, 8,  8, 56, 16 },
+        /* ENC_T2W    */
+        { 2,  2,  2, 78, 44 },
+        /* ENC_LLM    */
+        { 40, 2,  4, 80, 2  },
+        /* ENC_TTS    */
+        { 2,  28, 2, 94, 2  },
+    };
+    const int  plan_ids[4]                    = { SM_PLAN_STEADY, SM_PLAN_ENC_T2W, SM_PLAN_ENC_LLM, SM_PLAN_ENC_TTS };
+    int        static_sms[SM_COMPONENT_COUNT] = {};
+    const bool is_dyn                         = base == "DYN";
+    if (!is_dyn && (!sm_parse_sms_list(base, static_sms) || static_sms[SM_G_LLM] <= 0)) {
+        fprintf(stderr, "[SM] OMNI_SM_SMS='%s' invalid base strategy, scheduler disabled\n", env_c);
+        return;
+    }
+
+    auto install_plan = [&](int plan_id, const int logical_sms[SM_COMPONENT_COUNT]) -> bool {
+        SmPlanLayout layout;
+        if (!sm_build_layout(logical_sms, shared, layout)) {
+            return false;
+        }
+        s.layouts[plan_id] = layout;
+        s.presets[plan_id] = ggml_backend_cuda_sm_plan_create(0, layout.sms, layout.n_groups, false);
+        return s.presets[plan_id] != nullptr;
+    };
+
+    bool plans_ok = true;
+    if (is_dyn) {
         for (int i = 0; i < 4; ++i) {
-            s.presets[plan_ids[i]] = ggml_backend_cuda_sm_plan_create(0, SMS[i], 5, false);
+            plans_ok = install_plan(plan_ids[i], DYN_SMS[i]) && plans_ok;
         }
     } else {
-        // 显式逗号列表（组序 [LLM,TTS,APM,VPM,T2W]）：单静态 plan，永不切换
-        int sms[5] = {0, 0, 0, 0, 0};
-        int n = 0;
-        const char * p = env;
-        while (*p && n < 5) {
-            while (*p == ',' || *p == ' ') ++p;
-            if (*p < '0' || *p > '9') break;
-            sms[n++] = atoi(p);
-            while (*p >= '0' && *p <= '9') ++p;
+        plans_ok = install_plan(SM_PLAN_STEADY, static_sms);
+    }
+    if (!plans_ok) {
+        for (auto & plan : s.presets) {
+            if (plan != nullptr) {
+                ggml_backend_cuda_sm_plan_free(plan);
+                plan = nullptr;
+            }
         }
-        if (n == 5 && sms[0] > 0) {
-            s.presets[SM_PLAN_STEADY] = ggml_backend_cuda_sm_plan_create(0, sms, 5, false);
-        } else {
-            fprintf(stderr, "[SM] OMNI_SM_SMS='%s' invalid, scheduler disabled\n", env);
-            return;
-        }
+        fprintf(stderr, "[SM] OMNI_SM_SMS='%s' plan creation failed, scheduler disabled\n", env_c);
+        return;
     }
 
     // wire backends（duplex_prepare 之后、prewarm 之前）
@@ -285,9 +450,15 @@ void sm_sched_init(struct omni_context * ctx_omni) {
 
     s.enabled = true;
     s.applied_plan = SM_PLAN_STEADY;
-    sm_log("[SM] OMNI_SM_SMS=%s enabled presets=%s/%s/%s/%s\n", env,
-           sm_plan_name(SM_PLAN_STEADY), sm_plan_name(SM_PLAN_ENC_T2W),
-           sm_plan_name(SM_PLAN_ENC_LLM), sm_plan_name(SM_PLAN_ENC_TTS));
+    sm_log("[SM] OMNI_SM_SMS=%s enabled presets=%s/%s/%s/%s\n", env_c, sm_plan_name(SM_PLAN_STEADY),
+           sm_plan_name(SM_PLAN_ENC_T2W), sm_plan_name(SM_PLAN_ENC_LLM), sm_plan_name(SM_PLAN_ENC_TTS));
+    for (int i = 0; i < 4; ++i) {
+        if (s.presets[plan_ids[i]] != nullptr) {
+            char label[64];
+            std::snprintf(label, sizeof(label), "layout plan=%s", sm_plan_name(plan_ids[i]));
+            sm_log_layout(label, s.layouts[plan_ids[i]]);
+        }
+    }
 }
 
 #else

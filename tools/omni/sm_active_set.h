@@ -1,8 +1,12 @@
 #pragma once
 #include <cstdint>
 
-// 组件组索引（与 preset 表顺序一致：LLM,TTS,APM,VPM,T2W）
-enum : int { SM_G_LLM = 0, SM_G_TTS = 1, SM_G_APM = 2, SM_G_VPM = 3, SM_G_T2W = 4 };
+// 逻辑组件索引（与 preset 表顺序一致：LLM,TTS,APM,VPM,T2W）。
+// 该索引用于 active/reserved 位图，不等同于物理 SM group 索引。
+enum : int {
+    SM_G_LLM = 0, SM_G_TTS = 1, SM_G_APM = 2, SM_G_VPM = 3, SM_G_T2W = 4,
+    SM_COMPONENT_COUNT = 5,
+};
 // 物理分片位
 enum : uint32_t {
     SM_BIT_LLM = 1u << SM_G_LLM, SM_BIT_TTS = 1u << SM_G_TTS,

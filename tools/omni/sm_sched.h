@@ -10,6 +10,14 @@
 #include "ggml-cuda.h"   // ggml_backend_cuda_sm_plan
 #endif
 
+// 一个 plan 的物理分组布局。group_of 按逻辑组件索引，sms 按物理 group 索引。
+// 多个逻辑组件可以指向同一个物理 group；未共享时 group_of[c] == c。
+struct SmPlanLayout {
+    int n_groups = SM_COMPONENT_COUNT;
+    int group_of[SM_COMPONENT_COUNT] = {0, 1, 2, 3, 4};
+    int sms[SM_COMPONENT_COUNT] = {};
+};
+
 // 段租约调度器：单锁 + 单一 snapshot。enabled=false 时全部 no-op（= 无调度开销）。
 //
 // 一个 GPU 计算 = 一串带同步边界的段；调度只在段边界发生。逻辑任务首段通过
@@ -25,9 +33,10 @@ struct SmSched {
     uint64_t epoch = 0;           // 成功整卡切换次数
     uint64_t next_ticket = 1, serving_ticket = 1;   // 准入 FIFO
 #ifdef GGML_USE_CUDA
-    ggml_backend_t backend[5] = {};                 // 索引 = SM_G_*；T2W 用 t2w_backends
+    ggml_backend_t backend[SM_COMPONENT_COUNT] = {}; // 索引 = SM_G_*；T2W 用 t2w_backends
     std::vector<ggml_backend_t> t2w_backends;
     ggml_backend_cuda_sm_plan * presets[7] = {};    // 索引 = plan id（0..6）；STEADY=0
+    SmPlanLayout layouts[7] = {};                    // plan id -> 物理 group 布局
 #endif
     uint64_t switch_count = 0;
     double switch_total_ms = 0.0;
@@ -43,6 +52,8 @@ void sm_task_finish(SmSched & s, int selected_plan, uint32_t bit,
 void sm_sched_free(SmSched & s);
 
 // init 装配：OMNI_SM_SMS=DYN 时建 4 个 preset + wire backends + enabled=true；
+// 可追加 @COMPONENT+COMPONENT[+COMPONENT...]（例如 DYN@APM+TTS）合并物理 SM group；
+// 不设后缀时保持五组切分。
 // 不设 / 0 时 no-op（关闭调度）。duplex_prepare 之后、prewarm 之前调用。
 struct omni_context;
 void sm_sched_init(struct omni_context * ctx_omni);

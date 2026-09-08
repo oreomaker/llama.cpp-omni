@@ -167,17 +167,23 @@ void omni_prewarm(struct omni_context * ctx_omni) {
     }
 
     // ---- SM 各 plan 的 EC 预建 ----
-    // 遍历 4 个 preset 对 5 组 backend 各 set_sm_group 一次，把每个 plan 的 green context
-    // 建好并留在 green_ctx_cache。运行期切到任一 plan 零重建 EC。STEADY 放最后，末态 STEADY。
+    // 遍历 4 个 preset，按实际物理 group layout 对每个 backend set_sm_group 一次，把每个
+    // plan 的 green context 建好并留在 green_ctx_cache。运行期切到任一 plan 零重建 EC。
+    // 不做按 plan 图预热：实测（含 GLOBAL 的对齐主工作树版本）decode 无改善（p50 仍 ~133ms），
+    // 运行期 decode 图键因输入 buffer 地址漂移不匹配预热键；主工作树 decode 快是因为其图 miss
+    // 走 eager 不重捕获（见 PHASE3_SCHEDULER_REPORT §5），不是预热。STEADY 放最后，末态 STEADY。
     if (ctx_omni->sm_sched.enabled && ctx_omni->ctx_llama && ctx_omni->model &&
             ctx_omni->duplex != nullptr) {
         SmSched & s = ctx_omni->sm_sched;
         const int order[4] = {SM_PLAN_ENC_T2W, SM_PLAN_ENC_LLM, SM_PLAN_ENC_TTS, SM_PLAN_STEADY};
         auto apply_plan_all = [&](int plan) {
-            auto set_one = [&](ggml_backend_t b, int group) {
+            const SmPlanLayout & layout = s.layouts[plan];
+            auto set_one = [&](ggml_backend_t b, int component) {
                 if (b == nullptr) return;
                 ggml_backend_cuda_sm_plan * p = s.presets[plan];
-                if (p != nullptr) ggml_backend_cuda_set_sm_group(b, p, group, plan);
+                if (p != nullptr) {
+                    ggml_backend_cuda_set_sm_group(b, p, layout.group_of[component], plan);
+                }
             };
             set_one(s.backend[SM_G_LLM], SM_G_LLM);
             set_one(s.backend[SM_G_TTS], SM_G_TTS);
