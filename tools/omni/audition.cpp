@@ -1270,6 +1270,10 @@ struct audition_model_loader {
     }
 };
 
+struct audition_shared_model {
+    audition_ctx * owner = nullptr;
+};
+
 struct audition_ctx * audition_init(const char * fname, struct audition_context_params audition_params) {
     audition_g_logger_state.verbosity_thold = audition_params.verbosity;
     audition_ctx * ctx_audio = nullptr;
@@ -1308,6 +1312,56 @@ struct audition_ctx * audition_init(const char * fname, struct audition_context_
     }
 
     return ctx_audio;
+}
+
+audition_shared_model * audition_shared_init(const char * fname, audition_context_params params) {
+    audition_ctx * owner = audition_init(fname, params);
+    if (!owner) {
+        return nullptr;
+    }
+    auto * shared = new audition_shared_model();
+    shared->owner = owner;
+    return shared;
+}
+
+audition_ctx * audition_shared_clone(audition_shared_model * shared) {
+    if (!shared || !shared->owner) {
+        return nullptr;
+    }
+    audition_ctx * clone = nullptr;
+    try {
+        audition_context_params params{true, GGML_LOG_LEVEL_WARN};
+        clone = new audition_ctx(params);
+        clone->model = shared->owner->model;
+        clone->max_nodes = shared->owner->max_nodes;
+        clone->buf_compute_meta.resize(clone->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+        audition_whisper_init_kv_cache(clone, clone->model.hparams.n_embd,
+                                       clone->model.hparams.n_layer,
+                                       clone->model.hparams.n_ctx);
+
+        audition_audio_f32_batch batch;
+        audition_audio_f32_ptr audio(audition_audio_f32_init());
+        audio->nx = clone->model.hparams.warmup_audio_size;
+        audio->ny = clone->model.hparams.n_mel_bins;
+        batch.entries.push_back(std::move(audio));
+        ggml_cgraph * gf = audition_audio_build_graph(clone, batch);
+        ggml_backend_sched_reserve(clone->sched.get(), gf);
+        return clone;
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to clone shared model: %s\n", __func__, e.what());
+    } catch (...) {
+        LOG_ERR("%s: failed to clone shared model\n", __func__);
+    }
+    delete clone;
+    return nullptr;
+}
+
+void audition_shared_free(audition_shared_model * shared) {
+    if (!shared) {
+        return;
+    }
+    audition_free(shared->owner);
+    delete shared;
 }
 
 void audition_free(audition_ctx * ctx) {
@@ -1691,6 +1745,80 @@ void audition_whisper_clear_kv_cache(struct audition_ctx * ctx) {
     kv_cache.iter = 0;
     
     LOG_INF("%s: KV cache cleared\n", __func__);
+}
+
+bool audition_stream_capture(const audition_ctx * ctx, audition_stream_state * state) {
+    if (!ctx || !state) {
+        return false;
+    }
+    const auto & kv = ctx->whisper_kv_cache;
+    state->kv_bytes.clear();
+    state->iter = kv.iter;
+    state->n_layer = kv.n_layer;
+    state->size = kv.size;
+    if (!kv.buffer || kv.k_l.size() != kv.v_l.size()) {
+        return true;
+    }
+    if (ctx->backend) {
+        ggml_backend_synchronize(ctx->backend);
+    }
+    for (size_t i = 0; i < kv.k_l.size(); ++i) {
+        const size_t k_bytes = ggml_nbytes(kv.k_l[i]);
+        const size_t v_bytes = ggml_nbytes(kv.v_l[i]);
+        const size_t old_size = state->kv_bytes.size();
+        state->kv_bytes.resize(old_size + k_bytes + v_bytes);
+        ggml_backend_tensor_get(kv.k_l[i], state->kv_bytes.data() + old_size, 0, k_bytes);
+        ggml_backend_tensor_get(kv.v_l[i], state->kv_bytes.data() + old_size + k_bytes, 0, v_bytes);
+    }
+    return true;
+}
+
+bool audition_stream_restore(audition_ctx * ctx, const audition_stream_state * state) {
+    if (!ctx || !state) {
+        return false;
+    }
+    auto & kv = ctx->whisper_kv_cache;
+    if (kv.n_layer != state->n_layer || kv.size != state->size ||
+            kv.k_l.size() != kv.v_l.size() ||
+            state->kv_bytes.size() != audition_stream_byte_size(ctx)) {
+        return false;
+    }
+    if (!kv.buffer) {
+        kv.iter = state->iter;
+        return state->kv_bytes.empty();
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < kv.k_l.size(); ++i) {
+        const size_t k_bytes = ggml_nbytes(kv.k_l[i]);
+        const size_t v_bytes = ggml_nbytes(kv.v_l[i]);
+        ggml_backend_tensor_set(kv.k_l[i], state->kv_bytes.data() + offset, 0, k_bytes);
+        offset += k_bytes;
+        ggml_backend_tensor_set(kv.v_l[i], state->kv_bytes.data() + offset, 0, v_bytes);
+        offset += v_bytes;
+    }
+    if (ctx->backend) {
+        ggml_backend_synchronize(ctx->backend);
+    }
+    kv.iter = state->iter;
+    return true;
+}
+
+void audition_stream_clear(audition_ctx * ctx) {
+    audition_whisper_clear_kv_cache(ctx);
+}
+
+size_t audition_stream_byte_size(const audition_ctx * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    size_t total = 0;
+    for (const auto * tensor : ctx->whisper_kv_cache.k_l) {
+        total += ggml_nbytes(tensor);
+    }
+    for (const auto * tensor : ctx->whisper_kv_cache.v_l) {
+        total += ggml_nbytes(tensor);
+    }
+    return total;
 }
 
 // from mtmd-audio.cpp  TODO: move to correct place

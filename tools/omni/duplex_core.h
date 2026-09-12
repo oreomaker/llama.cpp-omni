@@ -55,6 +55,7 @@ struct DuplexFrame {
     bool encode_ok = false;
     std::vector<std::vector<float>> vision_embed;   // [0]=overview, [1..]=slices
     std::vector<float> audio_embed;
+    std::string input_text;
 
     // 解码结果
     bool decode_ok = false;
@@ -153,13 +154,20 @@ struct DuplexSession {
 // ---------------------------------------------------------------------------
 
 bool duplex_prepare(struct omni_context * ctx_omni, common_params * params);
+// Initialize token embedding lookup for an external per-user frame worker.
+// This does not create or start the legacy global pipeline.
+bool duplex_init_emb_cache_for_runtime(struct omni_context * ctx_omni, common_params * params);
+bool duplex_tokens_to_embeddings(struct omni_context * ctx_omni,
+                                 const std::vector<llama_token> & tokens,
+                                 std::vector<float> & embeddings);
 void duplex_start_threads(struct omni_context * ctx_omni, common_params * params);
 void duplex_stop_threads(struct omni_context * ctx_omni);
 
 bool duplex_prefill(struct omni_context * ctx_omni,
                     const std::string & aud_fname,
                     const std::string & img_fname,
-                    int index, int max_slice_nums);
+                    int index, int max_slice_nums,
+                    const std::string & text);
 bool duplex_decode(struct omni_context * ctx_omni,
                    const std::string & debug_dir,
                    int round_idx,

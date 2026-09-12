@@ -263,6 +263,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->owns_model = true;  // 拥有模型，omni_free 时需要释放
     }
     
+    const char * greedy_env = std::getenv("OMNI_GREEDY");
+    const bool greedy = greedy_env != nullptr && std::atoi(greedy_env) != 0;
+    if (greedy) {
+        params->sampling.temp = 0.0f;
+        print_with_timestamp("Sampler mode: greedy (OMNI_GREEDY=%s)\n", greedy_env);
+    }
+
     struct common_sampler * sampler = common_sampler_init(model, params->sampling);
     ctx_omni->ctx_llama = ctx_llama;
     ctx_omni->model = model;
@@ -304,7 +311,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         
         // 创建 TTS 的采样器（参数对齐 Python ras_sampling / TTSSamplingParams）
         common_params_sampling tts_sampling = params->sampling;
-        tts_sampling.temp = ctx_omni->tts_temperature;  // TTSSamplingParams.temperature（默认 0.8）
+        tts_sampling.temp = greedy ? 0.0f : ctx_omni->tts_temperature;
+        // 控制实验中让 LLM 和 TTS 使用相同的 greedy 选择。
         tts_sampling.top_p = 0.85f;            // TTSSamplingParams.top_p
         tts_sampling.top_k = 25;               // ras_sampling top_k
         tts_sampling.penalty_repeat = 1.05f;   // repetition_penalty

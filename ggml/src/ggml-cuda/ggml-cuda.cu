@@ -553,6 +553,19 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
+            // 🔧 [SM_GC_55] VMM 池增长 = cuMemCreate/cuMemMap/cuMemSetAccess（设备级同步）。
+            // 若此刻某个 backend 的 CUDA graph 正 replay 占着 GPU，本次增长会被阻塞到图跑完
+            // （chunk-18 ~80ms 异常的真因，见 SM_GC_55_CHUNK18_ATTRIBUTION.md）。用 GGML_CUDA_POOL_LOG=1
+            // 打印每次增长的时机/大小，验证 init 预扩后"流式阶段不再增长"。
+            static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (pool_log) {
+                fprintf(stderr, "[cuda-pool] dev%d pool=%p GROW +%.1f MB (req %.2f MB) -> pool %.1f MB used %.1f MB\n",
+                        device, (void *) this,
+                        (double) reserve_size / (1024.0*1024.0),
+                        (double) size        / (1024.0*1024.0),
+                        (double) pool_size   / (1024.0*1024.0),
+                        (double) pool_used   / (1024.0*1024.0));
+            }
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -3371,6 +3384,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    GGML_LOG_DEBUG("[SM GRAPH] key=0x%llx uid=%zu nodes=%d first_shape=%lldx%lldx%lldx%lld\n",
+                   (unsigned long long) graph_key, cgraph->uid, cgraph->n_nodes,
+                   (long long) cgraph->nodes[0]->ne[0], (long long) cgraph->nodes[0]->ne[1],
+                   (long long) cgraph->nodes[0]->ne[2], (long long) cgraph->nodes[0]->ne[3]);
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
@@ -4540,6 +4557,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
+    bool graph_property_miss        = false;
     uint64_t graph_key = 0;
 
 #ifdef USE_CUDA_GRAPH
@@ -4565,8 +4583,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
+                    cuda_ctx->graph_property_misses++;
+                    graph_property_miss = true;
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    cuda_ctx->graph_warmup_resets++;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -4577,6 +4598,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+#ifdef USE_CUDA_GRAPH
+    // Keep cumulative counters on the backend so host-side schedulers can
+    // attribute first-capture and graph misses to the task that caused them.
+    if (graph->is_enabled() && !cuda_ctx->disable_graphs) {
+        int32_t graph_result = GGML_CUDA_GRAPH_RESULT_MISS;
+        if (use_cuda_graph && graph->instance != nullptr && !cuda_graph_update_required) {
+            cuda_ctx->graph_hits++;
+            graph_result = GGML_CUDA_GRAPH_RESULT_HIT;
+        } else {
+            cuda_ctx->graph_misses++;
+        }
+        if (use_cuda_graph && cuda_graph_update_required) {
+            cuda_ctx->graph_captures++;
+            graph_result = GGML_CUDA_GRAPH_RESULT_CAPTURE;
+            if (getenv("GGML_CUDA_GRAPH_LOG") != nullptr) {
+                fprintf(stderr, "[graph] dev=%d key=0x%llx capture\n", cuda_ctx->device,
+                        (unsigned long long) graph_key);
+            }
+        } else if (getenv("GGML_CUDA_GRAPH_LOG") != nullptr) {
+            fprintf(stderr, "[graph] dev=%d key=0x%llx %s\n", cuda_ctx->device,
+                    (unsigned long long) graph_key,
+                    (use_cuda_graph && graph->instance != nullptr) ? "hit" : "miss");
+        }
+        if (graph_property_miss) graph_result = GGML_CUDA_GRAPH_RESULT_PROPERTY_MISS;
+        cuda_ctx->last_graph_key = graph_key;
+        cuda_ctx->last_graph_uid = (uint64_t) cgraph->uid;
+        cuda_ctx->last_graph_result = graph_result;
+        cuda_ctx->graph_event_serial++;
+    }
+#endif
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -5959,5 +6010,61 @@ bool ggml_backend_cuda_set_sm_group(ggml_backend_t backend, const ggml_backend_c
 #endif
 }
 
+bool ggml_backend_cuda_get_graph_stats(ggml_backend_t backend, ggml_backend_cuda_graph_stats * stats) {
+    if (stats == nullptr) return false;
+    memset(stats, 0, sizeof(*stats));
+    stats->current_slot_key = -1;
+#if defined(USE_CUDA_GRAPH)
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    stats->hits = ctx->graph_hits;
+    stats->misses = ctx->graph_misses;
+    stats->captures = ctx->graph_captures;
+    stats->slot_hits = ctx->graph_slot_hits;
+    stats->slot_misses = ctx->graph_slot_misses;
+    stats->property_misses = ctx->graph_property_misses;
+    stats->warmup_resets = ctx->graph_warmup_resets;
+    stats->event_serial = ctx->graph_event_serial;
+    stats->last_graph_key = ctx->last_graph_key;
+    stats->last_graph_uid = ctx->last_graph_uid;
+    stats->last_graph_result = ctx->last_graph_result;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    stats->current_slot_key = ctx->sm_slot_key;
+#else
+    stats->current_slot_key = -1;
+#endif
+    for (const auto & kv : ctx->cuda_graphs) {
+        if (kv.second && kv.second->instance != nullptr) stats->current_instances++;
+    }
+    for (const auto & kv : ctx->cuda_graphs) {
+        if (kv.second && kv.second->instance != nullptr) stats->instances++;
+    }
+    for (const auto & slot : ctx->sm_graph_slots) {
+        for (const auto & kv : slot.second) {
+            if (kv.second && kv.second->instance != nullptr) stats->instances++;
+        }
+    }
+    return true;
+#else
+    (void) backend;
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_get_last_sm_switch_stats(ggml_backend_t backend, ggml_backend_cuda_sm_switch_stats * stats) {
+    if (stats == nullptr) return false;
+    stats->total_ms = 0.0;
+    stats->stream_ec_ms = 0.0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13010
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    stats->total_ms = ctx->last_sm_switch_ms;
+    stats->stream_ec_ms = ctx->last_sm_switch_stream_ec_ms;
+    return true;
+#else
+    (void) backend;
+    return false;
+#endif
+}
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

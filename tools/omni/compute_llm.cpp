@@ -4,6 +4,7 @@
 #include "omni-impl.h"
 #include "omni.h"
 #include "omni_internal.h"
+#include "duplex_core.h"
 #include "common/common.h"
 #include "common/sampling.h"
 
@@ -222,47 +223,53 @@ static inline void append_raw_emb(std::vector<float> & fused,
     fused_ntok += n_tokens;
 }
 
-bool llm_fused_prefill(struct omni_context * ctx_omni, common_params * params,
-                       const std::vector<std::vector<float>> & vision_embed,
-                       const std::vector<float> & audio_embed,
-                       int hidden_size, int * out_fused_ntok) {
+bool llm_build_fused_embeddings(struct omni_context * ctx_omni,
+                                const std::vector<std::vector<float>> & vision_embed,
+                                const std::vector<float> & audio_embed,
+                                const std::string & text,
+                                const std::vector<llama_token> & tokens,
+                                int hidden_size,
+                                std::vector<float> & fused,
+                                int * out_fused_ntok) {
     if (!ctx_omni->emb_cache.initialized) return false;
     if (ctx_omni->emb_cache.hidden_size != hidden_size) return false;
-
-    auto t_begin  = std::chrono::high_resolution_clock::now();
-    int  n_past_0 = ctx_omni->n_past;
+    if (hidden_size <= 0 || audio_embed.size() % static_cast<size_t>(hidden_size) != 0) {
+        return false;
+    }
 
     int n_audio_tokens = (hidden_size > 0)
         ? (int)(audio_embed.size() / hidden_size) : 0;
     bool has_audio  = (n_audio_tokens > 0);
     bool has_vision = !vision_embed.empty();
-
-    if (ctx_omni->sliding_window_config.mode != "off") {
-        sliding_window_register_unit_start(ctx_omni);
-    }
-
-    std::vector<float> fused;
+    fused.clear();
     fused.reserve(128 * (size_t)hidden_size);
     int fused_ntok = 0;
 
     bool build_ok = true;
     if (has_vision) {
         int n_chunks         = (int)vision_embed.size();
-        int tokens_per_chunk = (int)vision_embed[0].size() / hidden_size;
         bool has_slices      = (n_chunks > 1);
 
         build_ok &= append_text_emb(ctx_omni, "<unit><image>", fused, fused_ntok);
-        if (build_ok) {
+        if (build_ok && vision_embed[0].size() % static_cast<size_t>(hidden_size) == 0) {
+            const int tokens_per_chunk = static_cast<int>(
+                vision_embed[0].size() / static_cast<size_t>(hidden_size));
             append_raw_emb(fused, fused_ntok,
                            vision_embed[0].data(), tokens_per_chunk, hidden_size);
+        } else {
+            build_ok = false;
         }
         build_ok &= append_text_emb(ctx_omni, "</image>", fused, fused_ntok);
         if (build_ok && has_slices) {
             for (int i = 1; i < n_chunks && build_ok; i++) {
                 build_ok &= append_text_emb(ctx_omni, "<slice>", fused, fused_ntok);
-                if (build_ok) {
+                if (build_ok && vision_embed[i].size() % static_cast<size_t>(hidden_size) == 0) {
+                    const int tokens_per_chunk = static_cast<int>(
+                        vision_embed[i].size() / static_cast<size_t>(hidden_size));
                     append_raw_emb(fused, fused_ntok,
                                    vision_embed[i].data(), tokens_per_chunk, hidden_size);
+                } else {
+                    build_ok = false;
                 }
                 build_ok &= append_text_emb(ctx_omni, "</slice>", fused, fused_ntok);
             }
@@ -280,12 +287,48 @@ bool llm_fused_prefill(struct omni_context * ctx_omni, common_params * params,
         }
     }
 
+    std::vector<llama_token> text_tokens;
+    if (!text.empty()) {
+        text_tokens = common_tokenize(ctx_omni->ctx_llama, text, false, true);
+    }
+    text_tokens.insert(text_tokens.end(), tokens.begin(), tokens.end());
+    if (build_ok && !text_tokens.empty()) {
+        build_ok = duplex_tokens_to_embeddings(ctx_omni, text_tokens, fused);
+        fused_ntok += build_ok ? static_cast<int>(text_tokens.size()) : 0;
+    }
+
     if (!build_ok) {
-        // 某个特殊串缓存缺失，放弃 fused 路径、让调用方走 fallback。
-        LOG_WRN("duplex_fused: cache miss, fallback to multi-step prefill\n");
+        LOG_WRN("duplex_fused: failed to build fused embeddings\n");
         return false;
     }
     if (out_fused_ntok != nullptr) *out_fused_ntok = fused_ntok;
+    return fused_ntok > 0;
+}
+
+bool llm_fused_prefill(struct omni_context * ctx_omni, common_params * params,
+                       const std::vector<std::vector<float>> & vision_embed,
+                       const std::vector<float> & audio_embed,
+                       int hidden_size, int * out_fused_ntok,
+                       const std::string & text,
+                       const std::vector<llama_token> & tokens) {
+    auto t_begin  = std::chrono::high_resolution_clock::now();
+    int  n_past_0 = ctx_omni->n_past;
+    std::vector<float> fused;
+    int fused_ntok = 0;
+    if (!llm_build_fused_embeddings(ctx_omni, vision_embed, audio_embed, text, tokens,
+                                    hidden_size, fused, &fused_ntok)) {
+        return false;
+    }
+    if (!params || params->n_batch <= 0 || fused_ntok > params->n_batch) {
+        LOG_ERR("duplex_fused: %d input rows exceed n_batch=%d\n",
+                fused_ntok, params ? params->n_batch : 0);
+        return false;
+    }
+    if (out_fused_ntok != nullptr) *out_fused_ntok = fused_ntok;
+
+    if (ctx_omni->sliding_window_config.mode != "off") {
+        sliding_window_register_unit_start(ctx_omni);
+    }
     print_with_timestamp("[LLM PREFILL] n_past_before=%d n_tokens=%d batch=%d kv_offset=%d topology=fused\n",
                          n_past_0, fused_ntok, params->n_batch, n_past_0);
     auto t_after_embed = std::chrono::high_resolution_clock::now();
@@ -300,7 +343,10 @@ bool llm_fused_prefill(struct omni_context * ctx_omni, common_params * params,
     auto t_after_llm = std::chrono::high_resolution_clock::now();
 
     if (ctx_omni->sliding_window_config.mode != "off") {
-        std::string input_type = has_vision ? "omni" : "audio";
+        const bool has_vision = !vision_embed.empty();
+        const bool has_audio = !audio_embed.empty();
+        std::string input_type = has_vision ? (has_audio ? "omni" : "video")
+                                            : (has_audio ? "audio" : "text");
         sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
         sliding_window_enforce(ctx_omni);
     }
@@ -652,7 +698,7 @@ bool eval_string_with_hidden(struct omni_context * ctx_omni, common_params* para
 const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past) {
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     common_sampler_accept(smpl, id, true);
-    static std::string ret;
+    static thread_local std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
     } else {
@@ -665,7 +711,7 @@ const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni
 static const char * sample_with_hidden(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states) {
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     common_sampler_accept(smpl, id, true);
-    static std::string ret;
+    static thread_local std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
     } else {
@@ -740,7 +786,7 @@ const char * sample_with_hidden_and_token(struct common_sampler * smpl, struct o
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     token_id = id;  // 保存token ID
     common_sampler_accept(smpl, id, true);
-    static std::string ret;
+    static thread_local std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
     } else {

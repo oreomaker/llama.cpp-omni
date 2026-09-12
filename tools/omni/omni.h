@@ -45,22 +45,29 @@ struct DuplexPipeline;
 // 的 index 语义和并发约束。
 struct DuplexSession;
 
-// Replacement TTS/T2W runtime. 定义在 tts_t2w_replacement.cpp；用 shared_ptr 持有
-// 不完整类型，避免公共头文件依赖其定义。
+// Replacement TTS/T2W runtime. The definition lives in
+// tts_t2w_replacement.cpp; shared_ptr keeps omni_context usable with the
+// incomplete type in public headers.
 struct OmniTtsT2wReplacement;
 
-
-// 特殊 token 的 embedding 查表（fused prefill 用）。
-// 在 duplex 路径启动后懒加载；加载失败时 initialized=false，
-// fused prefill 路径回退到 per-chunk 多次 llama_decode 的老逻辑。
+// Token embedding lookup used by fused prefill and continuous decode.
+// Fixed protocol markers are cached at initialization. Other rows are cached
+// on demand with a bounded cache.
 // 纯 LLM 域数据（per-context），挂在 omni_context 上，不依赖 duplex 调度层。
 struct DuplexTokenEmbCache {
     bool initialized = false;
     int  hidden_size = 0;
+    int  vocab_size = 0;
+    int  tensor_type = -1;
+    size_t row_bytes = 0;
+    size_t data_offset = 0;
+    std::string model_path;
     // text → embedding buffer（length = n_tokens * hidden_size）。
     // key 是 duplex prefill 里用到的固定字符串："<unit><image>" / "</image>" / "<slice>" / "</slice>" / "\n" / "<unit>"
     std::unordered_map<std::string, std::vector<float>> text_emb;
     std::unordered_map<std::string, int>                text_ntok;
+    // Arbitrary text and decode tokens are cached only after they are used.
+    std::unordered_map<llama_token, std::vector<float>> token_emb;
 };
 
 //

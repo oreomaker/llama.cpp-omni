@@ -106,6 +106,16 @@ using vision_segment_callback_t = void (*)(int segment_id, int segment_count,
 struct vision_ctx * vision_init(const char * fname, struct vision_context_params ctx_params);
 void vision_free(struct vision_ctx * ctx);
 
+// Shared-weight construction for the single-process multi-context runtime.
+// The owner loads the GGUF tensors once; each clone owns its scheduler,
+// compute workspace and mutable shape/position caches.
+struct vision_shared_model;
+struct vision_shared_model * vision_shared_init(const char * fname, struct vision_context_params ctx_params);
+struct vision_ctx * vision_shared_clone(struct vision_shared_model * shared);
+void vision_shared_free(struct vision_shared_model * shared);
+void vision_shared_set_batch_encode(struct vision_shared_model * shared, bool enable);
+void vision_shared_set_coreml_model_path(struct vision_shared_model * shared, const char * path);
+
 // 返回 VPM 的 CUDA/GPU 计算 backend（无则 NULL）。当前无调用方，预留给调度层。
 ggml_backend_t vision_get_backend(struct vision_ctx * ctx);
 

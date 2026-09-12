@@ -14,6 +14,53 @@
 #include <cstring>
 #include <random>
 
+namespace {
+
+bool tts_profile_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("OMNI_TTS_PROFILE");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+double tts_elapsed_ms(const std::chrono::steady_clock::time_point & begin) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+}
+
+struct tts_token_profile {
+    explicit tts_token_profile(int token_index) : enabled(tts_profile_enabled()), token_index(token_index) {}
+
+    ~tts_token_profile() {
+        if (!enabled || !got_hidden) {
+            return;
+        }
+        const double get_sync_ms = std::chrono::duration<double, std::milli>(get_end - get_begin).count();
+        const double cpu_ms = cpu_done
+            ? std::chrono::duration<double, std::milli>(cpu_end - get_end).count() : 0.0;
+        const double submit_ms = decode_done
+            ? std::chrono::duration<double, std::milli>(decode_end - decode_begin).count() : 0.0;
+        std::fprintf(stderr,
+                     "[tts.prof] token=%d get_sync=%.3f cpu_head_sample_emb=%.3f decode_submit=%.3f host_total=%.3f\n",
+                     token_index, get_sync_ms, cpu_ms, submit_ms, tts_elapsed_ms(token_begin));
+    }
+
+    bool enabled = false;
+    bool got_hidden = false;
+    bool cpu_done = false;
+    bool decode_done = false;
+    int token_index = -1;
+    std::chrono::steady_clock::time_point token_begin = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point get_begin{};
+    std::chrono::steady_clock::time_point get_end{};
+    std::chrono::steady_clock::time_point cpu_end{};
+    std::chrono::steady_clock::time_point decode_begin{};
+    std::chrono::steady_clock::time_point decode_end{};
+};
+
+} // namespace
+
 bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path) {
 
     auto ggml_tensor_to_f32 = [](const ggml_tensor * t, float * dst, int64_t n) {
@@ -798,17 +845,24 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
             n_eval = n_batch;
         }
         
-        llama_batch batch = {};
+        llama_batch batch = llama_batch_init(n_eval, n_embd, 1);
+        if (!batch.embd || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+            llama_batch_free(batch);
+            LOG_ERR("%s: failed to allocate TTS embedding batch\n", __func__);
+            return false;
+        }
         batch.n_tokens = int32_t(n_eval);
-        batch.embd = (embed + i * n_embd);  // 使用embedding作为输入
+        std::memcpy(batch.embd, embed + i * n_embd,
+                    static_cast<size_t>(n_eval) * static_cast<size_t>(n_embd) * sizeof(float));
         
         // 设置pos值以确保正确的KV cache位置
         // Python: pos_ids = torch.arange(text_start_pos, text_start_pos + condition_length)
         // C++: batch.pos[j] = text_start_pos + i + j (where i is the offset within the current batch)
-        std::vector<llama_pos> pos_vec(n_eval);
-        batch.pos = pos_vec.data();
         for (int j = 0; j < n_eval; j++) {
             batch.pos[j] = text_start_pos + i + j;  // Fix: use text_start_pos + i + j instead of *n_past_tts + j
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = 0;
+            batch.logits[j] = 0;
         }
         
         // Enable embeddings output for TTS model (needed for head_code logits calculation)
@@ -818,8 +872,10 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
             LOG_ERR("%s : failed to eval TTS embeddings. pos %d/%d (batch size %d, n_past %d)\n", 
                     __func__, i, n_pos, n_batch, *n_past_tts);
             llama_set_embeddings(ctx_omni->ctx_tts_llama, false);
+            llama_batch_free(batch);
             return false;
         }
+        llama_batch_free(batch);
         
         // Save hidden states for each token in the batch (for alignment testing)
         // Note: llama_get_embeddings_ith uses negative indices relative to the end of the batch
@@ -1371,6 +1427,7 @@ llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct omni_c
 }
 
 llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens, const std::vector<llama_token> * chunk_generated_tokens, int token_index_in_chunk, bool force_no_eos, bool is_final_text_chunk) {
+    tts_token_profile profile(token_index_in_chunk);
 
     // Debug: Save logits directory (set via environment variable)
     const char* logits_debug_dir = getenv("TTS_LOGITS_DEBUG_DIR");
@@ -1475,9 +1532,14 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
 
     // 1. 获取TTS模型的最后一个位置的hidden state
     // hidden_state shape: (hidden_size=768,)
-
+    if (profile.enabled) {
+        profile.get_begin = std::chrono::steady_clock::now();
+    }
     const float * hidden_state = llama_get_embeddings_ith(ctx_omni->ctx_tts_llama, -1);
-
+    if (profile.enabled) {
+        profile.get_end = std::chrono::steady_clock::now();
+        profile.got_hidden = hidden_state != nullptr;
+    }
     if (hidden_state == nullptr) {
         LOG_ERR("TTS: failed to get hidden state from TTS model\n");
         return 0;
@@ -1674,7 +1736,10 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
     if (ctx_omni->duplex_mode && is_eos && !is_final_text_chunk) {
         // 非 final chunk 采样到 EOS，不 prefill，直接返回
         // 这样 TTS 模型的 KV cache 不会包含 EOS，下一个 chunk 可以继续使用
-    
+        if (profile.enabled) {
+            profile.cpu_end = std::chrono::steady_clock::now();
+            profile.cpu_done = true;
+        }
         return id;
     }
     
@@ -1703,24 +1768,38 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
             }
         }
         
-    
+        if (profile.enabled) {
+            profile.cpu_end = std::chrono::steady_clock::now();
+            profile.cpu_done = true;
+            profile.decode_begin = std::chrono::steady_clock::now();
+        }
         // Use prefill_with_emb_tts to decode with embedding instead of token ID
         if (!prefill_with_emb_tts(ctx_omni, params, audio_token_embedding.data(), 1, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token embedding\n");
             return 0;
         }
-    
+        if (profile.enabled) {
+            profile.decode_end = std::chrono::steady_clock::now();
+            profile.decode_done = true;
+        }
     } else {
         // Fallback: use token IDs (may fail if token ID exceeds vocab size)
         LOG_ERR("TTS: emb_code not available, falling back to token IDs (may fail if token exceeds vocab)\n");
         std::vector<llama_token> tokens;
         tokens.push_back(id);
-    
+        if (profile.enabled) {
+            profile.cpu_end = std::chrono::steady_clock::now();
+            profile.cpu_done = true;
+            profile.decode_begin = std::chrono::steady_clock::now();
+        }
         if (!eval_tokens_tts(ctx_omni, params, tokens, 1, n_past_tts)) {
             LOG_ERR("TTS: failed to decode audio token ID (token may exceed vocab size)\n");
             return 0;
         }
-    
+        if (profile.enabled) {
+            profile.decode_end = std::chrono::steady_clock::now();
+            profile.decode_done = true;
+        }
     }
     
     return id;
@@ -2225,6 +2304,7 @@ bool generate_audio_tokens_local(
                 merged_embeddings.size(), n_tokens, tts_n_embd);
         return false;
     }
+
 
     // 在 prefill 之前动态添加 text_eos_embed（如果是轮次结束）和 audio_bos embedding
     // Python TTSStreamingGenerator.generate_with_buffer 逻辑：

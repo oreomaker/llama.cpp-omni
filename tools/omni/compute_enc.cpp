@@ -13,7 +13,14 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+static bool vpm_profile_enabled() {
+    const char * value = std::getenv("OMNI_VPM_PROFILE");
+    return value != nullptr && std::atoi(value) != 0;
+}
 
 static bool load_file_to_bytes(const char* path, unsigned char** bytesOut, long *sizeOut) {
     auto file = fopen(path, "rb");
@@ -64,10 +71,16 @@ static bool encode_image_with_vision_chunks(vision_ctx * ctx_vision, int n_threa
     vision_image_f32_batch img_res_v;
     img_res_v.entries.resize(0);
     img_res_v.entries.clear();
+    const int64_t t_preprocess_start_us = ggml_time_us();
     if (!vision_image_preprocess(ctx_vision, img, &img_res_v)) {
         LOG_ERR("%s: unable to preprocess image\n", __func__);
         img_res_v.entries.clear();
         return false;
+    }
+    if (vpm_profile_enabled()) {
+        std::fprintf(stderr, "[VPM PROF] preprocess=%.3fms images=%zu t=%.3fms\n",
+                     (ggml_time_us() - t_preprocess_start_us) / 1000.0,
+                     img_res_v.entries.size(), ggml_time_us() / 1000.0);
     }
     
     int n_embd = vision_n_mmproj_embd(ctx_vision);

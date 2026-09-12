@@ -731,7 +731,7 @@ ggml_tensor * fmCausalConditionalCFM::deterministic_noise(ggml_context * ctx,
         float *       data  = static_cast<float *>(noise->data);
         const int64_t total = C * T * B;
         // 用伪随机噪声替代周期性波形，避免音频伪影
-        static std::mt19937 gen(42);  // 固定种子保证可复现
+        static thread_local std::mt19937 gen(42);  // 每个 executor owner 线程独立消费
         std::normal_distribution<float> dist(0.0f, 1.0f);
         for (int64_t i = 0; i < total; ++i) {
             data[i] = temperature * dist(gen);
@@ -2342,7 +2342,7 @@ void fmFlowMatchingGGUFModelLoader::fill_noise_ctb(std::vector<float> & noise_ct
     noise_ctb.resize((size_t) C * (size_t) T * (size_t) B);
     const int64_t total = C * T * B;
     // 用伪随机噪声替代周期性波形，避免音频伪影
-    static std::mt19937 gen(42);  // 固定种子保证可复现
+    static thread_local std::mt19937 gen(42);  // 每个 executor owner 线程独立消费
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int64_t i = 0; i < total; ++i) {
         noise_ctb[(size_t) i] = temperature * dist(gen);
@@ -6843,6 +6843,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         std::vector<std::pair<int, int>> voc_ranges;
         const char * dispatch    = std::getenv("OMNI_T2W_DISPATCH");
         const bool   forced_full = dispatch != nullptr && std::strcmp(dispatch, "full") == 0;
+        const char * sprof       = std::getenv("OMNI_T2W_SPLIT_PROFILE");
+        const bool   split_prof  = sprof != nullptr && std::atoi(sprof) != 0;
         // 与 flow 的 split dispatch 一致：SM 协同路径（segment_callback 非空）下把
         // vocoder 图按阶段切分，每段 GPU 同步后调 segment_callback 让出 T2W 租约，
         // 让调度器在 vocoder 子段之间也能再决策（audio 尾巴只剩 T2W 时可及时降回 GLOBAL）。
@@ -6853,12 +6855,20 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             const int n = (int) voc_ranges.size();
             ggml_status st = GGML_STATUS_SUCCESS;
             for (int i = 0; i < n; ++i) {
+                const double t0 = (double) ggml_time_us() / 1000.0;
                 st = ggml_backend_graph_compute_range(model->backend, gf,
                                                       voc_ranges[i].first, voc_ranges[i].second);
                 if (st != GGML_STATUS_SUCCESS) {
                     break;
                 }
                 ggml_backend_synchronize(model->backend);
+                if (split_prof) {
+                    const double elapsed = (double) ggml_time_us() / 1000.0 - t0;
+                    std::fprintf(stderr,
+                                 "[voc.split] graph=vocoder segment=%d nodes=%d-%d count=%d elapsed=%.3fms\n",
+                                 i, voc_ranges[i].first, voc_ranges[i].second,
+                                 voc_ranges[i].second - voc_ranges[i].first, elapsed);
+                }
                 if (segment_callback != nullptr) {
                     segment_callback(i, n, segment_callback_user_data);
                 }
@@ -7505,7 +7515,7 @@ void runner_build_cosine_t_span(int n_timesteps, std::vector<float> & t_span_out
     }
 }
 static std::mt19937 & runner_noise_generator() {
-    static std::mt19937 gen(42);
+    static thread_local std::mt19937 gen(42);
     return gen;
 }
 
@@ -7698,11 +7708,17 @@ static ggml_status runner_dispatch_graph(
     ggml_status status = GGML_STATUS_SUCCESS;
     for (size_t i = 0; i < ranges.size(); ++i) {
         const auto [begin, end] = ranges[i];
+        const double t0 = (double) ggml_time_us() / 1000.0;
         status = ggml_backend_graph_compute_range(backend, gf, begin, end);
         if (status != GGML_STATUS_SUCCESS) {
             break;
         }
         ggml_backend_synchronize(backend);
+        if (runner_split_profile_enabled()) {
+            const double elapsed = (double) ggml_time_us() / 1000.0 - t0;
+            std::fprintf(stderr, "[t2m.split] graph=%s segment=%zu nodes=%d-%d count=%d elapsed=%.3fms\n",
+                         graph_kind, i, begin, end, end - begin, elapsed);
+        }
         if (segment_callback != nullptr) {
             // The final extra segment is the vocoder, which runs after this
             // token2mel graph returns.
@@ -9604,7 +9620,7 @@ bool Token2Mel::infer_one_chunk_ane_(const std::vector<int32_t> & chunk_bt, bool
     // 都是同一组随机数，TTS 输出会出现"重音节/卡字"（每帧像新句子起头）。
     std::vector<float> x_b1(one_xmcf);
     {
-        static std::mt19937             ane_noise_gen(42);
+        static thread_local std::mt19937 ane_noise_gen(42);
         std::normal_distribution<float> dist(0.0f, 1.0f);
         for (size_t i = 0; i < one_xmcf; ++i) {
             x_b1[i] = temperature_ * dist(ane_noise_gen);

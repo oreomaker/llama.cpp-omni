@@ -14,7 +14,9 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <chrono>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <stdexcept>
 
@@ -1149,9 +1151,19 @@ void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.embeddings = value;
+    embeddings_masked = false;
 
     // TODO: not sure yet if we want to reserve here
     //sched_need_reserve = true;
+}
+
+bool llama_context::set_embeddings_masked(bool value) {
+    if (value && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return false;
+    }
+    cparams.embeddings = value;
+    embeddings_masked = value;
+    return true;
 }
 
 void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
@@ -1315,6 +1327,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const int64_t t_pb_0 = ggml_time_us();
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1351,6 +1364,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
     }
+    const int64_t t_pb_alloc = ggml_time_us();
 
     // set the input data for the input tensors
     {
@@ -1361,6 +1375,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    const int64_t t_pb_inputs = ggml_time_us();
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -1368,6 +1383,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+    const int64_t t_pb_end = ggml_time_us();
+    // 1-token 批次（decode 单步）也记录：时间轴脚本用 compute 画 LLM kernel 条，
+    // 与 [prof] llm decode 的整窗口对比标出准入等待。
+    if (ubatch.n_tokens == 1 || t_pb_end - t_pb_0 > 40*1000) {
+        const auto _now = std::chrono::system_clock::now();
+        const auto _tt = std::chrono::system_clock::to_time_t(_now);
+        const auto _ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             _now.time_since_epoch()) % 1000;
+        std::tm _tm;
+        localtime_r(&_tt, &_tm);
+        fprintf(stderr, "%02d:%02d:%02d.%03d [pb-prof] n_tokens=%d alloc=%.1fms inputs=%.1fms compute=%.1fms total=%.1fms\n",
+                _tm.tm_hour, _tm.tm_min, _tm.tm_sec, (int) _ms.count(),
+                ubatch.n_tokens,
+                (t_pb_alloc - t_pb_0)/1000.0,
+                (t_pb_inputs - t_pb_alloc)/1000.0,
+                (t_pb_end - t_pb_inputs)/1000.0,
+                (t_pb_end - t_pb_0)/1000.0);
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -1697,8 +1731,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    const bool output_all   = cparams.embeddings && !embeddings_masked;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -3634,6 +3667,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+bool llama_set_embeddings_masked(llama_context * ctx, bool value) {
+    return ctx->set_embeddings_masked(value);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

@@ -16,6 +16,9 @@ add_library(omni
             tts_t2w_replacement.cpp
             omni_prewarm.cpp
             omni_prewarm.h
+            sm_sched.cpp
+            sm_sched.h
+            sm_active_set.h
             compute_llm.cpp
             compute_enc.cpp
             compute_tts.cpp
@@ -24,6 +27,11 @@ add_library(omni
             omni.h
             duplex_core.cpp
             duplex_core.h
+            multi_user_llm_engine.cpp
+            multi_user_llm_engine.h
+            multi_user_multictx_runtime.cpp
+            multi_user_multictx_runtime.h
+            multi_user_runtime.h
             tts_worker.cpp
             omni_t2w.cpp
             tts-condition-graph.cpp
@@ -193,6 +201,40 @@ set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
+# Single-process multi-user probe with per-user and continuous-batch LLM policies.
+set(TARGET_MULTI_USER_MULTICTX llama-omni-test-multi-user-multictx)
+add_executable         (${TARGET_MULTI_USER_MULTICTX} test/test-multi-user-multictx.cpp)
+set_target_properties  (${TARGET_MULTI_USER_MULTICTX} PROPERTIES OUTPUT_NAME llama-omni-test-multi-user-multictx)
+target_link_libraries  (${TARGET_MULTI_USER_MULTICTX} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_MULTI_USER_MULTICTX} PRIVATE cxx_std_17)
+
+# decode × T2W 重叠隔离测试（无 duplex 编排，无 profiler）
+set(TARGET_ISO_OVERLAP llama-omni-test-isolate-overlap)
+add_executable         (${TARGET_ISO_OVERLAP} test/isolate_overlap.cpp)
+set_target_properties  (${TARGET_ISO_OVERLAP} PROPERTIES OUTPUT_NAME llama-omni-test-isolate-overlap)
+target_link_libraries  (${TARGET_ISO_OVERLAP} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_ISO_OVERLAP} PRIVATE cxx_std_17)
+
+# APM + TTS shared/split physical SM group benchmark.
+set(TARGET_ISO_APM_TTS llama-omni-test-isolate-apm-tts)
+add_executable         (${TARGET_ISO_APM_TTS} test/isolate_apm_tts.cpp)
+set_target_properties  (${TARGET_ISO_APM_TTS} PROPERTIES OUTPUT_NAME llama-omni-test-isolate-apm-tts)
+target_link_libraries  (${TARGET_ISO_APM_TTS} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_ISO_APM_TTS} PRIVATE cxx_std_17)
+
+# Standalone component batch probes for the multi-user latency model.
+set(TARGET_VPM_BATCH llama-omni-test-vpm-batch)
+add_executable         (${TARGET_VPM_BATCH} test/test-vpm-batch.cpp)
+set_target_properties  (${TARGET_VPM_BATCH} PROPERTIES OUTPUT_NAME llama-omni-test-vpm-batch)
+target_link_libraries  (${TARGET_VPM_BATCH} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_VPM_BATCH} PRIVATE cxx_std_17)
+
+set(TARGET_T2W_WINDOW_BATCH llama-omni-test-t2w-window-batch)
+add_executable         (${TARGET_T2W_WINDOW_BATCH} test/test-t2w-window-batch.cpp)
+set_target_properties  (${TARGET_T2W_WINDOW_BATCH} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-window-batch)
+target_link_libraries  (${TARGET_T2W_WINDOW_BATCH} PRIVATE llama-common omni Threads::Threads)
+target_compile_features(${TARGET_T2W_WINDOW_BATCH} PRIVATE cxx_std_17)
+
 
 # Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
 add_executable(token2wav-example token2wav/token2wav-example.cpp)
@@ -238,4 +280,3 @@ if(ENABLE_COREML)
     target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE llama-common omni Threads::Threads)
     target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
 endif()
-

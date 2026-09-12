@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <future>
 
 // ==========================================================================
@@ -25,6 +26,10 @@
 static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * params);
 static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * params);
 static bool duplex_init_emb_cache(omni_context * ctx_omni, common_params * params);
+
+bool duplex_init_emb_cache_for_runtime(omni_context * ctx_omni, common_params * params) {
+    return duplex_init_emb_cache(ctx_omni, params);
+}
 
 bool duplex_prepare(omni_context * ctx_omni, common_params * params) {
     if (!ctx_omni || !ctx_omni->duplex_mode || !params) return false;
@@ -46,7 +51,7 @@ void duplex_start_threads(omni_context * ctx_omni, common_params * params) {
 
     dup->running.store(true);
 
-    // Stage 3: 懒加载 special-token embedding。失败不是致命错误，fused 路径会自动回退。
+    // Load the token embedding metadata before the worker starts.
     if (!ctx_omni->emb_cache.initialized) {
         duplex_init_emb_cache(ctx_omni, params);
     }
@@ -105,11 +110,23 @@ void duplex_stop_threads(omni_context * ctx_omni) {
 // GPU 已在 vision 层同步过（回调在分段计算之后、下段计算之前触发）。
 static void sm_vpm_segment_cb(int segment_id, int segment_count, void * user_data) {
     if (segment_id + 1 >= segment_count) return;
-    sm_segment_boundary(*static_cast<SmSched *>(user_data), SM_BIT_VPM);
+    auto & s = *(SmSched *) user_data;
+    const int64_t t0 = ggml_time_us();
+    const char * profile = std::getenv("OMNI_VPM_PROFILE");
+    if (profile != nullptr && std::atoi(profile) != 0) {
+        std::fprintf(stderr, "[VPM PROF] sm_boundary_enter segment=%d/%d t=%.3fms\n",
+                     segment_id, segment_count, ggml_time_us() / 1000.0);
+    }
+    sm_segment_boundary(s, SM_BIT_VPM);
+    if (profile != nullptr && std::atoi(profile) != 0) {
+        std::fprintf(stderr, "[VPM PROF] sm_boundary segment=%d/%d elapsed=%.3fms t=%.3fms\n",
+                     segment_id, segment_count, (ggml_time_us() - t0) / 1000.0,
+                     ggml_time_us() / 1000.0);
+    }
 }
 
 static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * params) {
-    print_with_timestamp("Duplex: encoder_thread started (Stage 2: VPM || APM)\n");
+    print_with_timestamp("Duplex: encoder_thread started (VPM || APM)\n");
     DuplexPipeline * dup = ctx_omni->duplex;
     const int hidden_size = llama_n_embd(llama_get_model(ctx_omni->ctx_llama));
 
@@ -238,36 +255,79 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
 }
 
 // ---------------------------------------------------------------------------
-// llm thread 的辅助：把 prefill packet 按多段 eval 序列写入 KV cache。
-// 这是 fused prefill（duplex_do_prefill_one_fused）失败时的回退路径。
+// Debug-only segmented prefill implementation.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Stage 3: 从 LLM gguf 读 token_embd.weight，把 duplex prefill 里用到的
-// 固定 special-token 字符串 tokenize 后 dequantize 成 fp32 embedding，
-// 供 fused prefill 路径一次性拼入 embed buffer。
-//
-// 内存占用：最多 10 来个 token × 4096 float × 4B ≈ 200KB。
-// 失败（gguf 打不开 / tensor 类型不支持 dequantize）时返回 false，
-// fused prefill 自动回退到多段 llama_decode 的老路径。
+// Read token_embd.weight metadata from the LLM GGUF. Fixed protocol markers
+// are cached immediately. Other token rows are read and dequantized on demand.
 // ---------------------------------------------------------------------------
-static bool duplex_dequantize_row(const struct ggml_tensor * t, int64_t row_idx,
-                                  int64_t hidden_size, std::vector<float> & out) {
-    const auto * traits = ggml_get_type_traits(t->type);
-    if (!traits || !traits->to_float) {
-        LOG_WRN("duplex_emb_cache: type %d has no to_float traits\n", (int)t->type);
+bool duplex_tokens_to_embeddings(omni_context * ctx_omni,
+                                 const std::vector<llama_token> & tokens,
+                                 std::vector<float> & embeddings) {
+    if (!ctx_omni || !ctx_omni->emb_cache.initialized) {
         return false;
     }
-    // ne[0]=hidden_size, ne[1]=vocab_size, memory layout row-major [vocab, hidden]
-    // 每行字节数 = (hidden_size / blck_size) * type_size
-    if (traits->blck_size <= 0 || hidden_size % traits->blck_size != 0) {
-        LOG_WRN("duplex_emb_cache: hidden %lld not divisible by blck_size %lld\n",
-                (long long)hidden_size, (long long)traits->blck_size);
+
+    DuplexTokenEmbCache & cache = ctx_omni->emb_cache;
+    const ggml_type type = static_cast<ggml_type>(cache.tensor_type);
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    if (type != GGML_TYPE_F32 && (!traits || !traits->to_float)) {
         return false;
     }
-    const size_t bytes_per_row = (hidden_size / traits->blck_size) * traits->type_size;
-    const char * row_data = (const char *)t->data + (size_t)row_idx * bytes_per_row;
-    out.resize(hidden_size);
-    traits->to_float(row_data, out.data(), hidden_size);
+
+    std::ifstream input;
+    embeddings.reserve(embeddings.size() +
+                       tokens.size() * static_cast<size_t>(cache.hidden_size));
+    for (llama_token token : tokens) {
+        if (token < 0 || token >= cache.vocab_size) {
+            LOG_WRN("duplex_emb_cache: token id %d out of vocab %d\n",
+                    static_cast<int>(token), cache.vocab_size);
+            return false;
+        }
+
+        auto cached = cache.token_emb.find(token);
+        if (cached == cache.token_emb.end()) {
+            if (cache.token_emb.size() >= 4096) {
+                cache.token_emb.clear();
+            }
+            if (!input.is_open()) {
+                input.open(cache.model_path, std::ios::binary);
+                if (!input) {
+                    LOG_WRN("duplex_emb_cache: failed to open '%s'\n",
+                            cache.model_path.c_str());
+                    return false;
+                }
+            }
+
+            const size_t offset = cache.data_offset +
+                                  static_cast<size_t>(token) * cache.row_bytes;
+            input.clear();
+            input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+            if (!input) {
+                LOG_WRN("duplex_emb_cache: seek failed for token %d\n",
+                        static_cast<int>(token));
+                return false;
+            }
+
+            std::vector<uint8_t> row(cache.row_bytes);
+            input.read(reinterpret_cast<char *>(row.data()),
+                       static_cast<std::streamsize>(row.size()));
+            if (!input) {
+                LOG_WRN("duplex_emb_cache: read failed for token %d\n",
+                        static_cast<int>(token));
+                return false;
+            }
+
+            std::vector<float> values(static_cast<size_t>(cache.hidden_size));
+            if (type == GGML_TYPE_F32) {
+                std::memcpy(values.data(), row.data(), values.size() * sizeof(float));
+            } else {
+                traits->to_float(row.data(), values.data(), cache.hidden_size);
+            }
+            cached = cache.token_emb.emplace(token, std::move(values)).first;
+        }
+        embeddings.insert(embeddings.end(), cached->second.begin(), cached->second.end());
+    }
     return true;
 }
 
@@ -282,7 +342,7 @@ static bool duplex_init_emb_cache(omni_context * ctx_omni, common_params * param
     }
 
     struct ggml_context * ctx_meta = NULL;
-    struct gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &ctx_meta };
+    struct gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ &ctx_meta };
     struct gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!ctx_gguf) {
         LOG_WRN("duplex_emb_cache: failed to open llm gguf '%s'\n", gguf_path.c_str());
@@ -310,7 +370,31 @@ static bool duplex_init_emb_cache(omni_context * ctx_omni, common_params * param
         if (ctx_meta) ggml_free(ctx_meta);
         return false;
     }
-    ctx_omni->emb_cache.hidden_size = (int)hidden;
+    const ggml_type type = emb_t->type;
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    if (type != GGML_TYPE_F32 && (!traits || !traits->to_float)) {
+        LOG_WRN("duplex_emb_cache: type %s cannot be converted to float\n",
+                ggml_type_name(type));
+        gguf_free(ctx_gguf);
+        if (ctx_meta) ggml_free(ctx_meta);
+        return false;
+    }
+
+    DuplexTokenEmbCache & cache = ctx_omni->emb_cache;
+    const size_t row_bytes = ggml_row_size(type, hidden);
+    if (emb_t->nb[1] != row_bytes) {
+        LOG_WRN("duplex_emb_cache: unsupported token embedding row stride\n");
+        gguf_free(ctx_gguf);
+        if (ctx_meta) ggml_free(ctx_meta);
+        return false;
+    }
+    cache.hidden_size = static_cast<int>(hidden);
+    cache.vocab_size = static_cast<int>(vocab);
+    cache.tensor_type = static_cast<int>(type);
+    cache.row_bytes = row_bytes;
+    cache.data_offset = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, emb_idx);
+    cache.model_path = gguf_path;
+    cache.initialized = true;
 
     // 需要缓存的固定字符串。为了和老 duplex_do_prefill_one 严格对齐，
     // 每个字符串都用 llama_tokenize 拿到 token id 序列，逐 row dequantize 拼接。
@@ -331,59 +415,49 @@ static bool duplex_init_emb_cache(omni_context * ctx_omni, common_params * param
             continue;
         }
         std::vector<float> buf;
-        buf.reserve(toks.size() * (size_t)hidden);
-        bool ok = true;
-        for (auto id : toks) {
-            if (id < 0 || (int64_t)id >= vocab) {
-                LOG_WRN("duplex_emb_cache: token id %d out of vocab %lld\n",
-                        (int)id, (long long)vocab);
-                ok = false; break;
-            }
-            std::vector<float> row;
-            if (!duplex_dequantize_row(emb_t, id, hidden, row)) { ok = false; break; }
-            buf.insert(buf.end(), row.begin(), row.end());
-            total_rows_loaded++;
+        if (!duplex_tokens_to_embeddings(ctx_omni, toks, buf)) {
+            cache.initialized = false;
+            break;
         }
-        if (!ok) continue;
-        ctx_omni->emb_cache.text_ntok[text] = (int)toks.size();
-        ctx_omni->emb_cache.text_emb[text]  = std::move(buf);
+        total_rows_loaded += static_cast<int>(toks.size());
+        cache.text_ntok[text] = static_cast<int>(toks.size());
+        cache.text_emb[text] = std::move(buf);
     }
 
     // 注意：先在释放 ctx_meta 之前拷贝所有需要的 metadata，避免 use-after-free
-    const char * type_name_cached = ggml_type_name(emb_t->type);
+    const char * type_name_cached = ggml_type_name(type);
     std::string type_name_str(type_name_cached ? type_name_cached : "?");
 
     gguf_free(ctx_gguf);
     if (ctx_meta) ggml_free(ctx_meta);
 
-    if (ctx_omni->emb_cache.text_emb.empty()) {
+    if (!cache.initialized || cache.text_emb.size() != fixed_texts.size()) {
         LOG_WRN("duplex_emb_cache: no text embed cached, fused prefill disabled\n");
+        cache = DuplexTokenEmbCache{};
         return false;
     }
 
-    ctx_omni->emb_cache.initialized = true;
     print_with_timestamp(
-        "[Duplex Stage 3] emb_cache initialized: %zu texts, %d rows, hidden=%d, src=%s\n",
-        ctx_omni->emb_cache.text_emb.size(), total_rows_loaded, (int)hidden,
+        "[Duplex] emb_cache initialized: %zu texts, %d rows, hidden=%d, src=%s\n",
+        cache.text_emb.size(), total_rows_loaded, (int)hidden,
         type_name_str.c_str());
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: fused prefill 路径（薄包装，转发到 compute 层 llm_fused_prefill）。
+// Fused prefill wrapper around the compute-layer implementation.
 // 把一个 chunk 的 "<unit><image>" + vision_embed + "</image>" + (slices)
 // + audio_embed 拼成单块 buffer，一次 prefill_with_emb 写入 KV，
 // 消除原来 5~7 次小 llama_decode 的 kernel launch 开销。
 //
-// 如果 emb_cache 未初始化（llm_fused_prefill 内部检查），回退到原始多段路径
-// （duplex_do_prefill_one）。
+// Segmented execution is available only when OMNI_DEBUG_SEGMENTED_PREFILL is set.
 // ---------------------------------------------------------------------------
 static bool duplex_do_prefill_one_fused(omni_context * ctx_omni, common_params * params,
                                         DuplexFrame * frame,
                                         int hidden_size,
                                         int * out_fused_ntok = nullptr) {
     return llm_fused_prefill(ctx_omni, params, frame->vision_embed, frame->audio_embed,
-                             hidden_size, out_fused_ntok);
+                             hidden_size, out_fused_ntok, frame->input_text);
 }
 
 static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * params,
@@ -444,6 +518,10 @@ static void duplex_do_prefill_one(omni_context * ctx_omni, common_params * param
                                  n_audio_tokens, params->n_batch, &ctx_omni->n_past);
             }
         }
+        if (!frame->input_text.empty()) {
+            eval_string(ctx_omni, params, frame->input_text.c_str(),
+                        params->n_batch, &ctx_omni->n_past, false);
+        }
 
         if (ctx_omni->sliding_window_config.mode != "off") {
             std::string input_type = has_vision ? "omni" : "audio";
@@ -492,6 +570,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
     auto t_dec_begin = ctx_omni->stream_decode_start_time;
     int  n_past_dec_0 = ctx_omni->n_past;
 
+    // 逐 token 步计时：OMNI_DECODE_STEP_PROFILE=1 时每步(单 token llama_decode)打一行。
+    // step_ms 只框住该步 llama_loop（返回即 embeddings 已拷回 host、GPU 已同步），
+    // 不含 chunk 推送与 SM 段边界让出，即该步的 decode 计算时延。
+    const char * llm_step_prof_env = std::getenv("OMNI_DECODE_STEP_PROFILE");
+    const bool   llm_step_profile  = llm_step_prof_env != nullptr && std::atoi(llm_step_prof_env) != 0;
+    int          llm_step_idx      = 0;   // 本 decode 段的步号（从 1 起，跨 chunk 连续）
 
     print_with_timestamp("[DUPLEX CONTRACT] frame=%d stage=D ctx_owner=llm_thread n_past_before=%d n_keep=%d n_ctx=%d prefill_complete=1\n",
                          round_idx, ctx_omni->n_past, ctx_omni->n_keep, params->n_ctx);
@@ -594,11 +678,21 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             float *      hidden_states = nullptr;
             llama_token  sampled_token = 0;
 
+            const auto t_step_begin = std::chrono::high_resolution_clock::now();
             tmp = llama_loop_with_hidden_and_token(
                 ctx_omni, params, ctx_omni->ctx_sampler,
                 ctx_omni->n_past, hidden_states, sampled_token);
+            const double step_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t_step_begin).count();
 
+            ++llm_step_idx;
             total_tokens_generated++;
+
+            if (llm_step_profile) {
+                print_with_timestamp(
+                    "[LLM STEP] frame=%d step=%d step_ms=%.3f tok=%d n_past=%d\n",
+                    round_idx, llm_step_idx, step_ms, (int)sampled_token, ctx_omni->n_past);
+            }
 
             // 本帧首个输出 token 的绝对 wall 时间（epoch ms）
             if (!req_first_token_logged) {
@@ -894,19 +988,31 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
         }
         dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位 / duplex_decode 在等槽位
 
-        // ---- prefill（fused 优先，失败回退多段） ----
+        // ---- prefill ----
         bool prefill_ok = false;
         if (frame->cancel_generation == dup->cancel_generation.load()) {
             if (frame->encode_ok) {
                 sm_enter(ctx_omni->sm_sched, SM_BIT_LLM);   // LLM prefill 段租约
                 const int prefill_selected = ctx_omni->sm_sched.applied_plan;
-                if (!duplex_do_prefill_one_fused(ctx_omni, params, frame, hidden_size)) {
-                    duplex_do_prefill_one(ctx_omni, params, frame, hidden_size);
+                const int32_t prefill_start = ctx_omni->n_past;
+                prefill_ok = duplex_do_prefill_one_fused(ctx_omni, params, frame, hidden_size);
+                if (!prefill_ok) {
+                    const bool rollback_ok = llama_memory_seq_rm(
+                        llama_get_memory(ctx_omni->ctx_llama), 0, prefill_start, -1);
+                    if (rollback_ok) {
+                        ctx_omni->n_past = prefill_start;
+                    }
+                    const char * segmented_debug = std::getenv("OMNI_DEBUG_SEGMENTED_PREFILL");
+                    if (rollback_ok && segmented_debug && std::atoi(segmented_debug) != 0) {
+                        duplex_do_prefill_one(ctx_omni, params, frame, hidden_size);
+                        prefill_ok = true;
+                    } else {
+                        LOG_ERR("duplex fused prefill failed\n");
+                    }
                 }
                 sm_exit(ctx_omni->sm_sched, SM_BIT_LLM);           // prefill 段结束，注销租约
                 sm_task_finish(ctx_omni->sm_sched, prefill_selected, SM_BIT_LLM, "prefill",
                                (uint64_t) frame->index);
-                prefill_ok = true;
             }
             print_with_timestamp("[DUPLEX CONTRACT] frame=%d stage=P ctx_owner=llm_thread kv_written=%d n_past_after=%d\n",
                                  frame->index, prefill_ok ? 1 : 0, ctx_omni->n_past);
@@ -958,7 +1064,8 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
 bool duplex_prefill(omni_context * ctx_omni,
                            const std::string & aud_fname,
                            const std::string & img_fname,
-                           int index, int max_slice_nums) {
+                           int index, int max_slice_nums,
+                           const std::string & text) {
     if (!ctx_omni || !ctx_omni->duplex) {
         LOG_ERR("duplex_prefill: pipeline not initialized\n");
         return false;
@@ -974,6 +1081,7 @@ bool duplex_prefill(omni_context * ctx_omni,
     frame->input.aud_fname      = aud_fname;
     frame->input.img_fname      = img_fname;
     frame->input.max_slice_nums = max_slice_nums;
+    frame->input_text = text;
     frame->session_frame        = false;
     frame->cancel_generation    = dup->cancel_generation.load();
     frame->t_push               = std::chrono::high_resolution_clock::now();
@@ -1061,7 +1169,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     // 下方主体（本次 if 之后的部分）是非 duplex 的旧同步/异步实现。
     if (ctx_omni->duplex_mode && ctx_omni->async && index > 0
         && ctx_omni->system_prompt_initialized && ctx_omni->duplex != nullptr) {
-        return duplex_prefill(ctx_omni, aud_fname, img_fname, index, max_slice_nums);
+        return duplex_prefill(ctx_omni, aud_fname, img_fname, index, max_slice_nums, text);
     }
 
     // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
@@ -1260,11 +1368,11 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
 
             if (ctx_omni->use_tts && !ctx_omni->tts_thread.joinable()) {
                 tts_thread_running = true;
+                // 按 duplex_mode 选择 TTS 线程函数
 #if OMNI_REPLACEMENT_TTS_T2W
                 ctx_omni->tts_thread = std::thread(omni_tts_replacement_thread_func, ctx_omni, ctx_omni->params);
                 print_with_timestamp("create tts replacement thread success\n");
 #else
-                // 按 duplex_mode 选择 TTS 线程函数
                 if (ctx_omni->duplex_mode) {
                     ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
                     print_with_timestamp("create tts thread (duplex mode) success\n");

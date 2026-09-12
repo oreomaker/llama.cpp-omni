@@ -465,6 +465,7 @@ void sm_sched_init(struct omni_context * ctx_omni) {
 void sm_enter(SmSched &, uint32_t) {}
 void sm_segment_boundary(SmSched &, uint32_t) {}
 void sm_exit(SmSched &, uint32_t) {}
+void sm_task_finish(SmSched &, int, uint32_t, const char *, uint64_t) {}
 void sm_sched_free(SmSched &) {}
 void sm_sched_init(struct omni_context *) {}
 #endif

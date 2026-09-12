@@ -90,6 +90,14 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 //
+// selected token embeddings (after the final output norm)
+//
+
+// Enable embeddings only for rows selected by batch.logits. Requires pooling NONE.
+// llama_set_embeddings() restores the default all-token behavior.
+LLAMA_API bool llama_set_embeddings_masked(struct llama_context * ctx, bool value);
+
+//
 // pre-norm embeddings (hidden state before the final output norm)
 //
 

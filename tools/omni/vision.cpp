@@ -33,6 +33,8 @@
 
 struct omni_logger_state g_logger_state = {GGML_LOG_LEVEL_CONT, omni_log_callback_default, NULL};
 
+static bool vision_profile_enabled();
+
 enum ffn_op_type {
     FFN_GELU,
     FFN_GELU_ERF,
@@ -349,6 +351,7 @@ struct vision_graph {
         ggml_tensor * learned_pos_embd = ggml_get_rows(ctx0, model.position_embeddings, positions);
 
         ggml_tensor * inp = build_inp();
+        ggml_set_name(inp, "vit_stem_out");
         ggml_tensor * embeddings = build_vit(
                                 inp, n_patches,
                                 NORM_TYPE_NORMAL,
@@ -475,6 +478,7 @@ struct vision_graph {
 
         // patch embedding + positional embedding
         ggml_tensor * inp = build_inp();
+        ggml_set_name(inp, "vit_stem_out");
         inp = ggml_add(ctx0, inp, learned_pos_embd);
         cb(inp, "pos_embed", -1);
 
@@ -1619,6 +1623,10 @@ struct vision_model_loader {
     }
 };
 
+struct vision_shared_model {
+    vision_ctx * owner = nullptr;
+};
+
 struct vision_ctx * vision_init(const char * fname, struct vision_context_params ctx_params) {
     g_logger_state.verbosity_thold = ctx_params.verbosity;
     vision_ctx * ctx_vision = nullptr;
@@ -1637,6 +1645,68 @@ struct vision_ctx * vision_init(const char * fname, struct vision_context_params
         return nullptr;
     }
     return ctx_vision;
+}
+
+vision_shared_model * vision_shared_init(const char * fname, vision_context_params ctx_params) {
+    vision_ctx * owner = vision_init(fname, ctx_params);
+    if (!owner) {
+        return nullptr;
+    }
+    auto * shared = new vision_shared_model();
+    shared->owner = owner;
+    return shared;
+}
+
+vision_ctx * vision_shared_clone(vision_shared_model * shared) {
+    if (!shared || !shared->owner) {
+        return nullptr;
+    }
+    vision_ctx * clone = nullptr;
+    try {
+        vision_context_params params{true, GGML_LOG_LEVEL_WARN, nullptr};
+        clone = new vision_ctx(params);
+        clone->model = shared->owner->model;
+        clone->max_nodes = shared->owner->max_nodes;
+        clone->max_slice_nums_override = shared->owner->max_slice_nums_override;
+        clone->batch_encode = shared->owner->batch_encode;
+        clone->coreml_model_path = shared->owner->coreml_model_path;
+        clone->buf_compute_meta.resize(clone->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead());
+
+        vision_image_f32_batch batch;
+        vision_image_f32_ptr img(vision_image_f32_init());
+        img->nx = clone->model.hparams.warmup_image_size;
+        img->ny = clone->model.hparams.warmup_image_size;
+        batch.entries.push_back(std::move(img));
+        ggml_cgraph * gf = vision_image_build_graph(clone, batch);
+        ggml_backend_sched_reserve(clone->sched.get(), gf);
+        return clone;
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: failed to clone shared model: %s\n", __func__, e.what());
+    } catch (...) {
+        LOG_ERR("%s: failed to clone shared model\n", __func__);
+    }
+    delete clone;
+    return nullptr;
+}
+
+void vision_shared_free(vision_shared_model * shared) {
+    if (!shared) {
+        return;
+    }
+    vision_free(shared->owner);
+    delete shared;
+}
+
+void vision_shared_set_batch_encode(vision_shared_model * shared, bool enable) {
+    if (shared && shared->owner) {
+        vision_set_batch_encode(shared->owner, enable);
+    }
+}
+
+void vision_shared_set_coreml_model_path(vision_shared_model * shared, const char * path) {
+    if (shared && shared->owner) {
+        vision_set_coreml_model_path(shared->owner, path);
+    }
 }
 
 void vision_free(vision_ctx * ctx) {
@@ -2126,6 +2196,8 @@ private:
 };
 
 bool vision_image_preprocess(struct vision_ctx * ctx, const vision_image_u8 * img, struct vision_image_f32_batch * res_imgs) {
+    const bool profile = vision_profile_enabled();
+    const int64_t t_instructions_start_us = ggml_time_us();
     vision_image_size original_size{img->nx, img->ny};
     auto & params = ctx->model.hparams;
 
@@ -2136,13 +2208,25 @@ bool vision_image_preprocess(struct vision_ctx * ctx, const vision_image_u8 * im
             //             see llama.cpp tools/mtmd/mtmd.cpp::PROJECTOR_TYPE_MINICPMV4_6
             //             (PR currently shares MiniCPM-o's bicubic path for the o-4.6 vit)
             auto const inst = llava_uhd::get_slice_instructions(ctx, original_size);
+            const double instructions_ms = (ggml_time_us() - t_instructions_start_us) / 1000.0;
+            const int64_t t_slice_start_us = ggml_time_us();
             std::vector<vision_image_u8_ptr> imgs = llava_uhd::slice_image(img, inst);
+            const double slice_ms = (ggml_time_us() - t_slice_start_us) / 1000.0;
 
+            const int64_t t_normalize_start_us = ggml_time_us();
             for (size_t i = 0; i < imgs.size(); ++i) {
                 // vision_image_save_to_bmp(*imgs[i], "slice_" + std::to_string(i) + ".bmp");
                 vision_image_f32_ptr res(vision_image_f32_init());
                 normalize_image_u8_to_f32(*imgs[i], *res, params.image_mean, params.image_std);
                 res_imgs->entries.push_back(std::move(res));
+            }
+            if (profile) {
+                std::fprintf(stderr,
+                             "[VPM PROF] preprocess_parts instructions=%.3fms slice_resize=%.3fms normalize=%.3fms slices=%zu\n",
+                             instructions_ms,
+                             slice_ms,
+                             (ggml_time_us() - t_normalize_start_us) / 1000.0,
+                             imgs.size());
             }
 
             res_imgs->grid_x = inst.grid_size.width;
@@ -2322,7 +2406,18 @@ struct vision_block_group_eval_state {
     vision_block_group_profile * profile = nullptr;
     vision_segment_callback_t callback = nullptr;
     void * callback_user_data = nullptr;
+    bool profile_stem = false;
 };
+
+static bool vision_profile_enabled() {
+    const char * value = std::getenv("OMNI_VPM_PROFILE");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
+static bool vision_is_stem_output(const ggml_tensor * tensor) {
+    const char * name = tensor != nullptr ? ggml_get_name(tensor) : nullptr;
+    return name != nullptr && std::strcmp(name, "vit_stem_out") == 0;
+}
 
 static int vision_block_output_layer(const ggml_tensor * tensor) {
     static constexpr char prefix[] = "vit_block_";
@@ -2342,22 +2437,39 @@ static int vision_block_output_layer(const ggml_tensor * tensor) {
 static bool vision_block_group_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * state = static_cast<vision_block_group_eval_state *>(user_data);
     const int layer = vision_block_output_layer(tensor);
+    const bool stem_boundary = state->profile_stem && vision_is_stem_output(tensor);
     const bool boundary = layer >= 0 && layer + 1 < state->n_layers &&
         (layer + 1) % state->group_size == 0;
     if (ask) {
-        return boundary;
+        return stem_boundary || boundary;
     }
-    if (!boundary) {
+    if (!stem_boundary && !boundary) {
         return true;
     }
 
     const auto now = std::chrono::steady_clock::now();
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(now - state->segment_start).count();
+    if (stem_boundary) {
+        if (vision_profile_enabled()) {
+            std::fprintf(stderr, "[VPM PROF] stem patch_embedding=%.3fms t=%.3fms\n",
+                         elapsed_ms, ggml_time_us() / 1000.0);
+        }
+        state->segment_start = now;
+        return true;
+    }
     if (state->profile != nullptr) {
         state->profile->segments.push_back({
             state->last_boundary_layer + 1,
             layer,
-            std::chrono::duration<double, std::milli>(now - state->segment_start).count(),
+            elapsed_ms,
         });
+    }
+    if (vision_profile_enabled()) {
+        const int segment_id = (layer + 1) / state->group_size - 1;
+        std::fprintf(stderr, "[VPM PROF] blocks segment=%d/%d layers=%d-%d compute=%.3fms t=%.3fms\n",
+                     segment_id, (state->n_layers + state->group_size - 1) / state->group_size,
+                     state->last_boundary_layer + 1, layer, elapsed_ms,
+                     ggml_time_us() / 1000.0);
     }
     if (state->callback != nullptr) {
         const int segment_id = (layer + 1) / state->group_size - 1;
@@ -2368,6 +2480,7 @@ static bool vision_block_group_eval_callback(ggml_tensor * tensor, bool ask, voi
     state->segment_start = now;
     return true;
 }
+
 static bool vision_image_batch_encode_impl(
         vision_ctx * ctx,
         const int n_threads,
@@ -2379,6 +2492,7 @@ static bool vision_image_batch_encode_impl(
         void * callback_user_data) {
     const vision_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
+    const int64_t t_graph_setup_start_us = ggml_time_us();
 
     if (batch_size < 1) {
         return false;
@@ -2400,12 +2514,17 @@ static bool vision_image_batch_encode_impl(
 
     // build the inference graph
     ctx->debug_print_tensors.clear();
+    const int64_t t_graph_build_start_us = ggml_time_us();
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = vision_image_build_graph(ctx, imgs);
+    const double graph_build_ms = (ggml_time_us() - t_graph_build_start_us) / 1000.0;
 
+    const int64_t t_graph_alloc_start_us = ggml_time_us();
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    const double graph_alloc_ms = (ggml_time_us() - t_graph_alloc_start_us) / 1000.0;
 
     // set inputs
+    const int64_t t_input_setup_start_us = ggml_time_us();
     const auto & model   = ctx->model;
     const auto & hparams = model.hparams;
 
@@ -2433,14 +2552,24 @@ static bool vision_image_batch_encode_impl(
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
+        const int64_t t0 = ggml_time_us();
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+        if (vision_profile_enabled()) {
+            std::fprintf(stderr, "[VPM PROF] input_f32 name=%s bytes=%zu elapsed=%.3fms\n",
+                         name, ggml_nbytes(cur), (ggml_time_us() - t0) / 1000.0);
+        }
     };
 
     auto set_input_i32 = [&get_inp_tensor](const char * name, const std::vector<int32_t> & values) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
+        const int64_t t0 = ggml_time_us();
         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+        if (vision_profile_enabled()) {
+            std::fprintf(stderr, "[VPM PROF] input_i32 name=%s bytes=%zu elapsed=%.3fms\n",
+                         name, ggml_nbytes(cur), (ggml_time_us() - t0) / 1000.0);
+        }
     };
 
     // set input pixel values for all images in the batch
@@ -2469,6 +2598,7 @@ static bool vision_image_batch_encode_impl(
     switch (ctx->model.model_type) {
         case MiniCPM_o:
             {
+                const int64_t t_positions_start_us = ggml_time_us();
                 std::vector<int32_t> positions(pos_h * pos_w);
                 int bucket_coords_h[1024];
                 int bucket_coords_w[1024];
@@ -2484,6 +2614,7 @@ static bool vision_image_batch_encode_impl(
                     }
                 }
                 set_input_i32("positions", positions);
+                const double positions_ms = (ggml_time_us() - t_positions_start_us) / 1000.0;
 
                 int embed_dim = vision_n_mmproj_embd(ctx);
 
@@ -2491,22 +2622,34 @@ static bool vision_image_batch_encode_impl(
                     && ctx->pos_embed_cache_h == pos_h
                     && ctx->pos_embed_cache_dim == embed_dim
                     && ctx->pos_embed_cache.size() == (size_t) embed_dim * pos_w * pos_h;
+                double pos_embed_math_ms = 0.0;
+                double pos_embed_pack_ms = 0.0;
                 if (!pos_cache_hit) {
+                    const int64_t t_pos_embed_start_us = ggml_time_us();
                     auto pos_embed_t = get_2d_sincos_pos_embed(embed_dim, std::make_pair(pos_w, pos_h));
+                    pos_embed_math_ms = (ggml_time_us() - t_pos_embed_start_us) / 1000.0;
 
                     // pos_embed is [embed_dim, n_pos, 1] — same for all batch elements (broadcast)
+                    const int64_t t_pos_embed_pack_start_us = ggml_time_us();
                     ctx->pos_embed_cache.resize((size_t) embed_dim * pos_w * pos_h);
                     for (int i = 0; i < pos_w * pos_h; ++i) {
                         for (int j = 0; j < embed_dim; ++j) {
                             ctx->pos_embed_cache[(size_t) i * embed_dim + j] = pos_embed_t[i][j];
                         }
                     }
+                    pos_embed_pack_ms = (ggml_time_us() - t_pos_embed_pack_start_us) / 1000.0;
                     ctx->pos_embed_cache_w = pos_w;
                     ctx->pos_embed_cache_h = pos_h;
                     ctx->pos_embed_cache_dim = embed_dim;
                 }
 
                 set_input_f32("pos_embed", ctx->pos_embed_cache);
+                if (vision_profile_enabled()) {
+                    std::fprintf(stderr,
+                                 "[VPM PROF] input_prepare positions=%.3fms pos_math=%.3fms pos_pack=%.3fms shape=%dx%d emb=%d cache=%s\n",
+                                 positions_ms, pos_embed_math_ms, pos_embed_pack_ms,
+                                 pos_w, pos_h, embed_dim, pos_cache_hit ? "hit" : "miss");
+                }
             } break;
         case MiniCPM_o_4_6:
             {
@@ -2602,6 +2745,14 @@ static bool vision_image_batch_encode_impl(
         }
     }
 
+    if (vision_profile_enabled()) {
+        std::fprintf(stderr, "[VPM PROF] graph_setup=%.3fms nodes=%d images=%d t=%.3fms\n",
+                     (ggml_time_us() - t_graph_setup_start_us) / 1000.0,
+                     ggml_graph_n_nodes(gf), batch_size, ggml_time_us() / 1000.0);
+        std::fprintf(stderr, "[VPM PROF] graph_parts build=%.3fms alloc=%.3fms inputs=%.3fms\n",
+                     graph_build_ms, graph_alloc_ms,
+                     (ggml_time_us() - t_input_setup_start_us) / 1000.0);
+    }
 
     vision_block_group_eval_state group_state;
     if (profile != nullptr) {
@@ -2617,6 +2768,7 @@ static bool vision_image_batch_encode_impl(
         group_state.profile = profile;
         group_state.callback = callback;
         group_state.callback_user_data = callback_user_data;
+        group_state.profile_stem = vision_profile_enabled();
         group_state.segment_start = std::chrono::steady_clock::now();
         ggml_backend_sched_set_eval_callback(
             ctx->sched.get(), vision_block_group_eval_callback, &group_state);
@@ -2629,6 +2781,13 @@ static bool vision_image_batch_encode_impl(
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    if (vision_profile_enabled() && block_group_size > 0 && block_group_size < hparams.n_layer) {
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+            compute_end - group_state.segment_start).count();
+        std::fprintf(stderr, "[VPM PROF] blocks final layers=%d-%d compute=%.3fms t=%.3fms\n",
+                     group_state.last_boundary_layer + 1, hparams.n_layer - 1,
+                     elapsed_ms, ggml_time_us() / 1000.0);
     }
     if (profile != nullptr) {
         if (block_group_size > 0 && block_group_size < hparams.n_layer) {

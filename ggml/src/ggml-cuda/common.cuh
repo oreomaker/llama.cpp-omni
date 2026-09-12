@@ -1397,12 +1397,14 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-    // per-backend CUDA graph 开关：由 ggml_backend_cuda_set_disable_graph 设置。true 时本
-    // backend 的 graph_compute 强制走 eager（不 capture/replay），用于按组件关闭图而不影响其它 backend。
+    // 🔧 [per-backend CUDA graph 开关] 由 proc-address 扩展 ggml_backend_cuda_set_disable_graph 设置。
+    // true 时本 backend 的 graph_compute 强制走 eager（不 capture/replay），用于把单个组件（如 flow）
+    // 的图关掉做归因/修复，而不影响其它 backend。见 SM_GC_55/56 归因。
     bool disable_graphs = false;
 
-    // Green Context / SM 限制（可选）。环境变量 GGML_CUDA_N_SMS > 0 时，本 backend 创建
-    // green context 并只使用该数量的 SM，用于单卡多模型流水线的组件 SM 测量。
+    // 🔧 [Green Context / SM 限制] 可选。
+    // 环境变量 GGML_CUDA_N_SMS > 0 时，本 backend 创建 green context 并只使用该数量的 SM，
+    // 用于单卡多模型流水线的每组件最小 SM 测量（见 tools/omni/smbench/）。
     // green_n_sms == 0 时保持原行为（primary context 全 SM）。
     // green context runtime API 需要 CUDA >= 13.1（CUDART_VERSION >= 13010）。
     int green_n_sms = 0;
@@ -1410,8 +1412,8 @@ struct ggml_backend_cuda_context {
     cudaExecutionContext_t green_ctx = nullptr;
 
     // 显式 SM 计划路径（ggml_backend_cuda_init_sm）：backend 直接持有协调 split 出的
-    // 一个 disjoint 分组，避免多 backend 并发时 per-backend 各自 split 导致 SM 重叠/时间片。
-    // green_has_resource 优先于 green_n_sms。
+    // 一个 disjoint 分组，避免多 backend 并发时 per-backend 各自 split 导致 SM 重叠/时间片
+    // （见 tools/omni/SM_MULTI_GC_HARNESS.md §4.1）。green_has_resource 优先于 green_n_sms。
     bool green_has_resource = false;
     cudaDevResource green_sm_resource = {};
     // 可选：balanced workqueue 配置（descriptor 里同时带 SM + workqueue 两类资源）
@@ -1423,8 +1425,8 @@ struct ggml_backend_cuda_context {
     // 缓存里的 EC 由析构统一销毁；green_ctx 若不在缓存里则单独销毁（见 ggml-cuda.cu 析构函数）。
     std::unordered_map<int, cudaExecutionContext_t> green_ctx_cache;
 
-    // 按 cache_key 缓存 stream，与下方 cuda_graphs 一起换槽，切回同一分组时零重建 stream /
-    // 零重捕获 graph。sm_slot_key = 当前 streams/cuda_graphs 所属的 cache_key
+    // Phase 2（SM_GC_60 §7）：按 cache_key 缓存 stream，与下方 cuda_graphs 一起换槽，切回同一分组时
+    // 零重建 stream / 零重捕获 graph。sm_slot_key = 当前 streams/cuda_graphs 所属的 cache_key
     // （-1 = 初始 EC，不进缓存，切走时销毁）。缓存槽里的 EC 一定在 green_ctx_cache 中、不会被销毁，
     // 故其 stream/graphExec 保持有效。
     int sm_slot_key = -1;
@@ -1437,9 +1439,21 @@ struct ggml_backend_cuda_context {
     // arena address from continuously resetting one shared graph entry.
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    // 切走的分组的 cuda_graphs 暂存于此（按 cache_key），切回时 move 回
+    // Phase 2（SM_GC_60 §7）：切走的分组的 cuda_graphs 暂存于此（按 cache_key），切回时 move 回
     // cuda_graphs，避免每次切换重捕获。与 sm_stream_slots 配套换槽。
     std::unordered_map<int, std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>>> sm_graph_slots;
+
+    uint64_t graph_hits = 0;
+    uint64_t graph_misses = 0;
+    uint64_t graph_captures = 0;
+    uint64_t graph_slot_hits = 0;
+    uint64_t graph_slot_misses = 0;
+    uint64_t graph_property_misses = 0;
+    uint64_t graph_warmup_resets = 0;
+    uint64_t graph_event_serial = 0;
+    uint64_t last_graph_key = 0;
+    uint64_t last_graph_uid = 0;
+    int32_t last_graph_result = GGML_CUDA_GRAPH_RESULT_NONE;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1487,6 +1501,11 @@ struct ggml_backend_cuda_context {
         return false;
     }
 #endif // USE_CUDA_GRAPH
+
+    // Last runtime SM switch timing.  The host scheduler reads this after
+    // ggml_backend_cuda_set_sm_group() and aggregates it per frame.
+    double last_sm_switch_ms = 0.0;
+    double last_sm_switch_stream_ec_ms = 0.0;
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),
@@ -1614,19 +1633,24 @@ struct ggml_backend_cuda_context {
     }
 
     // 运行时切换本 backend 使用的 SM 分组（见 ggml_backend_cuda_set_sm_group）。调用方保证此时
-    // backend 空闲。cache_key>=0：EC + stream + graph 都按 key 缓存，切回同一分组时零重建/零重捕获；
-    // cache_key<0：每次重建 EC、释放未缓存 stream、清 graph（旧行为，不缓存）。
+    // backend 空闲。cache_key>=0：EC + stream + graph 都按 key 缓存，切回同一分组时零重建/零重捕获
+    // （Phase 2，SM_GC_60 §7）；cache_key<0：每次重建 EC、释放未缓存 stream、清 graph（旧行为，不缓存）。
     bool set_sm_group(const cudaDevResource & sm_res, bool has_wq, const cudaDevResource & wq_res, int cache_key) {
         ggml_cuda_set_device(device);
+        const int64_t switch_t0 = ggml_time_us();
+        int64_t switch_stream_ec = switch_t0;
 
         // 已在目标分组：no-op（避免误销毁当前 stream/graph）。
         if (cache_key >= 0 && cache_key == sm_slot_key && green_ctx != nullptr) {
+            last_sm_switch_ms = 0.0;
+            last_sm_switch_stream_ec_ms = 0.0;
             return true;
         }
 
         // 切换前同步当前 execution context（调用方保证 backend 空闲，但可能有已提交未完成的工作）。
         // Do not synchronize green streams through the primary context.
         synchronize_streams();
+        switch_stream_ec = ggml_time_us();
 
         const bool to_slot   = (cache_key >= 0);
         const bool from_slot = (sm_slot_key >= 0);   // 当前 EC 已在 green_ctx_cache 中，不会被销毁
@@ -1699,10 +1723,12 @@ struct ggml_backend_cuda_context {
 
         // 取出目标分组的 stream + graph（命中则零成本复用；未命中则留空，下次 stream() 懒建 / 首次捕获）
         if (to_slot) {
+            bool stream_hit = false, graph_hit = false;
             auto sit = sm_stream_slots.find(cache_key);
             if (sit != sm_stream_slots.end()) {
                 for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) streams[device][j] = sit->second[j];
                 sm_stream_slots.erase(sit);
+                stream_hit = true;
             }
 #ifdef USE_CUDA_GRAPH
             auto git = sm_graph_slots.find(cache_key);
@@ -1714,27 +1740,45 @@ struct ggml_backend_cuda_context {
                     GGML_UNUSED(key);
                     if (graph) graph->last_used_time = restore_time;
                 }
+                graph_hit = true;
+                graph_slot_hits++;
+            } else {
+                graph_slot_misses++;
             }
 #endif
+            static const bool slot_log = (getenv("GGML_SM_SLOT_LOG") != nullptr);
+            if (slot_log) fprintf(stderr, "[sm slot] dev=%d key=%d stream_hit=%d graph_hit=%d\n", device, cache_key, stream_hit, graph_hit);
             sm_slot_key = cache_key;
         } else {
             sm_slot_key = -1;  // cache_key<0：不进缓存
         }
 
+        last_sm_switch_stream_ec_ms = (ggml_time_us() - switch_stream_ec) / 1000.0;
+        last_sm_switch_ms = (ggml_time_us() - switch_t0) / 1000.0;
+        if (getenv("GGML_SM_SWITCH_LOG") != nullptr) {
+            fprintf(stderr, "[sm switch] dev=%d key=%d total=%.3fms stream_ec=%.3fms\n",
+                    device, cache_key, last_sm_switch_ms, last_sm_switch_stream_ec_ms);
+        }
+
         return green_ctx != nullptr;
     }
 
-    // 回全局（解绑 green context，本 backend 拿满设备全部 SM，等价于不隔离）。
+    // 回全局（解绑 green context，本 backend 拿满设备全部 SM，等价于不隔离；SM_GC_60 §7 的"串行拿满"）。
     // stream + graph 同样按 cache_key 换槽（全局也是一个可缓存分组）。缓存的 EC 保留、无主 EC 销毁。
     bool set_sm_global(int cache_key) {
         ggml_cuda_set_device(device);
+        const int64_t switch_t0 = ggml_time_us();
+        int64_t switch_stream_ec = switch_t0;
 
         // 已在同一全局槽：no-op。
         if (cache_key == sm_slot_key && green_ctx == nullptr) {
+            last_sm_switch_ms = 0.0;
+            last_sm_switch_stream_ec_ms = 0.0;
             return true;
         }
 
         synchronize_streams();
+        switch_stream_ec = ggml_time_us();
 
         const bool to_slot   = (cache_key >= 0);
         const bool from_slot = (sm_slot_key >= 0);
@@ -1754,8 +1798,8 @@ struct ggml_backend_cuda_context {
             }
 #ifdef USE_CUDA_GRAPH
             // 回 GLOBAL 也要把当前分组的图存回其槽。若不存，切走时（set_sm_group 的 else
-            // 分支）会 clear cuda_graphs，把"暂留在 cuda_graphs 里的图"一起清掉，该分组的
-            // 图会丢失，切回时需重捕获。
+            // 分支）会 clear cuda_graphs，把"暂留在 cuda_graphs 里的图"一起清掉 → 该分组的
+            // 图丢失，切回时 graph_slot_misses 每次重捕获（预热白做）。
             sm_graph_slots[sm_slot_key] = std::move(cuda_graphs);
             cuda_graphs.clear();
 #endif
@@ -1796,11 +1840,21 @@ struct ggml_backend_cuda_context {
                     GGML_UNUSED(key);
                     if (graph) graph->last_used_time = restore_time;
                 }
+                graph_slot_hits++;
+            } else {
+                graph_slot_misses++;
             }
 #endif
             sm_slot_key = cache_key;
         } else {
             sm_slot_key = -1;
+        }
+
+        last_sm_switch_stream_ec_ms = (ggml_time_us() - switch_stream_ec) / 1000.0;
+        last_sm_switch_ms = (ggml_time_us() - switch_t0) / 1000.0;
+        if (getenv("GGML_SM_SWITCH_LOG") != nullptr) {
+            fprintf(stderr, "[sm switch] dev=%d key=%d global total=%.3fms stream_ec=%.3fms\n",
+                    device, cache_key, last_sm_switch_ms, last_sm_switch_stream_ec_ms);
         }
 
         return true;   // 回全局总是成功（primary context 恒在）

@@ -165,13 +165,24 @@ bool prefill_with_emb(struct omni_context * ctx_omni, common_params * params,
 bool prefill_emb_with_hidden(struct omni_context * ctx_omni, common_params * params,
                              float * embed, int n_pos, int n_batch, int * n_past,
                              float *& hidden_states);
-// 把 vision/audio embedding 拼成 fused buffer 一次性 prefill（fused 路径）。
+// Build one fused embedding buffer in protocol order.
+bool llm_build_fused_embeddings(struct omni_context * ctx_omni,
+                                const std::vector<std::vector<float>> & vision_embed,
+                                const std::vector<float> & audio_embed,
+                                const std::string & text,
+                                const std::vector<llama_token> & tokens,
+                                int hidden_size,
+                                std::vector<float> & fused,
+                                int * out_fused_ntok);
+// 把固定标记、文字和媒体拼成 fused buffer 一次性 prefill。
 // 需要 ctx_omni->emb_cache 已初始化（duplex_prepare 填充）且 hidden 匹配；失败返回 false。
 // 调度层（duplex_do_prefill_one_fused）与 init 预热（omni_prewarm）共用同一入口。
 bool llm_fused_prefill(struct omni_context * ctx_omni, common_params * params,
                        const std::vector<std::vector<float>> & vision_embed,
                        const std::vector<float> & audio_embed,
-                       int hidden_size, int * out_fused_ntok);
+                       int hidden_size, int * out_fused_ntok,
+                       const std::string & text = {},
+                       const std::vector<llama_token> & tokens = {});
 const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni,
                     common_params * params, int * n_past);
 const char * sample_with_hidden_and_token(struct common_sampler * smpl,

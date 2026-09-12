@@ -373,6 +373,7 @@ bool omni_tts_replacement_sample_token(struct common_sampler * smpl,
     return false;
 #else
     (void) params;
+    const bool profile = std::getenv("OMNI_TTS_PROFILE") != nullptr;
     const auto token_begin = std::chrono::steady_clock::now();
     if (!ctx || !ctx->tts_t2w_replacement || !ctx->tts_t2w_replacement->initialized ||
             !ctx->ctx_tts_llama || !n_past_tts || !out_token) {
@@ -434,7 +435,17 @@ bool omni_tts_replacement_sample_token(struct common_sampler * smpl,
         return false;
     }
     ++*n_past_tts;
-
+    if (profile) {
+        const auto lookup_end = std::chrono::steady_clock::now();
+        const auto ms = [](const auto & a, const auto & b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr,
+                     "[tts.replacement.prof] token=%d gpu_head_topk=%.3f candidate_sample=%.3f gpu_lookup_decode=%.3f host_total=%.3f\n",
+                     token_index_in_chunk, ms(head_begin, head_end),
+                     ms(head_end, sample_end), ms(lookup_begin, lookup_end),
+                     ms(token_begin, lookup_end));
+    }
     *out_token = token;
     return true;
 #endif

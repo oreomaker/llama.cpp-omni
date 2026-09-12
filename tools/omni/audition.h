@@ -158,6 +158,26 @@ struct audition_ctx * audition_init(const char * fname, struct audition_context_
 
 void audition_free(struct audition_ctx * ctx);
 
+// Shared-weight construction for multi-user streaming.  Clones own their
+// scheduler, compute workspace and Whisper KV cache; model tensors stay in the
+// shared owner until all clones are released.
+struct audition_shared_model;
+struct audition_shared_model * audition_shared_init(const char * fname, struct audition_context_params ctx_params);
+struct audition_ctx * audition_shared_clone(struct audition_shared_model * shared);
+void audition_shared_free(struct audition_shared_model * shared);
+
+struct audition_stream_state {
+    std::vector<uint8_t> kv_bytes;
+    int iter = 0;
+    int n_layer = 0;
+    int size = 0;
+};
+using AuditionStreamState = audition_stream_state;
+bool audition_stream_capture(const struct audition_ctx * ctx, struct audition_stream_state * state);
+bool audition_stream_restore(struct audition_ctx * ctx, const struct audition_stream_state * state);
+void audition_stream_clear(struct audition_ctx * ctx);
+size_t audition_stream_byte_size(const struct audition_ctx * ctx);
+
 // 返回 APM 的 CUDA/GPU 计算 backend（无则 NULL）。当前无调用方，预留给调度层。
 ggml_backend_t audition_get_backend(struct audition_ctx * ctx);
 
